@@ -38,15 +38,15 @@ import asyncio
 import time
 from dataclasses import dataclass, field
 
-from config import EVAConfig, carregar_config
-from context import ContextBuilder
-from decision import DecisorPorLLM, DecisorPorRegras, Plano
-from identity import Pessoa, promover
-from llm import ClienteLLM, ErroLLM
-from memory.extractor import extrair_por_regras
-from memory.store import BancoMemoria
-from state import GerenciadorEstado
-from tools.builtin import carregar_ferramentas
+from .config import EVAConfig, carregar_config
+from .context import ContextBuilder
+from .decision import DecisorPorLLM, DecisorPorRegras, Plano
+from .identity import Pessoa, promover
+from .llm import ClienteLLM, ErroLLM
+from .memory.extractor import extrair_por_regras
+from .memory.store import BancoMemoria
+from .state import GerenciadorEstado
+from .tools.builtin import carregar_ferramentas
 
 
 @dataclass

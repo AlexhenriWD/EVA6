@@ -4,6 +4,9 @@ Configuracao central do sistema EVA.
 Tudo que e ajustavel fica aqui, para nao espalhar constante magica pelo
 codigo. Valores podem vir do ambiente, o que permite trocar de modelo ou
 de banco sem editar arquivo.
+
+No Windows/PowerShell nao existe `export`: carregue um `.env` com
+python-dotenv antes de importar este modulo, ou use `$env:NOME="valor"`.
 """
 
 from __future__ import annotations
@@ -25,10 +28,33 @@ class LLMConfig:
     base_url: str = os.environ.get("EVA_LLM_URL", "http://localhost:1234/v1")
     api_key: str = os.environ.get("EVA_LLM_KEY", "lm-studio")
     modelo: str = os.environ.get("EVA_LLM_MODEL", "eva")
-    temperatura: float = 0.7
+
+    # 0.7 e nao 0.85: o modelo e um 3B com LoRA de personalidade. Temperatura
+    # alta em modelo pequeno degrada coerencia mais rapido do que aumenta
+    # variedade, e a variedade ja vem do fine-tuning.
+    temperatura: float = float(os.environ.get("EVA_TEMP", "0.7"))
     top_p: float = 0.9
+
+    # Teto de texto. O dataset tem mediana de 74 caracteres e p99 de 222,
+    # entao 400 tokens ja e folga generosa -- serve para as respostas longas
+    # (eva_longas_*.jsonl) sem permitir divagacao.
     max_tokens: int = 400
+
+    # Em voz o teto e menor: 400 tokens viram uns 40 segundos de fala, tempo
+    # demais para alguem esperando numa call. Combina com o formato
+    # "MODO: VOZ. Seja concisa (max 2-3 frases)." do treino.
+    max_tokens_voz: int = 120
+
     timeout: int = 120
+
+    # Como o bloco de dados e serializado no system prompt: "json" ou "prosa".
+    #
+    # O JSON e o que o Context Builder sempre produziu, mas nao aparece em
+    # nenhum dos 1.135 exemplos de treino -- funciona por capacidade herdada
+    # do Qwen2.5-Instruct base, nao pela LoRA. A prosa fica mais perto do
+    # "Contexto visual: ..." que o modelo viu. Existem os dois aqui para dar
+    # para comparar sem editar codigo.
+    formato_contexto: str = os.environ.get("EVA_FORMATO_CONTEXTO", "json")
 
 
 @dataclass
@@ -42,9 +68,11 @@ class DecisionConfig:
     """
     usar_llm: bool = os.environ.get("EVA_DECISION_LLM", "0") == "1"
     base_url: str = os.environ.get("EVA_DECISION_URL", "http://localhost:1234/v1")
+    api_key: str = os.environ.get("EVA_LLM_KEY", "lm-studio")
     modelo: str = os.environ.get("EVA_DECISION_MODEL", "eva")
     temperatura: float = 0.0  # decisao deve ser consistente, nao criativa
     max_tokens: int = 200
+    timeout: int = 60
 
 
 @dataclass
@@ -77,23 +105,38 @@ class EstadoConfig:
 
 
 @dataclass
+class IdentidadeConfig:
+    """Quem e quem, para a linha situacional do system prompt.
+
+    As tres formas vem do dataset: criador (138 exemplos), conhecido (210)
+    e nenhuma linha (784). Ver eva/identity.py.
+    """
+    # Depois de quantos turnos um desconhecido vira "alguem que voce conhece
+    # bem". Conta turnos e nao dias porque quem trocou 30 mensagens e mais
+    # conhecido que quem disse oi uma vez por mes durante um ano.
+    turnos_para_conhecido: int = int(os.environ.get("EVA_TURNOS_CONHECIDO", "30"))
+
+
+@dataclass
 class VozConfig:
     """Speech-to-text e text-to-speech."""
-    # STT via Groq (Whisper). Modelos: whisper-large-v3-turbo (rápido) ou
+    # STT via Groq (Whisper). Modelos: whisper-large-v3-turbo (rapido) ou
     # whisper-large-v3 (mais preciso).
     stt_chave: str = os.environ.get("GROQ_API_KEY", "")
     stt_modelo: str = os.environ.get("EVA_STT_MODEL", "whisper-large-v3-turbo")
     stt_idioma: str = os.environ.get("EVA_STT_IDIOMA", "pt")
 
-    # TTS: "piper" (offline, PT-BR), "edge" (online, PT-BR), "pocket"
-    # (offline, mas só EN/FR na data desta implementação).
-    # Vazio = escolhe automaticamente o primeiro disponível que suporte o idioma.
-    tts_backend: str = os.environ.get("EVA_TTS_BACKEND", "")
+    # TTS: Pocket TTS, unico backend. Suporta portugues via o modelo
+    # `portuguese_24l`. Piper e edge-tts foram removidos -- manter tres
+    # caminhos de sintese significava tres timbres diferentes e tres formas
+    # de quebrar, e a clonagem de voz do Pocket e o motivo de existir voz.
+    tts_backend: str = os.environ.get("EVA_TTS_BACKEND", "pocket")
     tts_idioma: str = os.environ.get("EVA_TTS_IDIOMA", "pt")
+    # WAV de referencia para clonar a voz (5 segundos bastam).
     tts_voz: str = os.environ.get("EVA_TTS_VOZ", "")
 
-    # Vocabulário passado ao Whisper para melhorar nomes próprios e termos
-    # técnicos que ele erraria sem contexto.
+    # Vocabulario passado ao Whisper para melhorar nomes proprios e termos
+    # tecnicos que ele erraria sem contexto.
     stt_vocabulario: str = os.environ.get("EVA_STT_VOCAB", "EVA, Alex")
 
 
@@ -101,9 +144,9 @@ class VozConfig:
 class DiscordConfig:
     token: str = os.environ.get("DISCORD_TOKEN", "")
     prefixo: str = os.environ.get("EVA_DISCORD_PREFIXO", "!eva ")
-    # Se definido, a EVA responde a tudo nesse canal sem precisar de menção.
+    # Se definido, a EVA responde a tudo nesse canal sem precisar de mencao.
     canal_dedicado: str = os.environ.get("EVA_DISCORD_CANAL", "")
-    # Segundos de silêncio para considerar que a pessoa terminou de falar.
+    # Segundos de silencio para considerar que a pessoa terminou de falar.
     silencio_para_responder: float = float(os.environ.get("EVA_VOZ_SILENCIO", "1.0"))
 
 
@@ -113,16 +156,21 @@ class EVAConfig:
     decisao: DecisionConfig = field(default_factory=DecisionConfig)
     memoria: MemoriaConfig = field(default_factory=MemoriaConfig)
     estado: EstadoConfig = field(default_factory=EstadoConfig)
+    identidade: IdentidadeConfig = field(default_factory=IdentidadeConfig)
     voz: VozConfig = field(default_factory=VozConfig)
     discord: DiscordConfig = field(default_factory=DiscordConfig)
 
-    usuario: str = os.environ.get("EVA_USER", "usuario")
+    # Id do dono da instancia. Serve de escopo padrao quando ninguem passa
+    # `usuario` -- caso da CLI. Integracoes multiusuario passam sempre.
+    usuario: str = os.environ.get("EVA_USER", "alex")
+    nome_criador: str = os.environ.get("EVA_NOME_CRIADOR", "Alex")
+
     debug: bool = os.environ.get("EVA_DEBUG", "0") == "1"
 
     def preparar_diretorios(self) -> None:
-        # Aceita caminhos como str também: é fácil atribuir uma string por
-        # engano ao configurar, e o erro que aparecia ('str' não tem
-        # atributo 'parent') não apontava para a causa.
+        # Aceita caminhos como str tambem: e facil atribuir uma string por
+        # engano ao configurar, e o erro que aparecia ('str' nao tem
+        # atributo 'parent') nao apontava para a causa.
         self.memoria.caminho_db = Path(self.memoria.caminho_db)
         self.estado.caminho = Path(self.estado.caminho)
         RAIZ.mkdir(parents=True, exist_ok=True)
