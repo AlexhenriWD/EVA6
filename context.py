@@ -65,6 +65,12 @@ LINHA_CONHECIDO = "Você está falando com alguém que você conhece bem."
 # string em si é preservada.
 MODO_VOZ = "MODO: VOZ. Seja concisa (máx 2-3 frases)."
 PREFIXO_VISUAL = "Contexto visual: "
+MODO_INICIATIVA = (
+    "MODO: INICIATIVA. Ninguém falou há um tempo e você decidiu dizer algo. "
+    "Uma ou duas frases, sem anunciar que está puxando assunto e sem "
+    "perguntar se tem alguém aí."
+)
+PREFIXO_IDEIA = "Ideia: "
 
 # Instrução adicional para momentos de crise. Curta e específica: a EVA já
 # foi treinada com exemplos desse tipo, então isso apenas reforça.
@@ -126,6 +132,7 @@ class ContextBuilder:
         identidade: str | None = None,
         modo_voz: bool = False,
         contexto_visual: str | None = None,
+        iniciativa: str | None = None,
     ) -> Contexto:
         """Monta o Contexto de um turno.
 
@@ -171,6 +178,9 @@ class ContextBuilder:
             linhas.append(MODO_VOZ)
         if contexto_visual:
             linhas.append(PREFIXO_VISUAL + contexto_visual.strip())
+        if iniciativa:
+            linhas.append(MODO_INICIATIVA)
+            linhas.append(PREFIXO_IDEIA + iniciativa.strip())
         system = "\n".join(linhas)
 
         # ------------------------------------------------- bloco de dados

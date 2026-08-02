@@ -38,15 +38,15 @@ import asyncio
 import time
 from dataclasses import dataclass, field
 
-from .config import EVAConfig, carregar_config
-from .context import ContextBuilder
-from .decision import DecisorPorLLM, DecisorPorRegras, Plano
-from .identity import Pessoa, promover
-from .llm import ClienteLLM, ErroLLM
-from .memory.extractor import extrair_por_regras
-from .memory.store import BancoMemoria
-from .state import GerenciadorEstado
-from .tools.builtin import carregar_ferramentas
+from config import EVAConfig, carregar_config
+from context import ContextBuilder
+from decision import DecisorPorLLM, DecisorPorRegras, Plano
+from identity import Pessoa, promover
+from llm import ClienteLLM, ErroLLM
+from memory.extractor import extrair_por_regras
+from memory.store import BancoMemoria
+from state import GerenciadorEstado
+from tools.builtin import carregar_ferramentas
 
 
 @dataclass
@@ -196,6 +196,58 @@ class EVA:
         return await asyncio.to_thread(
             lambda: self.responder(mensagem, **kwargs))
 
+
+    def falar_sozinha(self, ideia: str, *, usuario: str | None = None,
+                      modo_voz: bool = True) -> Resultado:
+        """Produz uma fala espontânea a partir de um impulso aprovado.
+
+        Quem decide SE ela fala é o portão em eva/consciousness.py. Aqui ela
+        já tem permissão -- este método só escreve.
+
+        A lista de mensagens termina no histórico, sem turno de `user`: não
+        houve pergunta. Servidores compatíveis com a API da OpenAI aplicam o
+        template e abrem o turno do assistente de qualquer forma. Se o seu
+        não abrir, o sintoma é resposta vazia, e o conserto é acrescentar
+        uma mensagem de user mínima -- mas evite, porque inventar um turno
+        de usuário que não existiu polui o histórico.
+        """
+        inicio = time.time()
+        usuario = usuario or self.cfg.usuario
+        plano = Plano(intencao="iniciativa", precisa_memoria=True,
+                      guardar_memoria=False, consulta_memoria=ideia)
+
+        historico = self.memoria.historico(
+            usuario=usuario, limite=self.cfg.memoria.janela_historico)
+        memorias = self._buscar_memorias(plano, usuario)
+
+        ctx = self.builder.montar(
+            plano=plano, memorias=memorias, resultados_ferramentas={},
+            estado=self.estado.estado, historico=historico,
+            identidade=self._identidade(usuario),
+            modo_voz=modo_voz, iniciativa=ideia,
+        )
+        mensagens = [{"role": "system", "content": ctx.system}] + ctx.mensagens
+
+        teto = self.cfg.llm.max_tokens_voz if modo_voz else self.cfg.llm.max_tokens
+        try:
+            resposta = self.llm.completar(mensagens, max_tokens=teto)
+            erro = None
+        except ErroLLM as e:
+            resposta, erro = "", str(e)
+
+        # Só o lado dela entra no histórico -- não houve turno de usuário.
+        # E `guardar_memoria=False` no plano evita o outro erro: extrair
+        # "fato sobre o usuário" de uma frase que quem escreveu foi ela.
+        if resposta:
+            self.memoria.registrar_turno("assistant", resposta, usuario=usuario)
+
+        return Resultado(resposta=resposta, plano=plano, usuario=usuario,
+                         contexto=ctx.bruto, system=ctx.system,
+                         ms=int((time.time() - inicio) * 1000), erro=erro)
+
+    async def falar_sozinha_async(self, ideia: str, **kwargs) -> Resultado:
+        return await asyncio.to_thread(lambda: self.falar_sozinha(ideia, **kwargs))
+    
     def _responder_stream(self, mensagem, usuario, plano, memorias, resultados,
                           ctx, mensagens, teto, inicio):
         """Gera a resposta em pedaços; o pós-processo roda no fim."""

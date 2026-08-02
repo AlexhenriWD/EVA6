@@ -24,8 +24,8 @@ import argparse
 import json
 import sys
 
-from .config import carregar_config
-from .orchestrator import EVA
+from config import carregar_config
+from orchestrator import EVA
 
 VERDE = "\033[32m"
 CINZA = "\033[90m"

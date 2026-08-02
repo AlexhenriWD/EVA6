@@ -101,6 +101,9 @@ class ClienteBridge:
 
         self.ws = None
         self.guilds: dict[str, EstadoGuild] = {}
+        from ..consciousness import Consciencia
+        self.consciencias: dict[str, Consciencia] = {}
+        self._tarefas_consciencia: dict[str, asyncio.Task] = {}
         # O bridge manda o cabeçalho JSON e logo depois o quadro binário.
         # Guardamos o cabeçalho para saber de quem é o áudio que vem a seguir.
         self._audio_pendente: dict | None = None
@@ -109,6 +112,51 @@ class ClienteBridge:
 
     def estado(self, guild_id: str) -> EstadoGuild:
         return self.guilds.setdefault(str(guild_id), EstadoGuild())
+
+    def consciencia(self, guild_id: str):
+        from ..consciousness import Consciencia
+        gid = str(guild_id)
+        if gid not in self.consciencias:
+            self.consciencias[gid] = Consciencia(self.cfg, canal=gid)
+        return self.consciencias[gid]
+
+    def _tts_tocando(self, guild_id: str) -> bool:
+        return self.estado(guild_id).falando
+
+    def _cancelar_laco_consciencia(self, guild_id: str) -> None:
+        gid = str(guild_id)
+        tarefa = self._tarefas_consciencia.pop(gid, None)
+        if tarefa and not tarefa.done():
+            tarefa.cancel()
+
+    async def _laco_consciencia(self, guild_id: str) -> None:
+        """Bate no portão de tempos em tempos. Não decide nada -- só pergunta."""
+        c = self.consciencia(guild_id)
+        while True:
+            await asyncio.sleep(self.cfg.consciencia.intervalo_tick)
+            try:
+                est = self.estado(guild_id)
+                c.ocupada = est.processando.locked() or self._tts_tocando(guild_id)
+
+                v = c.tick(self.eva.estado.estado)
+                if self.cfg.debug and not v.passou:
+                    print(f"[consciencia] {v}")
+                if not v.passou:
+                    continue
+
+                async with est.processando:
+                    c.ocupada = True
+                    r = await self.eva.falar_sozinha_async(
+                        v.impulso.conteudo, usuario=c.ultimo_falante, modo_voz=True)
+                    if r.resposta:
+                        print(f"[eva espontânea] {r.resposta}")
+                        await self.falar(guild_id, r.resposta)
+                        c.ela_falou(espontanea=True)
+                    c.ocupada = False
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                print(f"[consciencia] erro: {e}")
 
     # ------------------------------------------------------------ envio
 
@@ -121,6 +169,7 @@ class ClienteBridge:
                             "channel_id": str(canal_id)})
 
     async def sair(self, guild_id: str) -> None:
+        self._cancelar_laco_consciencia(guild_id)
         await self._enviar({"type": "leave", "guild_id": str(guild_id)})
 
     async def falar(self, guild_id: str, texto: str) -> None:
@@ -184,6 +233,7 @@ class ClienteBridge:
                 return
 
             print(f"[call] {user_id}: {t.texto}")
+            self.consciencia(guild_id).alguem_falou(str(user_id), t.texto)
 
             r = await asyncio.to_thread(self.eva.responder, t.texto)
             if r.erro:
@@ -194,6 +244,7 @@ class ClienteBridge:
 
             print(f"[eva] {r.resposta}")
             await self.falar(guild_id, r.resposta)
+            self.consciencia(guild_id).ela_falou()
 
     # ------------------------------------------------------------ texto
 
@@ -381,10 +432,14 @@ class ClienteBridge:
         elif tipo == "joined":
             gid = str(d["guild_id"])
             self.estado(gid).canal_id = str(d.get("channel_id"))
+            self._cancelar_laco_consciencia(gid)
+            self._tarefas_consciencia[gid] = asyncio.create_task(
+                self._laco_consciencia(gid))
             print(f"[bridge] entrou em '{d.get('channel_name')}'")
         elif tipo == "left":
             gid = str(d["guild_id"])
             self.estado(gid).canal_id = None
+            self._cancelar_laco_consciencia(gid)
             motivo = f" ({d['reason']})" if d.get("reason") else ""
             print(f"[bridge] saiu do canal{motivo}")
         elif tipo == "reconnecting":
@@ -444,4 +499,6 @@ class ClienteBridge:
         return d
 
     def fechar(self) -> None:
+        for gid in list(self._tarefas_consciencia):
+            self._cancelar_laco_consciencia(gid)
         self.eva.fechar()

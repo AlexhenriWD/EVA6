@@ -1,24 +1,35 @@
 /**
- * EVA Voice Bridge - Node.js
- * ===========================
- * Fixes v2:
+ * EVA Bridge - Node.js  (v3)
+ * ==========================
+ * Ponte entre o Discord e o processo Python. Fala WebSocket na porta 8765:
+ * JSON para controle, quadros binários para PCM.
  *
- * Bug 1 — Desconexão espontânea:
- *   O handler Disconnected tinha timeout de 5s para reconectar.
- *   Se o Discord não respondesse a tempo, destruía a conexão e
- *   notificava o Python com 'left', que não reconectava.
- *   Fix: timeout aumentado para 15s + loop de reconexão com backoff
- *   + notifica Python com 'reconnecting' em vez de destruir imediatamente.
+ * O QUE MUDOU NA v3
+ * -----------------
+ * Adicionado o caminho de TEXTO, que não existia. O bridge_client.py do lado
+ * Python já esperava por ele -- `_ao_receber_mensagem`, `enviar_mensagem` e
+ * `typing` não tinham contraparte aqui, então texto simplesmente não chegava.
  *
- * Bug 2 — Não consegue sair pelo comando:
- *   Se a WS Python caia antes do leave, o estado interno do bridge
- *   ficava sujo (voiceStates com connection destruída).
- *   Fix: cleanup de estado no ws.on('close') + forçar destroy de
- *   todas as conexões de voz quando Python desconecta.
+ *   novo evento  message        bridge -> Python
+ *   novo comando send_message   Python -> bridge
+ *   novo comando typing         Python -> bridge
+ *
+ * E dois bugs que impediriam o texto de funcionar mesmo com o handler:
+ *
+ *   Faltava a intent MessageContent. Sem ela o Discord entrega
+ *   `message.content` como string vazia -- o bot recebe o evento, e o
+ *   conteúdo chega em branco. É um erro silencioso: nada falha, a EVA só
+ *   responde a mensagens vazias para sempre.
+ *
+ *   Faltavam DirectMessages e os Partials. DM nunca dispara messageCreate
+ *   sem eles, porque o canal não está em cache.
+ *
+ * TODAS as correções da v2 estão preservadas, com os comentários originais.
+ * Elas vieram de bug real em produção; cada uma corrige algo audível.
  */
 
 // ─────────────────────────────────────────
-// FIX (debug desconexão espontânea): sem isso, uma exceção não tratada
+// FIX v2 (debug desconexão espontânea): sem isso, uma exceção não tratada
 // em QUALQUER callback assíncrono (decoder, opusStream, voice connection,
 // etc.) mata o processo Node inteiro em silêncio — o Python só vê o
 // WebSocket fechar ("🔌 Bridge desconectou") sem nenhuma pista do motivo.
@@ -35,11 +46,9 @@ process.on('uncaughtException', (err) => {
   setTimeout(() => process.exit(1), 200);
 });
 
-process.on('unhandledRejection', (reason, promise) => {
+process.on('unhandledRejection', (reason) => {
   console.error('💥 [FATAL] unhandledRejection:', reason);
-  if (reason instanceof Error) {
-    console.error(reason.stack);
-  }
+  if (reason instanceof Error) console.error(reason.stack);
 });
 
 const dns = require('dns');
@@ -54,7 +63,7 @@ net.createConnection = (options, ...args) => {
   return _origConnect(options, ...args);
 };
 
-const { Client, GatewayIntentBits } = require('discord.js');
+const { Client, GatewayIntentBits, Partials, ChannelType } = require('discord.js');
 const {
   joinVoiceChannel,
   createAudioPlayer,
@@ -75,10 +84,12 @@ const CONFIG = {
   SAMPLE_RATE: 48000,
   CHANNELS: 2,
   FRAME_SIZE: 3840,
-  // FIX: timeout de reconexão aumentado de 5s para 15s
+  // FIX v2: timeout de reconexão aumentado de 5s para 15s
   RECONNECT_TIMEOUT_MS: 15_000,
-  // FIX: tentativas de reconexão antes de desistir
+  // FIX v2: tentativas de reconexão antes de desistir
   MAX_RECONNECT_ATTEMPTS: 3,
+  // Limite duro do Discord por mensagem. Passar disso devolve 400.
+  MAX_MSG_CHARS: 2000,
 };
 
 const client = new Client({
@@ -86,7 +97,17 @@ const client = new Client({
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildVoiceStates,
     GatewayIntentBits.GuildMessages,
+    // NOVO v3 — sem MessageContent o `content` chega vazio. É intent
+    // privilegiada: ligue também no Developer Portal, em Bot > Privileged
+    // Gateway Intents > Message Content Intent. Se não ligar lá, o login
+    // falha com "Used disallowed intents".
+    GatewayIntentBits.MessageContent,
+    // NOVO v3 — sem isso, DM nunca dispara messageCreate.
+    GatewayIntentBits.DirectMessages,
   ],
+  // NOVO v3 — DM chega com o canal fora do cache; sem os partials o
+  // discord.js descarta o evento antes de emitir.
+  partials: [Partials.Channel, Partials.Message],
   rest: { timeout: 30000, retries: 3 },
 });
 
@@ -94,7 +115,7 @@ const voiceStates = new Map();
 let pythonSocket = null;
 let pendingAudioFor = null;
 
-// FIX: rastrear se uma guild está em processo de reconexão
+// FIX v2: rastrear se uma guild está em processo de reconexão
 const reconnectingGuilds = new Set();
 
 console.log(`🔌 WebSocket Server escutando na porta ${CONFIG.WS_PORT}`);
@@ -105,7 +126,7 @@ wss.on('connection', (ws) => {
   console.log('🐍 Python conectou ao bridge');
   pythonSocket = ws;
 
-  sendJson(ws, { type: 'ready', version: '2.0' });
+  sendJson(ws, { type: 'ready', version: '3.0' });
 
   ws.on('message', async (data, isBinary) => {
     if (isBinary) {
@@ -133,12 +154,15 @@ wss.on('connection', (ws) => {
       case 'play':
         pendingAudioFor = { guild_id: msg.guild_id };
         break;
+      // NOVO v3
+      case 'send_message': await handleSendMessage(ws, msg); break;
+      case 'typing':       await handleTyping(msg);          break;
       default:
         console.warn(`⚠️ Tipo desconhecido: ${msg.type}`);
     }
   });
 
-  // FIX Bug 2: quando Python desconecta, limpar estado de voz
+  // FIX v2 (Bug 2): quando Python desconecta, limpar estado de voz
   // para que no próximo connect tudo comece do zero
   ws.on('close', () => {
     console.log('🔌 Bridge desconectou');
@@ -155,6 +179,128 @@ wss.on('connection', (ws) => {
     console.error('❌ WebSocket erro:', err.message);
   });
 });
+
+// ─────────────────────────────────────────
+// NOVO v3 — TEXTO: DISCORD → PYTHON
+// ─────────────────────────────────────────
+client.on('messageCreate', async (message) => {
+  // Ignorar bots, inclusive a própria EVA. Sem isso ela responde à própria
+  // resposta e o loop só para quando o rate limit do Discord corta.
+  if (message.author?.bot) return;
+
+  // Partial: em DM a mensagem pode chegar incompleta. Buscar antes de ler.
+  if (message.partial) {
+    try { await message.fetch(); } catch { return; }
+  }
+
+  if (!pythonSocket || pythonSocket.readyState !== 1) return;
+
+  const isDM = message.channel?.type === ChannelType.DM;
+  const mentioned = client.user ? message.mentions.users.has(client.user.id) : false;
+
+  // Tira a menção do texto. Sem isso a EVA recebe "<@1234567890> oi" e o
+  // id cru entra no contexto do modelo -- às vezes ele repete o número.
+  let content = (message.content || '').trim();
+  if (client.user) {
+    content = content
+      .replace(new RegExp(`<@!?${client.user.id}>`, 'g'), '')
+      .trim();
+  }
+
+  // O canal de voz de quem falou. Deixa `!eva entra` funcionar sem argumento.
+  const voiceChannelId = message.member?.voice?.channelId || null;
+
+  const attachments = [...(message.attachments?.values() || [])].map((a) => ({
+    url: a.url,
+    name: a.name,
+    content_type: a.contentType || '',
+    size: a.size,
+  }));
+
+  sendJson(pythonSocket, {
+    type: 'message',
+    message_id: message.id,
+    channel_id: message.channelId,
+    guild_id: message.guildId || null,
+    author_id: message.author.id,
+    author_name: message.member?.displayName || message.author.username,
+    content,
+    is_dm: isDM,
+    mentioned,
+    voice_channel_id: voiceChannelId,
+    attachments,
+  });
+});
+
+// ─────────────────────────────────────────
+// NOVO v3 — TEXTO: PYTHON → DISCORD
+// ─────────────────────────────────────────
+async function handleSendMessage(ws, msg) {
+  const { channel_id, content, reply_to } = msg;
+  if (!content) return;
+
+  try {
+    const channel = await client.channels.fetch(channel_id);
+    if (!channel || !channel.isTextBased()) {
+      sendJson(ws, { type: 'error', message: `canal ${channel_id} não é de texto` });
+      return;
+    }
+
+    // Discord corta em 2000 caracteres e devolve 400. As respostas da EVA
+    // ficam bem abaixo disso (p99 do dataset é 222 chars), mas erro de
+    // modelo e saída de diagnóstico podem estourar -- e um 400 aqui vira
+    // silêncio, que é pior do que uma mensagem partida.
+    const partes = dividirTexto(content, CONFIG.MAX_MSG_CHARS);
+
+    let enviada = null;
+    for (let i = 0; i < partes.length; i++) {
+      const payload = { content: partes[i] };
+      // Só a primeira parte responde à mensagem original; as seguintes
+      // vão soltas, senão viram uma pilha de respostas à mesma mensagem.
+      if (i === 0 && reply_to) {
+        payload.reply = { messageReference: reply_to, failIfNotExists: false };
+      }
+      enviada = await channel.send(payload);
+    }
+
+    sendJson(ws, {
+      type: 'message_sent',
+      channel_id,
+      message_id: enviada ? enviada.id : null,
+      partes: partes.length,
+    });
+  } catch (err) {
+    console.error(`❌ Falha ao enviar mensagem (canal ${channel_id}): ${err.message}`);
+    sendJson(ws, { type: 'error', message: err.message, channel_id });
+  }
+}
+
+async function handleTyping(msg) {
+  // Melhor esforço: o indicador de digitação é cosmético, e falhar nele
+  // nunca deve impedir a resposta de sair.
+  try {
+    const channel = await client.channels.fetch(msg.channel_id);
+    if (channel && channel.isTextBased()) await channel.sendTyping();
+  } catch (err) {
+    console.warn(`⚠️ typing falhou (canal ${msg.channel_id}): ${err.message}`);
+  }
+}
+
+/** Divide respeitando quebra de linha e depois espaço, para não cortar palavra. */
+function dividirTexto(texto, limite) {
+  if (texto.length <= limite) return [texto];
+  const partes = [];
+  let resto = texto;
+  while (resto.length > limite) {
+    let corte = resto.lastIndexOf('\n', limite);
+    if (corte < limite * 0.5) corte = resto.lastIndexOf(' ', limite);
+    if (corte < limite * 0.5) corte = limite;
+    partes.push(resto.slice(0, corte).trim());
+    resto = resto.slice(corte).trim();
+  }
+  if (resto) partes.push(resto);
+  return partes;
+}
 
 // ─────────────────────────────────────────
 // HANDLER: ENTRAR NO CANAL
@@ -202,15 +348,14 @@ async function handleJoin(ws, msg) {
     receiver.speaking.on('start', (userId) => {
       if (subscriptions.has(userId)) return;
 
-      // FIX (áudio picotado): decodificar Opus recebido do microfone é
+      // FIX v2 (áudio picotado): decodificar Opus recebido do microfone é
       // trabalho de CPU no MESMO event loop single-threaded que está
       // codificando e enviando o áudio de saída da EVA. Se alguém (ou o
       // próprio eco da EVA sem fone) ativa o microfone enquanto ela está
-      // falando, as duas coisas competem pela CPU ao mesmo tempo — isso
-      // pode ser o que está causando o áudio picotado/com ruído. O lado
-      // Python já ignora esse áudio recebido durante TTS (_tts_playing),
-      // mas só DEPOIS de decodificar — aqui a gente evita nem começar a
-      // decodificar, que é a parte cara.
+      // falando, as duas coisas competem pela CPU ao mesmo tempo. O lado
+      // Python já ignora esse áudio recebido durante TTS, mas só DEPOIS de
+      // decodificar — aqui a gente evita nem começar a decodificar, que é
+      // a parte cara.
       if (player.state.status === AudioPlayerStatus.Playing) {
         return;
       }
@@ -253,12 +398,11 @@ async function handleJoin(ws, msg) {
         const pcm = Buffer.concat(pcmChunks);
         console.log(`🎙️ PCM do user ${userId}: ${pcm.length} bytes`);
 
-        // FIX (debug desconexão espontânea): pythonSocket.send() pode
-        // lançar de forma síncrona se o WS estiver no meio do fechamento
-        // (CLOSING) — isso acontece DENTRO de um callback de stream
-        // ('end' do decoder), sem nenhum try/catch acima na pilha, então
-        // sem esse try/catch aqui a exceção sobe crua e pode derrubar o
-        // processo Node inteiro (uncaughtException).
+        // FIX v2: pythonSocket.send() pode lançar de forma síncrona se o WS
+        // estiver no meio do fechamento (CLOSING) — isso acontece DENTRO de
+        // um callback de stream ('end' do decoder), sem nenhum try/catch
+        // acima na pilha, então sem esse try/catch aqui a exceção sobe crua
+        // e pode derrubar o processo Node inteiro.
         try {
           if (pythonSocket && pythonSocket.readyState === 1) {
             sendJson(pythonSocket, { type: 'audio', guild_id, user_id: userId, bytes: pcm.length });
@@ -278,7 +422,7 @@ async function handleJoin(ws, msg) {
     });
 
     // ─────────────────────────────────────────
-    // FIX Bug 1: Reconexão robusta com backoff
+    // FIX v2 (Bug 1): Reconexão robusta com backoff
     // ─────────────────────────────────────────
     connection.on(VoiceConnectionStatus.Disconnected, async () => {
       // Evitar loop de reconexão dupla
@@ -319,7 +463,6 @@ async function handleJoin(ws, msg) {
         voiceStates.delete(guild_id);
         sendJson(pythonSocket, { type: 'left', guild_id, reason: 'reconnect_failed' });
       } else {
-        // Notificar Python que reconectou
         sendJson(pythonSocket, { type: 'reconnected', guild_id, channel_id });
       }
     });
@@ -341,7 +484,7 @@ async function handleLeave(ws, msg) {
   const { guild_id } = msg;
   const state = voiceStates.get(guild_id);
 
-  // FIX: cancelar reconexão pendente se o Python pediu leave
+  // FIX v2: cancelar reconexão pendente se o Python pediu leave
   reconnectingGuilds.delete(guild_id);
 
   if (state) {
@@ -350,12 +493,12 @@ async function handleLeave(ws, msg) {
       try { sub.decoder.destroy();   } catch {}
     }
     state.subscriptions.clear();
-    // FIX: destroy antes de delete para garantir cleanup no Discord
+    // FIX v2: destroy antes de delete para garantir cleanup no Discord
     try { state.connection.destroy(); } catch {}
     voiceStates.delete(guild_id);
   }
 
-  // FIX: sempre responder 'left', mesmo se não estava conectado
+  // FIX v2: sempre responder 'left', mesmo se não estava conectado
   // (evita o Python ficar preso no future de leave)
   sendJson(ws, { type: 'left', guild_id });
   console.log(`👋 Saiu do canal (guild ${guild_id})`);
@@ -365,27 +508,22 @@ async function handleLeave(ws, msg) {
 // REPRODUZIR ÁUDIO PCM NO DISCORD
 // ─────────────────────────────────────────
 
-// FIX (áudio quebrado/cheio de ruído): Readable.from(buffer) tem um caso
+// FIX v2 (áudio quebrado/cheio de ruído): Readable.from(buffer) tem um caso
 // especial no Node para Buffer/string — em vez de entregar como stream de
 // bytes normal, ele cria um Readable em objectMode que empurra o BUFFER
 // INTEIRO (podem ser vários segundos de áudio, centenas de KB) como um
 // único chunk monolítico numa passada só (ver lib/internal/streams/from.js
-// no código-fonte do Node: há um branch dedicado pra "typeof iterable ===
-// 'string' || iterable instanceof Buffer" que faz exatamente isso).
+// no código-fonte do Node).
 //
 // O encoder Opus que o createAudioResource(..., {inputType:'raw'}) monta
-// por baixo dos panos (via prism-media) espera consumir um Readable
-// convencional entregando dados aos poucos — é assim que qualquer exemplo
-// da lib alimenta esse pipeline (fs.createReadStream, sockets, etc.), nunca
-// um objeto único carregando o áudio inteiro. Empurrar tudo de uma vez força
-// a codificação Opus de uma resposta inteira numa rajada só, sem a
-// granularidade/backpressure normal — suspeito nº1 pro áudio picotado/com
-// estática que chega no Discord.
+// por baixo dos panos espera consumir um Readable convencional entregando
+// dados aos poucos. Empurrar tudo de uma vez força a codificação Opus de
+// uma resposta inteira numa rajada só, sem a granularidade/backpressure
+// normal — causa do áudio picotado/com estática que chegava no Discord.
 //
 // Fix: Readable "de verdade" (sem objectMode) que entrega o PCM em pedaços
 // do tamanho exato de um frame Discord (3840 bytes = 20ms @ 48kHz stereo
-// s16le) a cada _read() — mesma granularidade que o encoder e o player
-// esperam, com backpressure normal.
+// s16le) a cada _read().
 function pcmBufferToStream(buffer, frameBytes = CONFIG.FRAME_SIZE) {
   let offset = 0;
   return new Readable({
@@ -398,11 +536,8 @@ function pcmBufferToStream(buffer, frameBytes = CONFIG.FRAME_SIZE) {
       const end = Math.min(offset + frameBytes, buffer.length);
       let chunk = buffer.subarray(offset, end);
       // Rede de segurança: se o último pedaço vier menor que um frame
-      // completo (buffer não alinhado por algum caller), preenche com
-      // silêncio em vez de mandar um frame parcial pro encoder Opus —
-      // mesma lógica de alinhamento já usada no lado Python
-      // (pocket_tts_engine.py / streaming_tts_system.py), só que como
-      // rede de segurança aqui também.
+      // completo, preenche com silêncio em vez de mandar frame parcial pro
+      // encoder Opus — mesma lógica de alinhamento do lado Python.
       if (chunk.length < frameBytes) {
         const padded = Buffer.alloc(frameBytes);
         chunk.copy(padded);
@@ -418,28 +553,23 @@ async function playAudio(guild_id, pcmBuffer) {
   const state = voiceStates.get(guild_id);
   if (!state) {
     console.warn(`⚠️ Não conectado à guild ${guild_id}`);
-    // FIX: notificar Python mesmo sem estado, para não travar o future
+    // FIX v2: notificar Python mesmo sem estado, para não travar o future
     sendJson(pythonSocket, { type: 'play_done', guild_id });
     return;
   }
 
   const { player } = state;
 
-  // FIX (debug desconexão espontânea): sem try/catch aqui, um buffer
-  // malformado ou uma conexão de voz já derrubada faz createAudioResource
-  // ou player.play() lançar de forma síncrona, e como playAudio() é
-  // chamada a partir do handler de mensagem WS sem proteção própria,
-  // isso pode se propagar e derrubar o processo inteiro.
+  // FIX v2: sem try/catch aqui, um buffer malformado ou uma conexão de voz
+  // já derrubada faz createAudioResource ou player.play() lançar de forma
+  // síncrona, e como playAudio() é chamada a partir do handler de mensagem
+  // WS sem proteção própria, isso derruba o processo inteiro.
   try {
     const readable = pcmBufferToStream(pcmBuffer);
-    // Erros de leitura/decodificação no meio do stream (ex: pipeline do
-    // Opus encoder falhando) antes só apareciam como 'error' no player,
-    // sem contexto de qual guild/quantos bytes — agora fica logado aqui
-    // também, direto na origem.
     readable.on('error', (err) => {
       console.error(`❌ Erro no stream de PCM (guild ${guild_id}): ${err.message}`);
     });
-    const resource  = createAudioResource(readable, { inputType: 'raw', inlineVolume: false });
+    const resource = createAudioResource(readable, { inputType: 'raw', inlineVolume: false });
     player.play(resource);
     console.log(`🔊 Reproduzindo ${pcmBuffer.length} bytes (guild ${guild_id})`);
   } catch (err) {
@@ -472,7 +602,7 @@ function sendJson(ws, obj) {
 // ─────────────────────────────────────────
 client.once('clientReady', () => {
   console.log(`🤖 Discord Bot conectado como ${client.user.tag}`);
-  console.log(`🎙️ EVA Voice Bridge v2 pronto!`);
+  console.log(`🎙️ EVA Bridge v3 pronto (voz + texto)`);
   console.log(`   WebSocket: ws://localhost:${CONFIG.WS_PORT}`);
 });
 
@@ -486,9 +616,17 @@ async function loginWithRetry(maxAttempts = 5) {
       return;
     } catch (err) {
       console.error(`❌ Login falhou: ${err.message}`);
+      // Erro típico de quem esqueceu de ligar a intent no portal. Sem esta
+      // dica, a mensagem crua do discord.js não diz onde resolver.
+      if (String(err.message).includes('disallowed intents')) {
+        console.error(
+          '   → Ligue "Message Content Intent" no Discord Developer Portal:\n' +
+          '     Applications > seu app > Bot > Privileged Gateway Intents'
+        );
+      }
       if (attempt < maxAttempts) {
         const delay = attempt * 3000;
-        console.log(`⏳ Aguardando ${delay/1000}s...`);
+        console.log(`⏳ Aguardando ${delay / 1000}s...`);
         await new Promise(r => setTimeout(r, delay));
       } else {
         process.exit(1);

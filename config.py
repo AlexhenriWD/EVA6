@@ -27,7 +27,7 @@ class LLMConfig:
     """
     base_url: str = os.environ.get("EVA_LLM_URL", "http://localhost:1234/v1")
     api_key: str = os.environ.get("EVA_LLM_KEY", "lm-studio")
-    modelo: str = os.environ.get("EVA_LLM_MODEL", "eva")
+    modelo: str = os.environ.get("EVA_LLM_MODEL", "eva-3b")
 
     # 0.7 e nao 0.85: o modelo e um 3B com LoRA de personalidade. Temperatura
     # alta em modelo pequeno degrada coerencia mais rapido do que aumenta
@@ -118,6 +118,24 @@ class IdentidadeConfig:
 
 
 @dataclass
+class ConscienciaConfig:
+    """Quando a EVA fala sem ser chamada.
+
+    Os dois primeiros numeros vieram da calibracao em producao do sistema
+    antigo (MIN_SILENCE=40, SPEAK_COOLDOWN=30). Nao mexa neles sem rodar
+    ferramentas/simular_portao.py antes -- e barato de testar e caro de
+    descobrir errado numa call.
+    """
+    ativa: bool = os.environ.get("EVA_CONSCIENCIA", "1") == "1"
+    silencio_minimo: float = float(os.environ.get("EVA_SILENCIO_MIN", "40"))
+    cooldown_fala: float = float(os.environ.get("EVA_COOLDOWN_FALA", "30"))
+    limiar_base: float = float(os.environ.get("EVA_LIMIAR_FALA", "0.55"))
+    intervalo_tick: float = 5.0
+    max_fios: int = 8
+    horas_para_fio_azedar: float = 48.0
+
+
+@dataclass
 class VozConfig:
     """Speech-to-text e text-to-speech."""
     # STT via Groq (Whisper). Modelos: whisper-large-v3-turbo (rapido) ou
@@ -157,6 +175,7 @@ class EVAConfig:
     memoria: MemoriaConfig = field(default_factory=MemoriaConfig)
     estado: EstadoConfig = field(default_factory=EstadoConfig)
     identidade: IdentidadeConfig = field(default_factory=IdentidadeConfig)
+    consciencia: ConscienciaConfig = field(default_factory=ConscienciaConfig)
     voz: VozConfig = field(default_factory=VozConfig)
     discord: DiscordConfig = field(default_factory=DiscordConfig)
 
