@@ -35,18 +35,19 @@ o cursor do SQLite.
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 from dataclasses import dataclass, field
 
-from config import EVAConfig, carregar_config
-from context import ContextBuilder
-from decision import DecisorPorLLM, DecisorPorRegras, Plano
-from identity import Pessoa, promover
-from llm import ClienteLLM, ErroLLM
-from memory.extractor import extrair_por_regras
-from memory.store import BancoMemoria
-from state import GerenciadorEstado
-from tools.builtin import carregar_ferramentas
+from .config import EVAConfig, carregar_config
+from .context import ContextBuilder
+from .decision import DecisorPorLLM, DecisorPorRegras, Plano
+from .identity import Pessoa, promover
+from .llm import ClienteLLM, ErroLLM
+from .memory.extractor import extrair_por_llm, extrair_por_regras
+from .memory.store import BancoMemoria
+from .state import GerenciadorEstado
+from .tools.builtin import carregar_ferramentas
 
 
 @dataclass
@@ -65,15 +66,50 @@ class Resultado:
     erro: str | None = None
 
 
+class _ConfigExtrator:
+    """Adaptador leve: ClienteLLM só precisa destes atributos (duck typing).
+
+    Não é um dataclass em EVAConfig porque não é configuração de primeira
+    classe -- é a ponte entre MemoriaConfig (onde os valores vivem de
+    verdade) e o formato que ClienteLLM espera.
+    """
+    def __init__(self, mem_cfg):
+        self.base_url = mem_cfg.extrator_base_url
+        self.api_key = mem_cfg.extrator_api_key
+        self.modelo = mem_cfg.extrator_modelo
+        self.temperatura = 0.0  # extração é tarefa estruturada, não criativa
+        self.top_p = 0.9
+        self.max_tokens = 300
+        self.timeout = mem_cfg.extrator_timeout
+
+
 class EVA:
     def __init__(self, config: EVAConfig | None = None):
         self.cfg = config or carregar_config()
 
-        self.memoria = BancoMemoria(self.cfg.memoria.caminho_db)
+        embeddings = None
+        if self.cfg.memoria.usar_embeddings:
+            from .memory.embeddings import ClienteEmbeddings
+            embeddings = ClienteEmbeddings(
+                base_url=self.cfg.memoria.embeddings_base_url,
+                modelo=self.cfg.memoria.embeddings_modelo,
+                api_key=self.cfg.memoria.embeddings_api_key,
+                timeout=self.cfg.memoria.embeddings_timeout,
+            )
+        self.memoria = BancoMemoria(self.cfg.memoria.caminho_db, embeddings=embeddings)
         self.estado = GerenciadorEstado(self.cfg.estado.caminho, self.cfg.estado.inercia)
         self.ferramentas = carregar_ferramentas()
         self.llm = ClienteLLM(self.cfg.llm)
         self.builder = ContextBuilder(self.cfg)
+
+        # Cliente separado do de conversa: extração de fatos é tarefa
+        # estruturada (JSON), não conversa, e pode ser um modelo diferente
+        # no futuro sem afetar o eva-3b conversacional. `_config_extrator`
+        # é um objeto simples que só carrega o que ClienteLLM precisa
+        # (base_url, api_key, modelo, temperatura, top_p, max_tokens,
+        # timeout) -- não é um dataclass registrado em EVAConfig porque só
+        # existe para essa injeção.
+        self.llm_extrator = ClienteLLM(_ConfigExtrator(self.cfg.memoria))
 
         if self.cfg.decisao.usar_llm:
             self.decisor = DecisorPorLLM(ClienteLLM(self.cfg.decisao), self.ferramentas)
@@ -345,7 +381,10 @@ class EVA:
         reg = self.memoria.pessoa(usuario)
         self.memoria.salvar_pessoa(usuario, turnos=reg["turnos"] + 1)
 
-        # novas memórias
+        # novas memórias -- só as de regra entram aqui, porque são
+        # instantâneas (regex, sem chamada de rede) e o Resultado devolvido
+        # ao chamador já reflete o que foi guardado. A extração por LLM roda
+        # à parte, em segundo plano -- ver _disparar_extracao_llm.
         novas = []
         if plano.guardar_memoria:
             for item in extrair_por_regras(mensagem):
@@ -356,6 +395,30 @@ class EVA:
                 )
                 if id_:
                     novas.append(item)
+
+        # Extração por LLM: cobre o que a regra não pega (declaração
+        # indireta, "estou testando minha IA e o desenvolvimento vai bem"
+        # não tem forma fixa nenhuma pra regex casar). Roda em SEGUNDO
+        # PLANO -- não faz o usuário esperar uma segunda chamada ao modelo
+        # depois que a resposta já saiu. Por isso não entra em `novas`: essa
+        # lista alimenta o Resultado que volta pro chamador AGORA, e o que
+        # a extração em fundo salvar só existe no banco depois, para o
+        # PRÓXIMO turno usar.
+        if plano.guardar_memoria and self.cfg.memoria.extrair_com_llm:
+            self._disparar_extracao_llm(usuario)
+
+        # Consolidação periódica (memory/consolidacao.py): não a cada
+        # turno -- é trabalho pesado (embedding de dezenas de memórias,
+        # comparação par a par) que só compensa de tempos em tempos.
+        # `reg["turnos"]` já é o contador de turnos DESSA pessoa, então o
+        # intervalo é por usuário, não global -- alguém que conversa muito
+        # consolida mais vezes que alguém que mal fala, o que é o
+        # comportamento certo (mais conversa = mais memória acumulando).
+        turnos_novo = reg["turnos"] + 1
+        intervalo = self.cfg.memoria.consolidar_a_cada_turnos
+        if (self.cfg.memoria.consolidar_com_llm and intervalo > 0
+                and turnos_novo % intervalo == 0):
+            self._disparar_consolidacao(usuario)
 
         # estado interno
         #
@@ -410,6 +473,135 @@ class EVA:
             "decisor": "llm" if self.cfg.decisao.usar_llm else "regras",
             "banco": str(self.cfg.memoria.caminho_db),
         }
+
+    async def pesquisar_lacuna(self, consulta: str) -> str | None:
+        """Busca em fundo o que uma mensagem pode ter deixado sem resposta
+        atualizada, e devolve um resumo pronto para virar impulso de
+        iniciativa -- ou None se a busca não trouxe nada útil.
+
+        Quem chama isto é o bridge_client (ou qualquer integração que tenha
+        uma Consciencia por perto), a partir de `Resultado.plano.
+        possivel_lacuna`. O EVA não conhece Consciencia de propósito -- ele
+        continua utilizável sozinho pela CLI, sem call nem iniciativa
+        nenhuma. A ponte fica do lado de quem já sabe orquestrar os dois.
+
+        `async def` direto, sem variante sync: pesquisar_lacuna só faz
+        sentido vindo de uma integração que já vive num loop (bridge,
+        Discord) -- não existe caso de uso pela CLI síncrona.
+        """
+        try:
+            resultado = await asyncio.to_thread(
+                self.ferramentas.executar, "buscar", consulta=consulta)
+        except Exception as e:
+            if self.cfg.debug:
+                print(f"[lacuna] erro ao buscar '{consulta[:60]}': {e}")
+            return None
+
+        if not isinstance(resultado, dict) or resultado.get("erro"):
+            return None
+
+        resumo = resultado.get("resumo")
+        if not resumo:
+            relacionados = resultado.get("relacionados") or []
+            resumo = relacionados[0] if relacionados else None
+        if not resumo:
+            return None
+
+        # "segundo uma busca" fica explícito de propósito -- você pediu que
+        # ela possa citar que pesquisou, em vez de falar como se já soubesse.
+        return f"segundo uma busca sobre isso: {resumo}"
+
+    def _disparar_extracao_llm(self, usuario: str) -> None:
+        """Roda extrair_por_llm em segundo plano, sem bloquear a resposta.
+
+        Dois caminhos porque `responder` é chamado tanto de dentro de um
+        event loop (bridge, Discord) quanto de fora dele (CLI). Detectar
+        qual é o certo em vez de assumir um dos dois evita que a CLI quebre
+        silenciosamente sem loop, ou que o caminho async bloqueie por usar
+        thread manual onde já existe um loop rodando pra fazer isso melhor.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        if loop is not None:
+            loop.create_task(self._extrair_e_salvar_async(usuario))
+        else:
+            threading.Thread(
+                target=self._extrair_e_salvar, args=(usuario,), daemon=True
+            ).start()
+
+    async def _extrair_e_salvar_async(self, usuario: str) -> None:
+        await asyncio.to_thread(self._extrair_e_salvar, usuario)
+
+    def _extrair_e_salvar(self, usuario: str) -> None:
+        """O trabalho de verdade: busca histórico recente, pede fatos ao
+        LLM, grava o que vier. Roda fora do caminho principal -- exceção
+        aqui NUNCA deve derrubar a conversa, só fica no log.
+
+        `self.memoria` é seguro entre threads (BancoMemoria tem RLock), mas
+        se a EVA for fechada (`fechar()`) enquanto isso ainda roda, o
+        SQLite pode já estar fechado -- daí o except genérico no fim: uma
+        falha aqui é invisível para o usuário por natureza (a resposta já
+        foi entregue), então não vale derrubar nada, só avisar no log.
+        """
+        try:
+            historico = self.memoria.historico(usuario=usuario, limite=8)
+            fatos = extrair_por_llm(historico, self.llm_extrator)
+            for item in fatos:
+                self.memoria.adicionar(
+                    tipo=item["tipo"], conteudo=item["conteudo"],
+                    usuario=usuario, fonte=item["fonte"],
+                    confianca=item["confianca"],
+                )
+            if fatos and self.cfg.debug:
+                print(f"[memoria-llm] {usuario}: {[f['conteudo'] for f in fatos]}")
+        except Exception as e:
+            if self.cfg.debug:
+                print(f"[memoria-llm] erro ao extrair para {usuario}: {e}")
+
+    def _disparar_consolidacao(self, usuario: str) -> None:
+        """Mesmo padrão de _disparar_extracao_llm: thread solta no
+        caminho síncrono, task no caminho async. Consolidação é ainda mais
+        best-effort que extração -- se falhar, o pior caso é a memória
+        continuar crescendo sem resumir, não uma perda de dado.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        if loop is not None:
+            loop.create_task(self._consolidar_async(usuario))
+        else:
+            threading.Thread(
+                target=self._consolidar, args=(usuario,), daemon=True
+            ).start()
+
+    async def _consolidar_async(self, usuario: str) -> None:
+        await asyncio.to_thread(self._consolidar, usuario)
+
+    def _consolidar(self, usuario: str) -> None:
+        """O trabalho de verdade: agrupa memórias antigas similares em
+        resumos. Ver memory/consolidacao.py para o algoritmo.
+
+        Sem `self.memoria.embeddings` configurado (LM Studio sem o modelo
+        de embedding, ou EVA_EMBEDDINGS=0), `candidatos_para_consolidar`
+        sempre devolve vazio -- não há vetor pra comparar -- então isso
+        roda sem erro e sem efeito, sem precisar de um if extra aqui.
+        """
+        try:
+            from .memory.consolidacao import consolidar_usuario
+            resumos = consolidar_usuario(
+                self.memoria, usuario=usuario,
+                dias_minimo=self.cfg.memoria.consolidar_dias_minimo,
+            )
+            if resumos and self.cfg.debug:
+                print(f"[consolidacao] {usuario}: {len(resumos)} resumo(s) -> {resumos}")
+        except Exception as e:
+            if self.cfg.debug:
+                print(f"[consolidacao] erro para {usuario}: {e}")
 
     def fechar(self) -> None:
         self.estado.salvar()

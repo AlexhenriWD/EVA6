@@ -136,6 +136,11 @@ class Memoria:
     acessos: int = 0
     meta: dict | None = None
     score: float = 0.0
+    # Quando esta memoria foi absorvida por um resumo semantico (ver
+    # consolidacao.py), ou None se nunca consolidada. Nao afeta busca --
+    # a memoria original continua pesquisavel mesmo apos consolidar; o
+    # resumo e um ADICIONAL, nao uma substituicao que apaga o detalhe.
+    consolidado_em: float | None = None
 
     def __str__(self) -> str:
         return self.conteudo
@@ -204,10 +209,20 @@ def _preparar_consulta(texto: str, expandir: bool = True) -> str:
 
 
 class BancoMemoria:
-    def __init__(self, caminho: Path | str):
+    def __init__(self, caminho: Path | str, embeddings=None):
+        """`embeddings` é opcional -- um ClienteEmbeddings (ver embeddings.py).
+
+        Sem ele, o banco funciona exatamente como antes: só FTS5/BM25. Com
+        ele, `adicionar` grava o vetor junto e `buscar` passa a combinar
+        BM25 com similaridade de cosseno. Opcional de propósito: um banco
+        criado sem embeddings continua abrindo e funcionando se um dia o
+        LM Studio estiver fora do ar -- só perde a metade semântica da
+        busca, não trava.
+        """
         self.caminho = Path(caminho)
         self.caminho.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
+        self.embeddings = embeddings
         self.con = sqlite3.connect(str(self.caminho), check_same_thread=False)
         self.con.row_factory = sqlite3.Row
         # WAL deixa leitura e escrita concorrerem sem bloquear uma a outra.
@@ -246,6 +261,19 @@ class BancoMemoria:
                     "DEFAULT 'default'"
                 )
 
+        # embedding: NULL em linhas antigas ate serem regeradas (nao ha
+        # como recalcular em massa sem custo de rede -- fica pra
+        # consolidacao.py preencher sob demanda, nao aqui na migracao).
+        # consolidado_em: quando a memoria foi absorvida por um resumo
+        # semantico; NULL enquanto nunca consolidada. Ver consolidacao.py.
+        colunas_mem = {r["name"] for r in
+                       self.con.execute("PRAGMA table_info(memorias)")}
+        if colunas_mem and "embedding" not in colunas_mem:
+            self.con.execute("ALTER TABLE memorias ADD COLUMN embedding BLOB")
+        if colunas_mem and "consolidado_em" not in colunas_mem:
+            self.con.execute(
+                "ALTER TABLE memorias ADD COLUMN consolidado_em REAL")
+
     def renomear_usuario(self, de: str, para: str) -> int:
         """Move todas as memorias e turnos de um id para outro."""
         with self._lock:
@@ -271,6 +299,7 @@ class BancoMemoria:
         confianca: float = 0.8,
         meta: dict | None = None,
         evitar_duplicata: bool = True,
+        gerar_embedding: bool = True,
     ) -> int | None:
         """Grava uma memoria. Retorna o id, ou None se foi ignorada.
 
@@ -278,12 +307,32 @@ class BancoMemoria:
         mesmo tipo e do mesmo usuario. Sem isso, a mesma informacao entraria
         a cada conversa e acabaria dominando o contexto por repeticao, nao
         por relevancia.
+
+        `gerar_embedding` chama o servidor de embeddings (rede) SE
+        `self.embeddings` estiver configurado. BEST-EFFORT: falha aqui
+        (LM Studio fora do ar, timeout) nunca impede a memoria de ser
+        salva -- ela so fica sem embedding, e busca cai pra FTS5 puro
+        naquele item ate uma consolidacao futura preencher. `adicionar` e
+        chamado no caminho de resposta ao usuario (via _pos_processar); se
+        a rede de embeddings travar, a conversa nao pode travar junto.
+        Quem quer desligar por completo (ex: importacao em massa, onde
+        centenas de chamadas de rede sequenciais seriam inviaveis) passa
+        gerar_embedding=False e roda em lote depois.
         """
         if tipo not in TIPOS:
             raise ValueError(f"tipo invalido: {tipo}. Use um de {TIPOS}")
         conteudo = conteudo.strip()
         if not conteudo:
             return None
+
+        embedding_blob = None
+        if gerar_embedding and self.embeddings is not None:
+            try:
+                from .embeddings import vetor_para_blob
+                embedding_blob = vetor_para_blob(
+                    self.embeddings.gerar_documento(conteudo))
+            except Exception:
+                embedding_blob = None  # best-effort -- ver docstring acima
 
         with self._lock:
             if evitar_duplicata:
@@ -295,14 +344,26 @@ class BancoMemoria:
                         "acessado_em = ? WHERE id = ?",
                         (time.time(), existente),
                     )
+                    # Se essa memoria existente ainda nao tinha embedding
+                    # (foi salva antes do servidor estar disponivel, por
+                    # exemplo) e agora conseguimos gerar um, preenche --
+                    # e como a consolidacao vai encontrar o vetor sem
+                    # esperar uma rodada de preenchimento em lote separada.
+                    if embedding_blob is not None:
+                        self.con.execute(
+                            "UPDATE memorias SET embedding=? "
+                            "WHERE id=? AND embedding IS NULL",
+                            (embedding_blob, existente),
+                        )
                     self.con.commit()
                     return existente
 
             cur = self.con.execute(
                 "INSERT INTO memorias (usuario, tipo, conteudo, fonte, confianca, "
-                "criado_em, meta) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "criado_em, meta, embedding) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (usuario, tipo, conteudo, fonte, confianca, time.time(),
-                 json.dumps(meta, ensure_ascii=False) if meta else None),
+                 json.dumps(meta, ensure_ascii=False) if meta else None,
+                 embedding_blob),
             )
             self.con.commit()
             return cur.lastrowid
@@ -349,52 +410,129 @@ class BancoMemoria:
         limite: int = 5,
         score_minimo: float = 0.0,
     ) -> list[Memoria]:
-        """Busca por relevancia (BM25), com ajuste por confianca e recencia."""
-        fts = _preparar_consulta(consulta)
-        if not fts:
-            return []
+        """Busca por relevancia. BM25 sempre; embedding complementa quando
+        `self.embeddings` esta configurado.
 
-        sql = """
-            SELECT m.*, bm25(memorias_fts) AS rank
-            FROM memorias_fts
-            JOIN memorias m ON m.id = memorias_fts.rowid
-            WHERE memorias_fts MATCH ? AND m.ativo = 1 AND m.usuario = ?
+        HIBRIDA, NAO SUBSTITUTA: BM25 continua rodando do jeito que sempre
+        rodou -- nome proprio, termo raro, sigla ("Alex", "postgres")
+        casam melhor em BM25 que em embedding, que tende a borrar isso.
+        O embedding entra pra cobrir o caso que BM25 estruturalmente nao
+        resolve: pergunta e fato sem NENHUMA palavra em comum ("que
+        sistema operacional eu uso" vs "usa Arch Linux"). Os dois
+        conjuntos de resultado sao unidos por id (uma memoria pode vir
+        dos dois) e reordenados pelo melhor score entre os dois metodos.
+
+        Sem `self.embeddings` configurado, ou se a chamada de rede falhar,
+        cai para BM25 puro -- exatamente o comportamento de antes desta
+        mudanca. Best-effort, igual a escrita: busca nunca trava esperando
+        embedding.
         """
-        params: list = [fts, usuario]
-        if tipo:
-            sql += " AND m.tipo = ?"
-            params.append(tipo)
-        sql += " ORDER BY rank LIMIT ?"
-        params.append(limite * 3)  # pega extra para reordenar depois
+        agora = time.time()
+        por_id: dict[int, Memoria] = {}
 
-        with self._lock:
-            try:
-                linhas = list(self.con.execute(sql, params))
-            except sqlite3.OperationalError:
-                # consulta malformada nao deve derrubar a conversa
-                return []
+        # ---------------------------------------------------------- BM25
+        fts = _preparar_consulta(consulta)
+        if fts:
+            sql = """
+                SELECT m.*, bm25(memorias_fts) AS rank
+                FROM memorias_fts
+                JOIN memorias m ON m.id = memorias_fts.rowid
+                WHERE memorias_fts MATCH ? AND m.ativo = 1 AND m.usuario = ?
+            """
+            params: list = [fts, usuario]
+            if tipo:
+                sql += " AND m.tipo = ?"
+                params.append(tipo)
+            sql += " ORDER BY rank LIMIT ?"
+            params.append(limite * 3)
 
-            agora = time.time()
-            resultados = []
+            with self._lock:
+                try:
+                    linhas = list(self.con.execute(sql, params))
+                except sqlite3.OperationalError:
+                    # consulta malformada nao deve derrubar a conversa
+                    linhas = []
+
             for r in linhas:
                 # bm25 do SQLite e negativo, quanto menor melhor
                 base = -float(r["rank"])
-                # memoria recente vale um pouco mais; meia-vida de ~60 dias
                 idade_dias = (agora - r["criado_em"]) / 86400
                 recencia = 0.5 ** (idade_dias / 60)
                 score = base * (0.6 + 0.4 * r["confianca"]) * (0.75 + 0.25 * recencia)
-                resultados.append(self._para_memoria(r, score=score))
+                por_id[r["id"]] = self._para_memoria(r, score=score)
 
-            resultados.sort(key=lambda m: m.score, reverse=True)
-            resultados = [m for m in resultados if m.score >= score_minimo][:limite]
+        # ------------------------------------------------------ embedding
+        if self.embeddings is not None:
+            candidatos = self._buscar_por_embedding(
+                consulta, usuario=usuario, tipo=tipo, limite=limite * 3, agora=agora)
+            for mem in candidatos:
+                # Uma memoria que ja veio do BM25 fica com o MAIOR dos dois
+                # scores, nao a soma -- somar inflaria artificialmente algo
+                # que so e relevante por uma via, e o objetivo aqui e unir
+                # cobertura, nao acumular pontuacao.
+                if mem.id in por_id:
+                    por_id[mem.id].score = max(por_id[mem.id].score, mem.score)
+                else:
+                    por_id[mem.id] = mem
 
-            for m in resultados:
-                self.con.execute(
-                    "UPDATE memorias SET acessos = acessos + 1, acessado_em = ? "
-                    "WHERE id = ?", (agora, m.id),
-                )
-            self.con.commit()
-            return resultados
+        resultados = sorted(por_id.values(), key=lambda m: m.score, reverse=True)
+        resultados = [m for m in resultados if m.score >= score_minimo][:limite]
+
+        if resultados:
+            with self._lock:
+                for m in resultados:
+                    self.con.execute(
+                        "UPDATE memorias SET acessos = acessos + 1, acessado_em = ? "
+                        "WHERE id = ?", (agora, m.id),
+                    )
+                self.con.commit()
+        return resultados
+
+    def _buscar_por_embedding(
+        self, consulta: str, *, usuario: str, tipo: str | None,
+        limite: int, agora: float,
+    ) -> list[Memoria]:
+        """Metade semantica da busca hibrida. So chamada por `buscar` --
+        nao publica porque nao faz sentido sem o lado BM25 complementando.
+        """
+        from .embeddings import blob_para_vetor, cosseno
+
+        try:
+            vetor_consulta = self.embeddings.gerar_consulta(consulta)
+        except Exception:
+            return []  # best-effort -- ver docstring de `buscar`
+
+        sql = ("SELECT * FROM memorias WHERE ativo=1 AND usuario=? "
+               "AND embedding IS NOT NULL")
+        params: list = [usuario]
+        if tipo:
+            sql += " AND tipo=?"
+            params.append(tipo)
+
+        with self._lock:
+            linhas = list(self.con.execute(sql, params))
+
+        pontuados = []
+        for r in linhas:
+            try:
+                vetor_mem = blob_para_vetor(r["embedding"])
+            except Exception:
+                continue  # blob corrompido/formato antigo -- pula, nao quebra
+            sim = cosseno(vetor_consulta, vetor_mem)
+            if sim <= 0:
+                continue
+            idade_dias = (agora - r["criado_em"]) / 86400
+            recencia = 0.5 ** (idade_dias / 60)
+            # Escala de score PROPOSITALMENTE no mesmo raio de grandeza do
+            # BM25 (tipicamente 0-tantos, nao 0.0-1.0) -- cosseno bruto
+            # (0 a 1) ficaria sempre perdendo na comparacao "max" contra
+            # BM25 mesmo quando semanticamente e o resultado certo. 10x e
+            # calibracao inicial; ajuste observando buscas reais.
+            score = sim * 10 * (0.6 + 0.4 * r["confianca"]) * (0.75 + 0.25 * recencia)
+            pontuados.append(self._para_memoria(r, score=score))
+
+        pontuados.sort(key=lambda m: m.score, reverse=True)
+        return pontuados[:limite]
 
     def fatos_nucleo(self, *, usuario: str, limite: int = 3) -> list[Memoria]:
         """Fatos estaveis e frequentemente uteis sobre a pessoa.
@@ -441,13 +579,15 @@ class BancoMemoria:
 
     @staticmethod
     def _para_memoria(r, score: float = 0.0) -> Memoria:
+        chaves = r.keys()
         return Memoria(
             id=r["id"], tipo=r["tipo"], conteudo=r["conteudo"],
-            usuario=r["usuario"] if "usuario" in r.keys() else "default",
+            usuario=r["usuario"] if "usuario" in chaves else "default",
             fonte=r["fonte"], confianca=r["confianca"],
             criado_em=r["criado_em"], acessos=r["acessos"],
             meta=json.loads(r["meta"]) if r["meta"] else None,
             score=score,
+            consolidado_em=r["consolidado_em"] if "consolidado_em" in chaves else None,
         )
 
     # ---------- historico de conversa ----------
@@ -527,6 +667,54 @@ class BancoMemoria:
         with self._lock:
             return [r["usuario"] for r in self.con.execute(
                 "SELECT DISTINCT usuario FROM memorias ORDER BY usuario")]
+
+    # ---------- suporte a consolidacao.py ----------
+
+    def candidatos_para_consolidar(
+        self, *, usuario: str, tipo: str | None = None,
+        dias_minimo: float = 14.0, limite: int = 50,
+    ) -> list[Memoria]:
+        """Memorias elegiveis para virar resumo semantico.
+
+        Criterio: mais velhas que `dias_minimo`, ainda ativas, ainda com
+        embedding gerado (sem embedding nao ha como agrupar por
+        similaridade -- ver consolidacao.py), e nunca consolidadas.
+        `dias_minimo` existe para nao consolidar algo ainda "quente": uma
+        memoria de ontem ainda deveria aparecer como ela mesma no
+        contexto, nao pre-resumida.
+        """
+        limite_tempo = time.time() - dias_minimo * 86400
+        sql = ("SELECT * FROM memorias WHERE usuario=? AND ativo=1 "
+               "AND embedding IS NOT NULL AND consolidado_em IS NULL "
+               "AND criado_em < ?")
+        params: list = [usuario, limite_tempo]
+        if tipo:
+            sql += " AND tipo=?"
+            params.append(tipo)
+        sql += " ORDER BY criado_em ASC LIMIT ?"
+        params.append(limite)
+
+        with self._lock:
+            linhas = list(self.con.execute(sql, params))
+        return [self._para_memoria(r) for r in linhas]
+
+    def marcar_consolidadas(self, ids: list[int]) -> None:
+        """Marca memorias como absorvidas por um resumo.
+
+        NAO desativa (`ativo` continua 1) -- a memoria original permanece
+        buscavel. Consolidar e sobre criar um resumo ADICIONAL para reduzir
+        o que entra no contexto por padrao, nao sobre apagar detalhe.
+        """
+        if not ids:
+            return
+        agora = time.time()
+        with self._lock:
+            placeholders = ",".join("?" * len(ids))
+            self.con.execute(
+                f"UPDATE memorias SET consolidado_em=? WHERE id IN ({placeholders})",
+                [agora, *ids],
+            )
+            self.con.commit()
 
     def fechar(self) -> None:
         with self._lock:

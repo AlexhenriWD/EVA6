@@ -45,6 +45,14 @@ class Plano:
     guardar_memoria: bool = True
     motivo: str = ""
 
+    # Sinal de "isso pode estar fora do que a EVA sabe" -- não dispara
+    # ferramenta no turno atual (diferente de precisa_ferramenta/buscar,
+    # que já busca IMEDIATO para responder). Este é para o orquestrador
+    # pesquisar em SEGUNDO PLANO e guardar o achado para trazer à tona
+    # depois, na iniciativa, via Consciencia.pesquisa_pronta(). Ver
+    # LACUNA_CONHECIMENTO em decision.py.
+    possivel_lacuna: str = ""
+
     def to_dict(self) -> dict:
         return asdict(self)
 
@@ -94,6 +102,35 @@ BUSCA = re.compile(
 BUSCA_RELATO = re.compile(
     r"\b(pesquisei|busquei|procurei|andei pesquisando|tentei achar|"
     r"j[áa] pesquisei|j[áa] procurei)\b", re.I
+)
+
+# ------------------------------------------------- lacuna de conhecimento
+#
+# Diferente de BUSCA (pedido explícito, busca AGORA para responder), isto
+# é sobre tema que SOA como fato-que-muda mesmo sem pedido de busca --
+# "o que você acha do mercado de IA agora", "fale sobre a Fórmula 1 esse
+# ano". A EVA responde do que já sabe (treino), que pode estar
+# desatualizado, e o usuário não tem como perceber isso.
+#
+# Não é substituto de julgamento -- é rede grosseira e rápida (regex, zero
+# custo), porque não pode ter o delay de uma chamada de LLM em todo turno.
+# Ela vai ERRAR: vai marcar coisa que não precisava, vai perder coisa
+# sutil. É aceitável porque o efeito de marcar errado é pesquisa em
+# segundo plano que talvez nunca seja usada (TTL expira, ver
+# consciousness.py) -- não é dito ao usuário, não interrompe nada.
+#
+# Dois sinais, and não or: sozinho, "mercado" ou "atual" aparecem demais
+# em conversa comum. Junto -- tema que muda (mercado, tecnologia, versão,
+# notícia, preço) E marcador de tempo presente/recente (agora, hoje, esse
+# ano, atualmente) -- é bem mais específico do que exige checagem.
+LACUNA_TEMA = re.compile(
+    r"\b(mercado|tecnologia|ia\b|intelig[êe]ncia artificial|not[íi]cia|"
+    r"pre[çc]o|vers[ãa]o|lan[çc]amento|eleiç[ãa]o|governo|guerra|"
+    r"empresa|startup|criptomoeda|bolsa|a[çc][õo]es)\b", re.I
+)
+LACUNA_TEMPORAL = re.compile(
+    r"\b(agora|hoje|atualmente|esse ano|este ano|ultimamente|"
+    r"recentemente|nos [úu]ltimos|em 202\d)\b", re.I
 )
 
 # Perguntas sobre a própria EVA -- não precisam de memória do usuário nem
@@ -185,8 +222,18 @@ class DecisorPorRegras:
 
         # Busca só com pedido explícito, sem carga emocional alta e sem ser
         # relato no passado. "pesquisei tanto e não achei sentido" é desabafo.
+        busca_ja_acionada = False
         if BUSCA.search(texto) and p.carga_emocional < 0.5 and not BUSCA_RELATO.search(texto):
             ferramentas.append({"nome": "buscar", "args": {"consulta": texto[:200]}})
+            busca_ja_acionada = True
+
+        # Lacuna de conhecimento: não busca AGORA (não atrasa a resposta),
+        # só marca para o orquestrador pesquisar em segundo plano. Só marca
+        # se a busca imediata não disparou -- senão a mesma pesquisa
+        # aconteceria duas vezes por motivos diferentes.
+        if (not busca_ja_acionada and p.carga_emocional < 0.5
+                and LACUNA_TEMA.search(texto) and LACUNA_TEMPORAL.search(texto)):
+            p.possivel_lacuna = texto[:200]
 
         if ferramentas:
             p.precisa_ferramenta = True

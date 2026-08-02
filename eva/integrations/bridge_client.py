@@ -120,6 +120,33 @@ class ClienteBridge:
             self.consciencias[gid] = Consciencia(self.cfg, canal=gid)
         return self.consciencias[gid]
 
+    def _nome(self, usuario: str) -> str | None:
+        """Nome da pessoa, se a EVA já souber. A voz do Discord só entrega
+        user_id -- o nome vem da tabela `pessoas`, alimentada pelo texto."""
+        try:
+            return self.eva.memoria.pessoa(str(usuario)).get("nome") or None
+        except Exception:
+            return None
+
+    async def _pesquisar_e_registrar(self, guild_id: str, consulta: str) -> None:
+        """Pesquisa em fundo e, se achar algo, alimenta a Consciencia.
+
+        Roda solto via create_task -- exceção aqui nunca deve propagar pro
+        chamador, porque quem chamou já seguiu em frente. Falha aqui é
+        equivalente a "não achou nada": silenciosa, sem efeito colateral
+        visível para o usuário.
+        """
+        try:
+            resumo = await self.eva.pesquisar_lacuna(consulta)
+        except Exception as e:
+            if self.cfg.debug:
+                print(f"[lacuna] erro: {e}")
+            return
+        if resumo:
+            self.consciencia(guild_id).pesquisa_pronta(resumo)
+            if self.cfg.debug:
+                print(f"[lacuna] impulso registrado: {resumo[:80]}")
+
     def _tts_tocando(self, guild_id: str) -> bool:
         return self.estado(guild_id).falando
 
@@ -233,9 +260,16 @@ class ClienteBridge:
                 return
 
             print(f"[call] {user_id}: {t.texto}")
-            self.consciencia(guild_id).alguem_falou(str(user_id), t.texto)
+            self.consciencia(guild_id).alguem_falou(
+                str(user_id), t.texto, nome=self._nome(user_id))
 
-            r = await asyncio.to_thread(self.eva.responder, t.texto)
+            # `usuario=` é o que separa a memória de cada pessoa na call.
+            # Sem ele, tudo cai no dono da instância e a EVA cita para um
+            # o que o outro contou. `modo_voz=True` acrescenta a linha
+            # "MODO: VOZ" treinada e baixa o teto de 400 para 120 tokens --
+            # 400 tokens são uns 40 segundos de fala.
+            r = await self.eva.responder_async(
+                t.texto, usuario=str(user_id), modo_voz=True)
             if r.erro:
                 print(f"[eva] {r.erro}")
                 return
@@ -245,6 +279,15 @@ class ClienteBridge:
             print(f"[eva] {r.resposta}")
             await self.falar(guild_id, r.resposta)
             self.consciencia(guild_id).ela_falou()
+
+            # Lacuna de conhecimento: a mensagem tocou em algo que pode
+            # estar desatualizado no que a EVA sabe. Não bloqueia nada --
+            # dispara como task solta; se terminar, vira impulso de
+            # iniciativa; se não terminar a tempo ou não achar nada, não
+            # acontece nada (sem aviso, sem erro visível).
+            if r.plano.possivel_lacuna:
+                asyncio.create_task(
+                    self._pesquisar_e_registrar(guild_id, r.plano.possivel_lacuna))
 
     # ------------------------------------------------------------ texto
 
@@ -300,7 +343,9 @@ class ClienteBridge:
 
         async with est.processando:
             await self._enviar({"type": "typing", "channel_id": canal})
-            r = await asyncio.to_thread(self.eva.responder, texto)
+            autor = str(d.get("author_id") or canal)
+            self.consciencia(gid).registrar_nome(autor, d.get("author_name"))
+            r = await self.eva.responder_async(texto, usuario=autor)
 
             if r.erro:
                 await self.enviar_mensagem(
@@ -314,6 +359,10 @@ class ClienteBridge:
             # se estiver numa call desse servidor, fala também
             if est.canal_id:
                 await self.falar(gid, r.resposta)
+
+            if r.plano.possivel_lacuna:
+                asyncio.create_task(
+                    self._pesquisar_e_registrar(gid, r.plano.possivel_lacuna))
 
     async def _transcrever_anexo(self, anexo: dict, canal: str) -> str | None:
         if not self.stt.disponivel():

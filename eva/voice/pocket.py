@@ -43,8 +43,8 @@ from typing import AsyncIterator, Optional, Union
 
 import numpy as np
 
+from .audio import alinhar_frames
 from .audio_utils import (
-    alinhar_frames,
     float32_to_int16_fixed_scale,
     float_audio_to_int16,
     iterate_blocking_generator,
@@ -87,6 +87,12 @@ class ErroPocketTTS(Exception):
 
 class PocketTTSEngine:
     """Pocket TTS: CPU, clonagem zero-shot, streaming nativo."""
+
+    # Abaixo disso, o áudio às vezes sai como ruído em vez de fala -- ver o
+    # comentário em gerar_para_discord. Não é limite documentado pelo
+    # Kyutai, é observação empírica; ajuste se medir outro número no seu
+    # hardware/voz de referência.
+    PISO_CARACTERES = 15
 
     def __init__(
         self,
@@ -204,11 +210,34 @@ class PocketTTSEngine:
         longos), mantém tudo em float cru, e só depois de concatenar
         normaliza e resampleia -- uma vez cada. Fazer isso por sentença
         causaria salto de volume e descontinuidade.
+
+        PISO MÍNIMO DE ENTRADA (achado em produção, não documentado pelo
+        Kyutai): texto muito curto -- "Bom.", "Sim." -- às vezes produz só
+        um som sem a palavra inteira, em vez de fala. Modelo de síntese
+        precisa de contexto fonético mínimo pra estabilizar a prosódia; com
+        poucos caracteres ele não tem o que prever direito. Isso pega em
+        cheio o dataset da EVA: mediana de resposta é 74 chars, mas há
+        exemplos de 4 ("Boa."), e em modo voz o teto empurra pra respostas
+        ainda mais curtas.
+
+        Não há chunk anterior pra fundir aqui -- diferente do
+        split_into_sentences, isto é o TEXTO INTEIRO da resposta, não um
+        fragmento de um texto maior. A única saída real sem trocar de
+        modelo é aceitar a fala como está (arriscando degradação) ou pedir
+        pro modelo tentar de novo -- e mais uma vez não muda o texto de
+        entrada, então não resolve nada. Por ora: log de aviso, para você
+        saber quando está acontecendo e decidir se vale ajustar o dataset
+        (menos respostas ultra-curtas em modo voz) em vez de mascarar aqui.
         """
         if not texto or not texto.strip():
             return b""
         if not self._carregado:
             await self.inicializar()
+
+        texto = texto.strip()
+        if len(texto) < self.PISO_CARACTERES:
+            print(f"[pocket-tts] aviso: texto curto ({len(texto)} chars) "
+                  f"pode sair degradado: {texto!r}", flush=True)
 
         sentencas = split_into_sentences(texto) or [texto]
 

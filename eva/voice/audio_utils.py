@@ -149,6 +149,21 @@ def split_into_sentences(text: str, min_chars: int = 20) -> List[str]:
     """
     Divide texto em sentenças, mesclando fragmentos curtos até atingir
     `min_chars`, para não gerar chunks minúsculos demais para o TTS.
+
+    Chunk abaixo do mínimo produz áudio degradado -- pouco contexto
+    fonético faz o modelo gerar prosódia instável, às vezes só um som sem
+    a palavra inteira ("Bom." virando um ruído em vez da palavra). O bug
+    original: o acúmulo `buf` era despejado no final do loop mesmo abaixo
+    de `min_chars`, então QUALQUER resposta cujo texto inteiro fosse menor
+    que o mínimo saía como um chunk curto de qualquer forma -- e isso
+    inclui boa parte do dataset, cuja mediana de resposta é 74 caracteres
+    e tem exemplos de 4 ("Boa.").
+
+    Fix: se o último fragmento acumulado ainda estiver abaixo do mínimo,
+    ele se funde ao fragmento anterior já fechado em vez de sair sozinho.
+    Só fica curto mesmo se o texto INTEIRO for menor que min_chars -- nesse
+    caso não há com o que fundir, e authorship do modelo já deveria evitar
+    respostas tão curtas em modo voz.
     """
     raw = [s.strip() for s in _SENTENCE_END_RE.split(text) if s.strip()]
     if not raw:
@@ -161,8 +176,16 @@ def split_into_sentences(text: str, min_chars: int = 20) -> List[str]:
         if len(buf) >= min_chars:
             merged.append(buf)
             buf = ""
+
     if buf:
-        merged.append(buf)
+        if merged and len(buf) < min_chars:
+            # funde ao chunk anterior em vez de mandar sozinho e curto --
+            # ele já passou do mínimo, um pouco mais não degrada nada
+            merged[-1] = f"{merged[-1]} {buf}".strip()
+        else:
+            # não há chunk anterior para fundir (texto inteiro é curto):
+            # não tem como não ser curto, mas ao menos não fica pior
+            merged.append(buf)
     return merged
 
 

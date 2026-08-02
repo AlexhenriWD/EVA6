@@ -21,7 +21,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from context import LINHA_CONHECIDO, LINHA_CRIADOR
+from .context import LINHA_CONHECIDO, LINHA_CRIADOR
 
 CRIADOR = "criador"
 CONHECIDO = "conhecido"

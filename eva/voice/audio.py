@@ -142,7 +142,7 @@ def para_pcm_discord(audio: bytes, formato: str = "wav") -> bytes:
 
     raise ErroAudio(
         f"não consigo converter '{formato}' sem ffmpeg.\n"
-        "Instale o ffmpeg, ou use um backend de TTS que produza WAV (piper)."
+        "Instale o ffmpeg."
     )
 
 

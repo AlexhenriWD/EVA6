@@ -153,39 +153,68 @@ def clima(cidade: str) -> dict:
     cara=True,
 )
 def buscar(consulta: str) -> dict:
-    """Busca via DuckDuckGo Instant Answer (sem chave).
+    """Busca via SearXNG local (metabusca open-source, self-hosted).
 
-    Cobertura limitada -- serve para definicoes e entidades. Para busca
-    completa, trocar por uma API com chave (Brave, Serper, Tavily).
+    SUBSTITUIU o DuckDuckGo Instant Answer, que tinha dois problemas
+    reais em uso: cobertura estreita demais (só resolvia entidade/definição
+    curta -- "Python" sozinho funcionava, "Python linguagem de programação"
+    já não trazia nada, e frase/pergunta natural quase nunca trazia), e a
+    API oficial (api.duckduckgo.com) passou a devolver 403 em alguns
+    ambientes de rede, sem relação com chave ou rate limit.
+
+    SearXNG resolve os dois: agrega vários motores (DuckDuckGo, Wikipedia,
+    Brave, Bing -- configurados em searxng/settings.yml) numa consulta só,
+    então a cobertura de qualquer um deles individualmente falhando não
+    derruba a busca inteira. E por rodar local (docker-compose.yml na raiz
+    do projeto), não depende de política de bloqueio de terceiro.
+
+    Requer o container rodando: docker compose up -d (a partir da raiz do
+    projeto). Se a instância não responder, o erro diz exatamente isso, em
+    vez de um traceback de conexão recusada sem contexto.
     """
+    base_url = os.environ.get("EVA_SEARXNG_URL", "http://127.0.0.1:8080")
+
     try:
+        import urllib.error
         import urllib.parse
         import urllib.request
         import json as _json
 
-        url = ("https://api.duckduckgo.com/?q=" + urllib.parse.quote(consulta)
-               + "&format=json&no_html=1&skip_disambig=1")
+        url = (base_url.rstrip("/") + "/search?q=" + urllib.parse.quote(consulta)
+               + "&format=json&language=pt-BR")
         req = urllib.request.Request(url, headers={"User-Agent": "EVA/1.0"})
-        with urllib.request.urlopen(req, timeout=8) as r:
+        with urllib.request.urlopen(req, timeout=10) as r:
             dados = _json.loads(r.read())
 
-        resumo = dados.get("AbstractText") or ""
-        relacionados = [
-            t.get("Text", "") for t in dados.get("RelatedTopics", [])[:3]
-            if isinstance(t, dict) and t.get("Text")
-        ]
-
-        if not resumo and not relacionados:
+        resultados = dados.get("results") or []
+        if not resultados:
             return {"consulta": consulta, "resultados": [], "aviso": "sem_resultado"}
+
+        # SearXNG devolve muitos campos por resultado (engine, score,
+        # template, etc.) que só interessam para debug -- o modelo
+        # conversacional só precisa do essencial, e passar tudo infla o
+        # contexto sem ganho (o Context Builder já filtra chave começando
+        # com "_", mas aqui é melhor nem gerar o excesso).
+        primeiro = resultados[0]
+        relacionados = [
+            r.get("title", "") for r in resultados[1:4] if r.get("title")
+        ]
 
         return {
             "consulta": consulta,
-            "resumo": resumo or None,
-            "fonte": dados.get("AbstractURL") or None,
+            "resumo": primeiro.get("content") or primeiro.get("title") or None,
+            "fonte": primeiro.get("url") or None,
             "relacionados": relacionados,
         }
+    except urllib.error.URLError as e:
+        return {
+            "erro": "searxng_indisponivel",
+            "detalhe": f"não consegui falar com {base_url}. "
+                       f"O container está rodando? docker compose up -d",
+            "consulta": consulta,
+        }
     except Exception as e:
-        return {"erro": "falha_rede", "detalhe": str(e)[:120], "consulta": consulta}
+        return {"erro": "falha_busca", "detalhe": str(e)[:120], "consulta": consulta}
 
 
 def carregar_ferramentas():

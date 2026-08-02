@@ -5,8 +5,8 @@ Tudo que e ajustavel fica aqui, para nao espalhar constante magica pelo
 codigo. Valores podem vir do ambiente, o que permite trocar de modelo ou
 de banco sem editar arquivo.
 
-No Windows/PowerShell nao existe `export`: carregue um `.env` com
-python-dotenv antes de importar este modulo, ou use `$env:NOME="valor"`.
+No Windows/PowerShell nao existe `export`: por isso o .env e carregado
+AQUI, na importacao deste modulo, e nao no ponto de entrada.
 """
 
 from __future__ import annotations
@@ -14,6 +14,25 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+
+# Carregado na importacao do modulo, nao em __main__.py -- porque nem todo
+# ponto de entrada passa por __main__.py. `python -m eva.integrations.discord`,
+# `python -m eva.cli`, os testes em tests/, o simular_portao.py: nenhum
+# desses roda __main__.py, e todos precisam do .env. Bug real que isso
+# fecha: o DISCORD_TOKEN aparecia em "python -m eva --diagnostico" e
+# sumia em "python -m eva.integrations.discord --diagnostico", porque só
+# o primeiro passava pelo __main__.py que chamava load_dotenv(). Carregar
+# aqui, no módulo que todo mundo importa antes de ler qualquer variável,
+# fecha esse buraco de vez.
+#
+# override=False: se a variável já foi definida no ambiente real (ex.:
+# $env:NOME="valor" no PowerShell, ou variável de sistema/CI), essa
+# definição explícita vale mais que o que está no arquivo .env.
+try:
+    from dotenv import load_dotenv
+    load_dotenv(override=False)
+except ImportError:
+    pass  # python-dotenv não instalado: segue só com o ambiente real
 
 RAIZ = Path(os.environ.get("EVA_HOME", Path.home() / ".eva"))
 
@@ -43,7 +62,14 @@ class LLMConfig:
     # Em voz o teto e menor: 400 tokens viram uns 40 segundos de fala, tempo
     # demais para alguem esperando numa call. Combina com o formato
     # "MODO: VOZ. Seja concisa (max 2-3 frases)." do treino.
-    max_tokens_voz: int = 120
+    # 200, não 120: no teste de call real, respostas sobre tópicos abertos
+    # (ex. "fale sobre IA no mercado") pareciam cortar antes de terminar o
+    # pensamento, e o modelo fechava com pergunta de volta como saída barata
+    # quando sentia estar no limite. 200 tokens em fala ainda são ~20s --
+    # longo pra voz, mas dá margem pra medir se o corte era a causa do
+    # tique antes de mexer em dataset ou em MODO: VOZ. Se o tique continuar
+    # igual com este valor, o teto não era a causa raiz.
+    max_tokens_voz: int = int(os.environ.get("EVA_MAX_TOKENS_VOZ", "200"))
 
     timeout: int = 120
 
@@ -69,7 +95,7 @@ class DecisionConfig:
     usar_llm: bool = os.environ.get("EVA_DECISION_LLM", "0") == "1"
     base_url: str = os.environ.get("EVA_DECISION_URL", "http://localhost:1234/v1")
     api_key: str = os.environ.get("EVA_LLM_KEY", "lm-studio")
-    modelo: str = os.environ.get("EVA_DECISION_MODEL", "eva")
+    modelo: str = os.environ.get("EVA_DECISION_MODEL", "minicpm-v-4.6")
     temperatura: float = 0.0  # decisao deve ser consistente, nao criativa
     max_tokens: int = 200
     timeout: int = 60
@@ -93,6 +119,44 @@ class MemoriaConfig:
 
     # Quantos turnos de conversa recente vao no historico
     janela_historico: int = 12
+
+    # Extracao por LLM, alem das regras. Roda em TODO turno, em segundo
+    # plano -- nao atrasa a resposta ao usuario, mas custa uma chamada a
+    # mais ao LM Studio por turno. Aponta para a mesma config do decisor
+    # por padrao (mesmo eva-3b), mas e uma secao separada de proposito:
+    # se um dia isso pesar na GPU (visao + conversa + extracao competindo),
+    # e so trocar o modelo aqui sem mexer em decisao.
+    extrair_com_llm: bool = os.environ.get("EVA_MEMORIA_LLM", "1") == "1"
+    extrator_base_url: str = os.environ.get(
+        "EVA_MEMORIA_LLM_URL", os.environ.get("EVA_DECISION_URL", "http://localhost:1234/v1"))
+    extrator_api_key: str = os.environ.get("EVA_LLM_KEY", "lm-studio")
+    extrator_modelo: str = os.environ.get(
+        "EVA_MEMORIA_LLM_MODEL", os.environ.get("EVA_DECISION_MODEL", "minicpm-v-4.6"))
+    extrator_timeout: int = 30
+
+    # Embeddings (busca hibrida BM25 + semantica, ver memory/embeddings.py
+    # e memory/store.py). Aponta para o mesmo LM Studio, modelo
+    # nomic-embed-text -- ele roda junto com eva-3b e minicpm-v-4.6 sem
+    # problema, e o custo por chamada e pequeno (768 floats, nao geracao
+    # de texto). Desligavel por completo se quiser rodar so com FTS5, do
+    # jeito que era antes desta secao existir.
+    usar_embeddings: bool = os.environ.get("EVA_EMBEDDINGS", "1") == "1"
+    embeddings_base_url: str = os.environ.get(
+        "EVA_EMBEDDINGS_URL", "http://localhost:1234/v1")
+    embeddings_api_key: str = os.environ.get("EVA_LLM_KEY", "lm-studio")
+    embeddings_modelo: str = os.environ.get(
+        "EVA_EMBEDDINGS_MODEL", "text-embedding-nomic-embed-text-v1.5@q4_k_m")
+    embeddings_timeout: int = 30
+
+    # Consolidacao periodica (memory/consolidacao.py): memorias episodicas
+    # antigas e similares viram um resumo semantico, reduzindo o que
+    # acumula sem limite. Roda sob demanda a cada N turnos, nao em todo
+    # turno -- e trabalho pesado o suficiente pra nao valer a pena
+    # verificar toda hora.
+    consolidar_com_llm: bool = os.environ.get("EVA_CONSOLIDAR", "1") == "1"
+    consolidar_a_cada_turnos: int = int(
+        os.environ.get("EVA_CONSOLIDAR_INTERVALO", "50"))
+    consolidar_dias_minimo: float = 14.0
 
 
 @dataclass
@@ -200,4 +264,45 @@ class EVAConfig:
 def carregar_config() -> EVAConfig:
     cfg = EVAConfig()
     cfg.preparar_diretorios()
+    _avisar_env_divergente()
     return cfg
+
+
+def _avisar_env_divergente() -> None:
+    """Avisa se uma variável de ambiente do SISTEMA está sobrepondo o .env.
+
+    Existe por causa de um bug real: GROQ_API_KEY ficou definida como
+    variável de ambiente persistente do Windows (User ou Machine), de uma
+    configuração antiga. Com override=False no load_dotenv() -- que é o
+    certo, pois uma variável de ambiente explícita deve valer mais que um
+    arquivo -- essa chave velha vencia o .env silenciosamente. O sintoma era
+    confuso: "editei o .env mas continua pegando a chave errada", sem
+    nenhum erro apontando a causa até o 401 da Groq. Este aviso mostra qual
+    arquivo .env foi carregado e sinaliza quando o valor efetivo não bate
+    com o que está escrito nele -- para as poucas variáveis onde isso
+    normalmente indica engano, não intenção.
+    """
+    try:
+        from dotenv import dotenv_values, find_dotenv
+    except ImportError:
+        return
+
+    caminho = find_dotenv(usecwd=True)
+    if not caminho:
+        return
+
+    valores_arquivo = dotenv_values(caminho)
+    # Só as credenciais que costumam ficar "presas" por engano em setup
+    # antigo. Não checa tudo: EVA_HOME ou EVA_USER divergirem do .env é
+    # uso normal (override intencional via $env:), não bug a sinalizar.
+    for chave in ("GROQ_API_KEY", "DISCORD_TOKEN"):
+        do_arquivo = valores_arquivo.get(chave)
+        efetivo = os.environ.get(chave)
+        if do_arquivo and efetivo and do_arquivo != efetivo:
+            print(
+                f"[config] aviso: {chave} no ambiente do sistema difere do "
+                f"que está em {caminho}. A variável de ambiente está "
+                f"vencendo -- se não foi intencional, rode no PowerShell:\n"
+                f"    [System.Environment]::SetEnvironmentVariable(\"{chave}\", $null, \"User\")\n"
+                f"e abra um terminal novo."
+            )

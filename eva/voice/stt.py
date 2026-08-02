@@ -124,6 +124,14 @@ class GroqSTT:
             headers={
                 "Authorization": f"Bearer {self.api_key}",
                 "Content-Type": content_type,
+                # Sem isso, urllib manda "User-Agent: Python-urllib/3.x" --
+                # e o Cloudflare na frente da API da Groq bloqueia esse UA
+                # por padrão como assinatura óbvia de bot/scraper. O erro
+                # que aparece não é da Groq: é a página de bloqueio do
+                # Cloudflare (HTTP 403, "error code: 1010"), sem JSON, sem
+                # relação nenhuma com a chave ou com rate limit. Qualquer
+                # string de navegador real resolve; não precisa ser exata.
+                "User-Agent": "Mozilla/5.0 (compatible; EVA/1.0)",
             },
         )
 

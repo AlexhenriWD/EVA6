@@ -24,8 +24,8 @@ import argparse
 import json
 import sys
 
-from config import carregar_config
-from orchestrator import EVA
+from .config import carregar_config
+from .orchestrator import EVA
 
 VERDE = "\033[32m"
 CINZA = "\033[90m"
@@ -101,19 +101,20 @@ def mostrar_diagnostico(eva: EVA) -> None:
                 print(f"  TTS {nome:<8}: instalado{ok_idioma}")
         if not algum:
             print(f"  TTS:        nenhum backend instalado")
-            print(_cor("              pip install piper-tts   (offline, PT-BR)", CINZA))
-            print(_cor("              pip install edge-tts    (online, PT-BR)", CINZA))
+            print(_cor("              pip install pocket-tts", CINZA))
     except ImportError:
         pass
 
     tem_discord = bool(_os.environ.get("DISCORD_TOKEN"))
     print(f"  Discord:    {'token presente' if tem_discord else 'sem DISCORD_TOKEN'}")
-    try:
-        from discord.ext import voice_recv  # noqa: F401
-        print("  ouvir call: sim")
-    except ImportError:
-        print("  ouvir call: não" +
-              _cor("  (pip install discord-ext-voice-recv)", CINZA))
+    # A voz não passa mais por discord.py: quem ouve a call é o bridge.js
+    # (Node + @discordjs/voice). O que importa checar aqui é o Node, não
+    # uma biblioteca Python que o sistema não usa mais.
+    import shutil as _sh
+    if _sh.which("node"):
+        print("  ouvir call: sim  " + _cor("(node bridge.js)", CINZA))
+    else:
+        print("  ouvir call: não" + _cor("  (instale o Node.js)", CINZA))
     print()
 
 
@@ -178,7 +179,7 @@ def _comando(eva: EVA, linha: str) -> bool:
         if not contagem:
             print("  (nada guardado ainda)")
         for tipo in ("semantica", "episodica", "procedural", "personalidade"):
-            itens = eva.memoria.listar(tipo, limite=20)
+            itens = eva.memoria.listar(usuario=eva.cfg.usuario, tipo=tipo, limite=20)
             if itens:
                 print(f"\n  {tipo}:")
                 for m in itens:
@@ -206,7 +207,8 @@ def _comando(eva: EVA, linha: str) -> bool:
             n = eva.esquecer(arg)
             print(f"{n} memória(s) removida(s)")
     elif cmd == "/limpar":
-        eva.memoria.con.execute("DELETE FROM conversas")
+        eva.memoria.con.execute("DELETE FROM conversas WHERE usuario=?",
+                                (eva.cfg.usuario,))
         eva.memoria.con.commit()
         print("histórico apagado (memórias mantidas)")
     else:
@@ -240,7 +242,7 @@ def main(argv=None) -> int:
 
         if args.memorias:
             for tipo in ("semantica", "episodica", "procedural", "personalidade"):
-                itens = eva.memoria.listar(tipo, limite=100)
+                itens = eva.memoria.listar(usuario=eva.cfg.usuario, tipo=tipo, limite=100)
                 if itens:
                     print(f"\n{tipo}:")
                     for m in itens:

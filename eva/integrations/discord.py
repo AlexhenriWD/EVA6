@@ -20,6 +20,18 @@ import shutil
 import signal
 import subprocess
 import sys
+
+# No Windows o console (cmd/PowerShell) roda em cp1252/cp850 por padrão, e o
+# stdout do Python herda essa codepage. Como este módulo imprime logs com
+# emoji (às vezes vindos do próprio bridge.js repassado), sem isso o texto
+# aparece corrompido (ex.: "🔌" vira "ðŸ”Œ") mesmo depois do subprocesso Node
+# já estar sendo lido em UTF-8 corretamente. reconfigure() existe desde o
+# Python 3.7; getattr cobre o caso raro de stdout já ter sido substituído
+# por algo sem esse método.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 from pathlib import Path
 
 from ..config import carregar_config
@@ -153,6 +165,18 @@ class Supervisor:
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
+            # O Node escreve UTF-8 (o bridge.js usa emoji nos logs — 🔌, 🔑,
+            # etc). Sem `encoding=` explícito, o Popen usa
+            # locale.getpreferredencoding(), que no Windows é a codepage do
+            # console (cp1252/cp850, não UTF-8). O primeiro emoji cortava a
+            # leitura no meio de um byte multibyte e derrubava o supervisor
+            # inteiro com UnicodeDecodeError -- levando o cliente Python
+            # junto, porque os dois rodam no mesmo asyncio.gather.
+            # errors="replace" é rede de segurança adicional: byte
+            # remanescente vira "?" no log em vez de crashar o processo de
+            # novo se algo mais escapar no futuro.
+            encoding="utf-8",
+            errors="replace",
             bufsize=1,
         )
 

@@ -372,7 +372,28 @@ async function handleJoin(ws, msg) {
         return;
       }
 
-      const decoder = new prism.opus.Decoder({ rate: 48000, channels: 2, frameSize: 960 });
+      // NOVO v3.1 — `new prism.opus.Decoder(...)` faz um require() interno
+      // de @discordjs/opus / node-opus / opusscript (nessa ordem), e nenhum
+      // deles vem instalado por padrão com o resto do stack de voz — não é
+      // dependência transitiva do @discordjs/voice, é "instale um dos três
+      // você mesmo". Sem esse try/catch aqui, esse require() faltando
+      // lançava DENTRO do listener 'start' e virava um uncaughtException
+      // GLOBAL a cada vez que alguém falava — matando o processo Node
+      // inteiro (e junto o cliente Python, que via o socket cair e entrava
+      // em loop de reconexão). Um usuário sem o pacote instalado corretamente
+      // não deveria conseguir derrubar a call inteira; agora falha só a
+      // captura desse usuário, uma vez, com mensagem que diz o que instalar.
+      let decoder;
+      try {
+        decoder = new prism.opus.Decoder({ rate: 48000, channels: 2, frameSize: 960 });
+      } catch (err) {
+        console.error(
+          `❌ Decoder Opus indisponível (${err.message}). ` +
+          `Rode: npm install @discordjs/opus`
+        );
+        try { opusStream.destroy(); } catch {}
+        return;
+      }
       const pcmChunks = [];
 
       opusStream.on('error', (err) => {

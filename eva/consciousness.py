@@ -270,6 +270,10 @@ class Consciencia:
         self.portao = PortaoFala(cfg.consciencia)
 
         self.fila: deque[Impulso] = deque(maxlen=12)
+        # user_id -> nome. Sem isso o impulso sai como "retomar o que
+        # 481923... mencionou", o id cru vai para o prompt e o modelo às
+        # vezes fala o número em voz alta.
+        self.nomes: dict[str, str] = {}
         self.fios: deque[Fio] = deque(maxlen=cfg.consciencia.max_fios)
 
         agora = time.time()
@@ -283,10 +287,16 @@ class Consciencia:
 
     # ---------------------------------------------------------- eventos
 
-    def alguem_falou(self, usuario: str, mensagem: str = "", plano=None) -> None:
+    def registrar_nome(self, usuario: str, nome: str | None) -> None:
+        if nome:
+            self.nomes[str(usuario)] = nome
+
+    def alguem_falou(self, usuario: str, mensagem: str = "", plano=None,
+                     nome: str | None = None) -> None:
         """Registra fala humana. Zera a escalada e colhe fios."""
         self.ultima_fala_alguem = time.time()
         self.ultimo_falante = usuario
+        self.registrar_nome(usuario, nome)
         self.falas_sem_resposta = 0
 
         # Impulso pendente vira lixo quando a conversa retoma: ele foi
@@ -381,10 +391,11 @@ class Consciencia:
         """
         for fio in reversed(self.fios):
             if not fio.usado:
+                nome = self.nomes.get(str(fio.usuario))
+                # Sem nome conhecido, a atribuição some em vez de virar id.
+                alvo = f"o que {nome} mencionou" if nome else "o que foi dito antes"
                 return criar_impulso(
-                    "fio",
-                    f"retomar o que {fio.usuario} mencionou: {fio.assunto}",
-                    origem=fio.usuario,
+                    "fio", f"retomar {alvo}: {fio.assunto}", origem=fio.usuario,
                 )
         return criar_impulso("vazio", "puxar assunto")
 
