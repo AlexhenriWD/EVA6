@@ -175,10 +175,20 @@ class Veredito:
     limiar: float = 0.0
     forca: float = 0.0
     impulso: Impulso | None = None
+    # True só nos dois caminhos que de fato calculam limiar/força (impulso
+    # fraco, e a aprovação final) -- todos os outros retornos antecipados
+    # (ocupada, sem impulso, conversa viva, etc) usam os defaults 0.0/0.0
+    # do dataclass, e SEM esta flag o __str__ imprimia "força 0.00 vs
+    # limiar 0.00" pra esses casos como se fosse uma comparação real que
+    # aconteceu -- confuso de ler no log, parecia sempre a mesma conta
+    # dando quase-zero quando na verdade a conta nunca rodou.
+    avaliado: bool = False
 
     def __str__(self) -> str:
         marca = "FALA" if self.passou else "cala"
-        return f"{marca}: {self.motivo} (força {self.forca:.2f} vs limiar {self.limiar:.2f})"
+        if self.avaliado:
+            return f"{marca}: {self.motivo} (força {self.forca:.2f} vs limiar {self.limiar:.2f})"
+        return f"{marca}: {self.motivo}"
 
 
 class PortaoFala:
@@ -226,9 +236,10 @@ class PortaoFala:
         limiar = self.limiar(estado, falas_sem_resposta)
         if impulso.forca < limiar:
             return Veredito(False, f"impulso fraco ({impulso.tipo})",
-                            limiar, impulso.forca, impulso)
+                            limiar, impulso.forca, impulso, avaliado=True)
 
-        return Veredito(True, f"impulso {impulso.tipo}", limiar, impulso.forca, impulso)
+        return Veredito(True, f"impulso {impulso.tipo}", limiar, impulso.forca,
+                        impulso, avaliado=True)
 
     def limiar(self, estado, falas_sem_resposta: int = 0) -> float:
         """Quanta força um impulso precisa ter para virar fala.

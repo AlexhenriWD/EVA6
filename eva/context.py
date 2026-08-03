@@ -60,6 +60,28 @@ PERSONA = (
 LINHA_CRIADOR = "Você está falando com {nome}, seu criador."
 LINHA_CONHECIDO = "Você está falando com alguém que você conhece bem."
 
+# Linha ADITIVA, opcional -- NÃO faz parte da âncora treinada (PERSONA
+# acima). Pedido explícito: mais emoção, carisma, brincadeira. A âncora
+# já foi fixada no fine-tuning; editá-la direto arriscaria divergir do que
+# o modelo aprendeu a associar a ela (é literalmente o aviso no comentário
+# da PERSONA). Em vez disso, isto entra como uma linha A MAIS depois da
+# âncora -- testável, revertível na hora via EVA_CARISMA=0 no .env, sem
+# mexer em código, e sem risco de contradizer o que já está nos pesos.
+#
+# É reforço de leitura (inference-time), não vai ensinar o modelo a ser
+# engraçado se não houver exemplo nenhum de humor/brincadeira no dataset
+# de treino -- mesma conclusão de quando investigamos o "modo terapeuta":
+# system prompt pode inclinar o comportamento dentro do que o modelo já
+# sabe fazer, não pode inventar um repertório que ele nunca viu. Teste
+# antes/depois igual fizemos com temperatura -- se não mudar muito a
+# resposta na prática, o próximo passo real é acrescentar exemplos de
+# humor/carisma no próximo lote de fine-tuning, não insistir no prompt.
+LINHA_CARISMA = (
+    "Tem senso de humor e gosta de brincar quando cabe -- não força piada, "
+    "mas também não segura graça quando ela surge naturalmente. Emoção "
+    "genuína conta mais que ficar sempre no modo análise fria."
+)
+
 # Modo voz e contexto visual: no dataset aparecem na mesma linha do
 # "Você é EVA.". Com a âncora longa fica melhor em linha própria, mas a
 # string em si é preservada.
@@ -172,6 +194,8 @@ class ContextBuilder:
 
         # ---------------------------------------------------- cabeçalho
         linhas = [PERSONA]
+        if self.cfg.llm.carisma:
+            linhas.append(LINHA_CARISMA)
         if identidade:
             linhas.append(identidade)
         if modo_voz:

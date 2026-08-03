@@ -82,6 +82,11 @@ class LLMConfig:
     # para comparar sem editar codigo.
     formato_contexto: str = os.environ.get("EVA_FORMATO_CONTEXTO", "json")
 
+    # Linha aditiva de humor/carisma (ver LINHA_CARISMA em context.py).
+    # Ligada por padrão a pedido explícito -- desligue com EVA_CARISMA=0
+    # se sentir que ela ficou insistindo em piada ou saindo do personagem.
+    carisma: bool = os.environ.get("EVA_CARISMA", "1") == "1"
+
 
 @dataclass
 class DecisionConfig:
@@ -95,7 +100,7 @@ class DecisionConfig:
     usar_llm: bool = os.environ.get("EVA_DECISION_LLM", "0") == "1"
     base_url: str = os.environ.get("EVA_DECISION_URL", "http://localhost:1234/v1")
     api_key: str = os.environ.get("EVA_LLM_KEY", "lm-studio")
-    modelo: str = os.environ.get("EVA_DECISION_MODEL", "minicpm-v-4.6")
+    modelo: str = os.environ.get("EVA_DECISION_MODEL", "eva")
     temperatura: float = 0.0  # decisao deve ser consistente, nao criativa
     max_tokens: int = 200
     timeout: int = 60
@@ -131,7 +136,7 @@ class MemoriaConfig:
         "EVA_MEMORIA_LLM_URL", os.environ.get("EVA_DECISION_URL", "http://localhost:1234/v1"))
     extrator_api_key: str = os.environ.get("EVA_LLM_KEY", "lm-studio")
     extrator_modelo: str = os.environ.get(
-        "EVA_MEMORIA_LLM_MODEL", os.environ.get("EVA_DECISION_MODEL", "minicpm-v-4.6"))
+        "EVA_MEMORIA_LLM_MODEL", os.environ.get("EVA_DECISION_MODEL", "eva"))
     extrator_timeout: int = 30
 
     # Embeddings (busca hibrida BM25 + semantica, ver memory/embeddings.py
@@ -200,6 +205,71 @@ class ConscienciaConfig:
 
 
 @dataclass
+class VisaoConfig:
+    """Reação a tela -- captura local do PC, MiniCPM-V para análise.
+
+    Desligada por padrão (ativa=False): captura de tela é sensível --
+    sempre ligar sob escolha explícita, nunca como default silencioso.
+    Liga com EVA_VISAO=1.
+    """
+    ativa: bool = os.environ.get("EVA_VISAO", "0") == "1"
+
+    # Qual monitor (mss: 0 é "todos combinados", 1 é tipicamente o
+    # principal) e em que largura reduzir antes de mandar pro modelo.
+    # 672px corta os tokens de visão por 3-4x frente a 1280x720 -- é o
+    # que tira a análise de ~5s para ~2s no MiniCPM-V.
+    monitor: int = int(os.environ.get("EVA_VISAO_MONITOR", "1"))
+    largura_captura: int = int(os.environ.get("EVA_VISAO_LARGURA", "672"))
+
+    # Detector de diferença (captura.py): quantos desvios-padrão acima da
+    # média recente para disparar MACRO, e um piso absoluto para não
+    # disparar em ruído quando a linha de base ainda é ~0 (tela parada).
+    limiar_desvios: float = 2.5
+    limiar_minimo_absoluto: float = 3.0
+
+    # MiniCPM-V via LM Studio -- servidor separado do conversacional
+    # (mesmo LM Studio, endpoint igual, mas nunca a mesma requisição) para
+    # não competir por latência com decisão/conversa.
+    base_url: str = os.environ.get("EVA_VISAO_URL", "http://localhost:1234/v1")
+    api_key: str = os.environ.get("EVA_LLM_KEY", "lm-studio")
+    modelo: str = os.environ.get("EVA_VISAO_MODEL", "minicpm-v-4.6")
+    timeout: int = 45
+
+    # Rajada de quadros por análise -- "vídeo de pobre": vários quadros na
+    # mesma mensagem em vez de um só, para o modelo entender sequência.
+    # 5 quadros / 0.35s = ~1.6s de janela temporal, mesmo padrão do código
+    # de referência do projeto (V4/unified_vision_system).
+    rajada_quadros: int = int(os.environ.get("EVA_VISAO_RAJADA", "5"))
+    rajada_intervalo: float = 0.35
+
+    # Abaixo desta sobreposição de palavras entre a descrição nova e a
+    # cena anterior, é considerada mudança real (vira cena+evento). Acima,
+    # é a mesma cena com palavras diferentes -- nada muda. Mesmo valor do
+    # código de referência (_detect_visual_change, threshold 0.4).
+    limiar_mudanca_cena: float = 0.4
+
+    # Cena mais velha que isso não entra mais no contexto -- evita
+    # contexto_visual "fantasma" de quando a visão já foi desligada.
+    cena_ttl: float = 300.0
+
+    # Cena mudou há menos que isso: injeta no prompt MESMO sem a pessoa
+    # mencionar a tela explicitamente -- uma mudança recém-capturada é
+    # provavelmente ainda relevante pro que está sendo dito. Mais velha
+    # que isso, só injeta com referência explícita (ver decision.py,
+    # visao_relevante). Bem menor que cena_ttl de propósito: cena_ttl é
+    # "ainda faz sentido existir", isto é "ainda é óbvio que é sobre
+    # isso sem precisar perguntar".
+    janela_relevancia_recente: float = 15.0
+
+    # Intervalo entre ticks (captura + avaliação do detector, barato).
+    # Não é o intervalo de ANÁLISE (isso só acontece quando o detector
+    # aprova) -- é de quanto em quanto tempo checar se algo mudou.
+    tick_intervalo: float = float(os.environ.get("EVA_VISAO_TICK", "2.0"))
+
+    debug: bool = os.environ.get("EVA_DEBUG", "0") == "1"
+
+
+@dataclass
 class VozConfig:
     """Speech-to-text e text-to-speech."""
     # STT via Groq (Whisper). Modelos: whisper-large-v3-turbo (rapido) ou
@@ -240,6 +310,7 @@ class EVAConfig:
     estado: EstadoConfig = field(default_factory=EstadoConfig)
     identidade: IdentidadeConfig = field(default_factory=IdentidadeConfig)
     consciencia: ConscienciaConfig = field(default_factory=ConscienciaConfig)
+    visao: VisaoConfig = field(default_factory=VisaoConfig)
     voz: VozConfig = field(default_factory=VozConfig)
     discord: DiscordConfig = field(default_factory=DiscordConfig)
 

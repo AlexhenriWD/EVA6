@@ -36,6 +36,7 @@ class Plano:
     intencao: str = "conversa"
     precisa_memoria: bool = True
     precisa_ferramenta: bool = False
+    precisa_visao: bool = False
     ferramentas: list[dict] = field(default_factory=list)  # [{"nome":..., "args":{...}}]
     consulta_memoria: str = ""
     prioridade: str = "normal"           # normal | alta
@@ -86,6 +87,48 @@ TEMPORAL = re.compile(
 CONTA = re.compile(r"\d+\s*[\+\-\*/×÷\^]\s*\d+|quanto\s+[ée]\s+\d|calcul\w*", re.I)
 
 CLIMA = re.compile(r"\b(clima|tempo|chuva|chover|temperatura|calor|frio|graus)\b", re.I)
+
+# ---------------------------------------------------------------- visão
+#
+# Não decide se a EVA VÊ algo -- isso é do SistemaVisual (vision/visao.py),
+# que roda por fora, independente de decisão. Isto decide se, num turno
+# em que existe uma cena capturada, vale a pena INJETAR ela no prompt.
+#
+# Sem este portão, contexto_visual entraria em TODO turno sempre que a
+# visão estivesse ligada -- inclusive conversa sem nenhuma relação com a
+# tela. É o mesmo risco de "narradora" da consciência (falar sobre tudo
+# que muda vira insuportável), só que aplicado ao nível da conversa
+# inteira em vez da fala espontânea: contexto visual perene polui o
+# prompt e pode puxar a resposta pra comentar a tela sem vir ao caso.
+#
+# Referência DEÍTICA (aponta pra tela: "olha isso", "vê aqui") ou menção
+# a artefato de tela (jogo, código, documento) -- os casos em que a
+# pessoa está claramente falando do que está vendo. Falso negativo
+# (não detectar quando devia) é preferível a falso positivo aqui: melhor
+# a EVA ocasionalmente "esquecer" de olhar a tela do que ficar comentando
+# a tela em toda resposta sem necessidade.
+VISAO = re.compile(
+    r"\b(v[êe] (isso|aqui|a[íi])|olha (isso|aqui|a tela)|olhando (isso|aqui)|"
+    r"minha tela|na tela|essa tela|nessa tela|"
+    r"o que (eu )?(t[ôo]|estou) (fazendo|jogando|vendo|mostrando)|"
+    r"(esse|essa) (jogo|c[óo]digo|documento|programa|tela|janela)|"
+    r"t[áa] vendo (isso|aqui)|consegue ver|voc[êe] (t[áa] |est[áa] )?vendo)\b",
+    re.I,
+)
+
+
+def visao_relevante(texto: str) -> bool:
+    """Se vale injetar contexto_visual neste turno.
+
+    Função pública (não só uso interno de DecisorPorRegras) porque quem
+    integra a visão (bridge_client.py) precisa decidir isso ANTES de
+    chamar EVA.responder() -- contexto_visual é um parâmetro de entrada,
+    não algo que o orquestrador busca sozinho. Mesma regra dos dois
+    lados: aqui alimenta Plano.precisa_visao (visível em Resultado, pra
+    quem quiser auditar a decisão depois), e bridge_client chama esta
+    função direto no texto cru antes de decidir se passa a cena ou None.
+    """
+    return bool(VISAO.search(texto))
 
 # Pedido de busca. Exige forma IMPERATIVA ou pergunta direta -- verbo no
 # passado ("pesquisei tanto e não achei sentido") é relato, não pedido, e
@@ -158,6 +201,11 @@ class DecisorPorRegras:
         p = Plano()
         texto = mensagem.strip()
         p.consulta_memoria = texto
+        # Setado ANTES de qualquer retorno antecipado (crise, saudação,
+        # sobre_si) -- referência à tela pode aparecer em mensagem curta
+        # ("olha isso") que de outra forma sairia num desses atalhos sem
+        # passar pelo resto da função.
+        p.precisa_visao = visao_relevante(texto)
 
         # --- crise tem precedência sobre tudo ---
         if CRISE.search(texto):

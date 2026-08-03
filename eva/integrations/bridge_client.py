@@ -104,6 +104,28 @@ class ClienteBridge:
         from ..consciousness import Consciencia
         self.consciencias: dict[str, Consciencia] = {}
         self._tarefas_consciencia: dict[str, asyncio.Task] = {}
+
+        # Visão: uma instância só (há uma tela, a do PC rodando a EVA --
+        # não uma por guild como Consciencia, que é por canal porque cada
+        # call tem seu próprio silêncio). Criada mesmo com visao.ativa=False
+        # para simplificar o resto do código (sempre existe, só não faz
+        # nada) -- só falha e vira None se a dependência mss não estiver
+        # instalada, e mesmo aí o resto do sistema continua funcionando
+        # sem visão.
+        self.visao = None
+        self.erro_visao: str | None = None
+        if self.cfg.visao.ativa:
+            try:
+                from ..vision.visao import SistemaVisual
+                self.visao = SistemaVisual(self.cfg)
+            except ImportError as e:
+                self.erro_visao = (
+                    f"visão ligada em config mas dependência faltando: {e}. "
+                    f"Rode: pip install mss pillow numpy"
+                )
+        self._tarefa_visao: asyncio.Task | None = None
+        self._guilds_com_call: set[str] = set()
+
         # O bridge manda o cabeçalho JSON e logo depois o quadro binário.
         # Guardamos o cabeçalho para saber de quem é o áudio que vem a seguir.
         self._audio_pendente: dict | None = None
@@ -127,6 +149,34 @@ class ClienteBridge:
             return self.eva.memoria.pessoa(str(usuario)).get("nome") or None
         except Exception:
             return None
+
+    def _contexto_visual_para(self, texto: str) -> str | None:
+        """A cena para injetar neste turno, ou None -- decide ANTES de
+        chamar EVA.responder(), porque contexto_visual é parâmetro de
+        entrada, não algo que o orquestrador busca sozinho (EVA não
+        conhece SistemaVisual de propósito, mesma separação que já existe
+        entre EVA e Consciencia).
+
+        Dois caminhos para "sim, injeta": a pessoa referenciou a tela
+        explicitamente (visao_relevante, decision.py -- "olha isso",
+        "minha tela"), OU a cena mudou muito recentemente (janela_
+        relevancia_recente) e ainda é razoável supor que seja sobre isso
+        mesmo sem menção direta. Fora esses dois casos, NÃO injeta --
+        contexto visual perene em toda resposta é o mesmo risco de
+        "narradora" da consciência, só que no nível da conversa inteira.
+        """
+        if self.visao is None:
+            return None
+        from ..decision import visao_relevante
+
+        if visao_relevante(texto):
+            return self.visao.contexto_atual()
+
+        cena = self.visao.cena
+        if cena and cena.idade_segundos() < self.cfg.visao.janela_relevancia_recente:
+            return self.visao.contexto_atual()
+
+        return None
 
     async def _pesquisar_e_registrar(self, guild_id: str, consulta: str) -> None:
         """Pesquisa em fundo e, se achar algo, alimenta a Consciencia.
@@ -155,6 +205,55 @@ class ClienteBridge:
         tarefa = self._tarefas_consciencia.pop(gid, None)
         if tarefa and not tarefa.done():
             tarefa.cancel()
+
+    def _ligar_visao_se_precisar(self, guild_id: str) -> None:
+        """Liga a visão quando a PRIMEIRA call entra, não uma vez por
+        call -- há uma tela só, então múltiplas guilds "ativas" (caso raro
+        num setup pessoal) continuam compartilhando a mesma captura.
+        """
+        self._guilds_com_call.add(str(guild_id))
+        if self.visao is None or self.visao.ativo:
+            return
+        self.visao.ligar()
+        if self._tarefa_visao is None or self._tarefa_visao.done():
+            self._tarefa_visao = asyncio.create_task(self._laco_visao())
+
+    def _desligar_visao_se_precisar(self, guild_id: str) -> None:
+        """Só desliga quando a ÚLTIMA call sai -- não a cada guild que sai
+        individualmente, senão duas calls simultâneas desligariam a visão
+        uma da outra."""
+        self._guilds_com_call.discard(str(guild_id))
+        if self.visao is None or self._guilds_com_call:
+            return
+        self.visao.desligar()
+        if self._tarefa_visao and not self._tarefa_visao.done():
+            self._tarefa_visao.cancel()
+
+    async def _laco_visao(self) -> None:
+        """Chama SistemaVisual.tick() periodicamente. tick() é síncrono e
+        bloqueante (captura de tela +, ocasionalmente, uma chamada de
+        rede de alguns segundos ao MiniCPM-V) -- roda via to_thread para
+        não travar o resto do event loop (voz, texto, consciência) durante
+        esses ~2s de análise.
+        """
+        while True:
+            await asyncio.sleep(self.cfg.visao.tick_intervalo)
+            try:
+                evento = await asyncio.to_thread(self.visao.tick)
+                if evento:
+                    print(f"[visao] evento: {evento}")
+                    # Empurra em toda guild com call ativa -- caso comum é
+                    # uma só; múltiplas é o caso raro de duas calls ao
+                    # mesmo tempo, e não há como saber qual delas "é sobre"
+                    # o que está na tela, então todas recebem o impulso.
+                    for gid in list(self._guilds_com_call):
+                        self.consciencia(gid).evento_visual(evento)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                # Visão é auxiliar -- uma falha aqui nunca deve derrubar
+                # voz, texto ou consciência, que são o núcleo da conversa.
+                print(f"[visao] erro no laço: {e}")
 
     async def _laco_consciencia(self, guild_id: str) -> None:
         """Bate no portão de tempos em tempos. Não decide nada -- só pergunta."""
@@ -197,6 +296,13 @@ class ClienteBridge:
 
     async def sair(self, guild_id: str) -> None:
         self._cancelar_laco_consciencia(guild_id)
+        # Mesma redundância do laço de consciência: desliga já, na hora
+        # que decidimos sair, sem esperar o "left" confirmado pelo bridge
+        # voltar (que também dispara _desligar_visao_se_precisar, de novo
+        # -- idempotente, seguro chamar duas vezes). Sem isso, um bridge
+        # lento ou uma queda de rede antes da confirmação chegar deixaria
+        # a captura de tela ligada indefinidamente depois de "sair" da call.
+        self._desligar_visao_se_precisar(guild_id)
         await self._enviar({"type": "leave", "guild_id": str(guild_id)})
 
     async def falar(self, guild_id: str, texto: str) -> None:
@@ -269,7 +375,8 @@ class ClienteBridge:
             # "MODO: VOZ" treinada e baixa o teto de 400 para 120 tokens --
             # 400 tokens são uns 40 segundos de fala.
             r = await self.eva.responder_async(
-                t.texto, usuario=str(user_id), modo_voz=True)
+                t.texto, usuario=str(user_id), modo_voz=True,
+                contexto_visual=self._contexto_visual_para(t.texto))
             if r.erro:
                 print(f"[eva] {r.erro}")
                 return
@@ -345,7 +452,9 @@ class ClienteBridge:
             await self._enviar({"type": "typing", "channel_id": canal})
             autor = str(d.get("author_id") or canal)
             self.consciencia(gid).registrar_nome(autor, d.get("author_name"))
-            r = await self.eva.responder_async(texto, usuario=autor)
+            r = await self.eva.responder_async(
+                texto, usuario=autor,
+                contexto_visual=self._contexto_visual_para(texto))
 
             if r.erro:
                 await self.enviar_mensagem(
@@ -484,11 +593,13 @@ class ClienteBridge:
             self._cancelar_laco_consciencia(gid)
             self._tarefas_consciencia[gid] = asyncio.create_task(
                 self._laco_consciencia(gid))
+            self._ligar_visao_se_precisar(gid)
             print(f"[bridge] entrou em '{d.get('channel_name')}'")
         elif tipo == "left":
             gid = str(d["guild_id"])
             self.estado(gid).canal_id = None
             self._cancelar_laco_consciencia(gid)
+            self._desligar_visao_se_precisar(gid)
             motivo = f" ({d['reason']})" if d.get("reason") else ""
             print(f"[bridge] saiu do canal{motivo}")
         elif tipo == "reconnecting":
@@ -550,4 +661,8 @@ class ClienteBridge:
     def fechar(self) -> None:
         for gid in list(self._tarefas_consciencia):
             self._cancelar_laco_consciencia(gid)
+        if self._tarefa_visao and not self._tarefa_visao.done():
+            self._tarefa_visao.cancel()
+        if self.visao:
+            self.visao.fechar()
         self.eva.fechar()

@@ -136,10 +136,28 @@ def extrair_por_llm(conversa: list[dict], cliente, max_fatos: int = 5) -> list[d
     except json.JSONDecodeError:
         return []
 
+    dados_fatos = dados.get("fatos", [])
+    if not isinstance(dados_fatos, list):
+        return []  # "fatos" não é lista -- formato irreconhecível, desiste
+
     saida = []
-    for f in dados.get("fatos", [])[:max_fatos]:
-        conteudo = str(f.get("conteudo", "")).strip()
-        tipo = f.get("tipo", "semantica")
+    for f in dados_fatos[:max_fatos]:
+        # O modelo às vezes devolve {"tipo":..., "conteudo":...} (o
+        # formato pedido no prompt) e às vezes devolve a string do fato
+        # direto, sem envelope -- {"fatos": ["mora em SP", "usa Linux"]}.
+        # Os dois são fatos genuinamente extraídos, só em forma diferente;
+        # tratar só o primeiro formato como válido jogava fora fatos reais
+        # e travava a extração do turno inteiro (um item malformado
+        # quebrava o processamento de todos os outros, inclusive os bons).
+        if isinstance(f, dict):
+            conteudo = str(f.get("conteudo", "")).strip()
+            tipo = f.get("tipo", "semantica")
+        elif isinstance(f, str):
+            conteudo = f.strip()
+            tipo = "semantica"
+        else:
+            continue  # formato irreconhecível (número, lista aninhada, etc) -- pula esse item, não trava os outros
+
         if conteudo and tipo in ("semantica", "episodica", "procedural", "personalidade"):
             saida.append({
                 "tipo": tipo,
