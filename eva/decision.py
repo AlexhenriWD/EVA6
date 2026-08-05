@@ -134,9 +134,37 @@ def visao_relevante(texto: str) -> bool:
 # passado ("pesquisei tanto e não achei sentido") é relato, não pedido, e
 # tratá-lo como busca faz a EVA sair procurando na web enquanto a pessoa
 # estava desabafando.
+# Pedido de busca. Exige forma IMPERATIVA, INFINITIVA (depois de modal:
+# "pode/consegue/dá pra pesquisar") ou pergunta direta -- verbo no passado
+# ("pesquisei tanto e não achei sentido") é relato, não pedido, e tratá-lo
+# como busca faz a EVA sair procurando na web enquanto a pessoa estava
+# desabafando.
+#
+# BUG REAL JÁ VISTO: "pesquis[ae]\b" casa "pesquisa"/"pesquise" mas NÃO
+# "pesquisar" -- depois de "pesquisa" vem "r" colado, sem fronteira de
+# palavra ali, então o \b falha. Isso faz "você pode pesquisar pra mim"
+# (forma mais natural e educada que o imperativo seco "pesquisa isso")
+# nunca disparar a ferramenta -- silenciosamente, sem erro nenhum. A EVA
+# respondia do que já sabia (desatualizado) e não tinha como perceber
+# que a busca nunca rodou. Por isso agora cada verbo cobre explicitamente
+# a forma no infinitivo também: pesquis(a|e|ar), não só pesquis[ae].
+# BUG REAL JA VISTO (2a vez, conjugacao diferente): "pesquisar[ae]" so
+# cobria imperativo e infinitivo. "eu gostaria que você pesquisasse"
+# (subjuntivo imperfeito, depois de verbo de vontade -- forma natural e
+# comum em portugues) nao batia em nada, e a busca nunca disparava, em
+# silencio. Agora cobre tambem subjuntivo (-asse) e condicional (-aria).
+#
+# Isso e enumeracao de forma verbal, e portugues tem mais conjugacao do
+# que da pra enumerar por regex com confianca de cobertura total -- essa
+# e a segunda lacuna encontrada, provavelmente nao a ultima. Se continuar
+# acontecendo com outras frases naturais, o proximo passo nao e continuar
+# remendando aqui: e ligar EVA_DECISION_LLM=1 (ja configuravel, aponta pro
+# minicpm-v-4.6 que ja provou suportar tool-calling nativo) para que a
+# deteccao de intencao use compreensao de linguagem de verdade em vez de
+# casar padrao de texto.
 BUSCA = re.compile(
-    r"(\b(pesquis[ae]|busca|procura|pesquise|busque|procure|me acha|acha a[íi]|"
-    r"d[áa] uma olhada|v[êe] a[íi])\b"
+    r"(\b(pesquis(a|e|ar|asse|aria)|busc(a|e|ar|asse|aria)|procur(a|e|ar|asse|aria)|"
+    r"me acha|acha a[íi]|d[áa] uma olhada|v[êe] a[íi])\b"
     r"|\b(quem [ée]|o que [ée] o|quanto custa|qual o pre[çc]o|"
     r"[úu]ltimas not[íi]cias|not[íi]cias de hoje)\b)", re.I
 )

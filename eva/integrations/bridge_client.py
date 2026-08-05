@@ -124,6 +124,7 @@ class ClienteBridge:
                     f"Rode: pip install mss pillow numpy"
                 )
         self._tarefa_visao: asyncio.Task | None = None
+        self._dashboard = None  # criado em rodar(), só se cfg.dashboard.ativa
         self._guilds_com_call: set[str] = set()
 
         # O bridge manda o cabeçalho JSON e logo depois o quadro binário.
@@ -618,6 +619,14 @@ class ClienteBridge:
         if websockets is None:
             raise SystemExit("websockets não instalado. Rode: pip install websockets")
 
+        # Fora do laço de reconexão -- o dashboard não deveria reiniciar
+        # (e perder o histórico de uptime/estado) só porque a conexão com
+        # o bridge.js caiu e reconectou.
+        if self.cfg.dashboard.ativa:
+            from dashboard import ServidorDashboard
+            self._dashboard = ServidorDashboard(self)
+            self._dashboard.iniciar()
+
         tentativa = 0
         while True:
             try:
@@ -665,4 +674,6 @@ class ClienteBridge:
             self._tarefa_visao.cancel()
         if self.visao:
             self.visao.fechar()
+        if self._dashboard:
+            self._dashboard.parar()
         self.eva.fechar()

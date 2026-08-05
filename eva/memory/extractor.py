@@ -19,7 +19,6 @@ e marcada na fonte, para ser auditavel depois.
 
 from __future__ import annotations
 
-import json
 import re
 
 # (padrao, tipo, template). O grupo 1 vira o conteudo.
@@ -58,18 +57,54 @@ BLOQUEIOS = re.compile(
 
 PROMPT_LLM = """Extraia fatos duradouros sobre o usuário a partir da conversa.
 
-Responda APENAS com JSON, no formato:
-{"fatos": [{"tipo": "semantica|episodica|procedural|personalidade", "conteudo": "..."}]}
-
 Regras:
 - Só extraia o que o usuário afirmou sobre si. Nada de suposição.
 - Ignore hipóteses, perguntas e desejos ("queria", "talvez", "e se").
 - Ignore o que é passageiro ("estou com fome agora").
 - Escreva na terceira pessoa, curto e direto.
-- Se não houver nada duradouro, responda {"fatos": []}.
+- Se não houver nada duradouro, chame a ferramenta com uma lista vazia.
 
 Conversa:
 {conversa}"""
+
+# Schema OpenAI para tool-calling nativo -- ver ClienteLLM.completar_com_
+# ferramenta em llm.py. Substituiu o formato antigo (pedir "responda em
+# JSON" na instrução e parsear o texto solto da resposta): o modelo é
+# treinado especificamente para produzir tool_calls estruturado quando
+# recebe um schema assim, e não necessariamente para seguir uma instrução
+# textual pedindo um formato JSON arbitrário -- daí a diferença real de
+# confiabilidade entre os dois caminhos.
+FERRAMENTA_EXTRACAO = {
+    "type": "function",
+    "function": {
+        "name": "registrar_fatos",
+        "description": "Registra fatos duradouros extraídos sobre o usuário.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "fatos": {
+                    "type": "array",
+                    "description": "Lista de fatos extraídos. Vazia se não houver nada duradouro.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "tipo": {
+                                "type": "string",
+                                "enum": ["semantica", "episodica", "procedural", "personalidade"],
+                            },
+                            "conteudo": {
+                                "type": "string",
+                                "description": "O fato, em terceira pessoa, curto.",
+                            },
+                        },
+                        "required": ["tipo", "conteudo"],
+                    },
+                },
+            },
+            "required": ["fatos"],
+        },
+    },
+}
 
 
 def _limpar(texto: str) -> str:
@@ -110,6 +145,11 @@ def extrair_por_regras(mensagem: str, min_palavras: int = 1) -> list[dict]:
 def extrair_por_llm(conversa: list[dict], cliente, max_fatos: int = 5) -> list[dict]:
     """Extrai memorias usando o LLM. Mais cobertura, menos precisao.
 
+    Usa tool-calling nativo (completar_com_ferramenta), não instrução de
+    prompt pedindo JSON solto -- é o caminho que o modelo foi de fato
+    treinado a seguir com confiabilidade, ver o schema FERRAMENTA_EXTRACAO
+    acima e o docstring de ClienteLLM.completar_com_ferramenta.
+
     Marca fonte='llm' e confianca menor de proposito -- assim da pra
     auditar depois o que veio de inferencia e nao de declaracao direta.
     """
@@ -120,35 +160,28 @@ def extrair_por_llm(conversa: list[dict], cliente, max_fatos: int = 5) -> list[d
     prompt = PROMPT_LLM.replace("{conversa}", texto)
 
     try:
-        resposta = cliente.completar(
+        argumentos = cliente.completar_com_ferramenta(
             [{"role": "user", "content": prompt}],
+            FERRAMENTA_EXTRACAO,
             temperatura=0.0, max_tokens=300,
         )
     except Exception:
         return []
 
-    # o modelo pode envolver o JSON em texto ou em bloco de codigo
-    m = re.search(r"\{.*\}", resposta, re.S)
-    if not m:
-        return []
-    try:
-        dados = json.loads(m.group(0))
-    except json.JSONDecodeError:
-        return []
+    if argumentos is None:
+        return []  # modelo não chamou a ferramenta -- nada a extrair
 
-    dados_fatos = dados.get("fatos", [])
+    dados_fatos = argumentos.get("fatos", [])
     if not isinstance(dados_fatos, list):
         return []  # "fatos" não é lista -- formato irreconhecível, desiste
 
     saida = []
     for f in dados_fatos[:max_fatos]:
-        # O modelo às vezes devolve {"tipo":..., "conteudo":...} (o
-        # formato pedido no prompt) e às vezes devolve a string do fato
-        # direto, sem envelope -- {"fatos": ["mora em SP", "usa Linux"]}.
-        # Os dois são fatos genuinamente extraídos, só em forma diferente;
-        # tratar só o primeiro formato como válido jogava fora fatos reais
-        # e travava a extração do turno inteiro (um item malformado
-        # quebrava o processamento de todos os outros, inclusive os bons).
+        # O schema pede {"tipo":..., "conteudo":...}, mas mesmo com
+        # tool-calling nativo um backend pode devolver a string do fato
+        # direto, sem envelope, ocasionalmente -- mantém a tolerância dos
+        # dois formatos como rede de segurança, não assume que o schema
+        # sozinho garante 100% de adesão.
         if isinstance(f, dict):
             conteudo = str(f.get("conteudo", "")).strip()
             tipo = f.get("tipo", "semantica")

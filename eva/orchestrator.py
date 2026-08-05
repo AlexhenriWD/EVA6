@@ -233,6 +233,52 @@ class EVA:
             lambda: self.responder(mensagem, **kwargs))
 
 
+    def pre_visualizar(
+        self, mensagem: str, *, usuario: str | None = None,
+        modo_voz: bool = False, contexto_visual: str | None = None,
+    ) -> dict:
+        """Monta o que SERIA enviado ao modelo, sem chamar o modelo.
+
+        Reaproveita passo a passo a mesma pipeline de responder() (decisão,
+        identidade, memória, ferramentas, contexto) -- só para antes do
+        passo de gerar a resposta. Existe para o dashboard de debug: ver
+        o prompt exato que seria montado para uma mensagem de teste, sem
+        gastar uma chamada real ao modelo nem esperar geração.
+
+        Duplica ~10 linhas de responder() de propósito, em vez de extrair
+        um helper compartilhado -- responder() já é código testado e em
+        produção (stream, tratamento de erro do LLM, pós-processamento);
+        arriscar isso por uma ferramenta de debug não vale a pena.
+
+        Síncrono e thread-safe (BancoMemoria usa RLock) -- chamável direto
+        da thread do servidor do dashboard, sem ponte com asyncio.
+        """
+        usuario = usuario or self.cfg.usuario
+        mensagem = mensagem.strip()
+        historico = self.memoria.historico(
+            usuario=usuario, limite=self.cfg.memoria.janela_historico)
+        plano = self.decisor.decidir(mensagem, historico)
+        identidade = self._identidade(usuario)
+        memorias = self._buscar_memorias(plano, usuario)
+        resultados = self._executar_ferramentas(plano)
+        ctx = self.builder.montar(
+            plano=plano, memorias=memorias, resultados_ferramentas=resultados,
+            estado=self.estado.estado, historico=historico, identidade=identidade,
+            modo_voz=modo_voz, contexto_visual=contexto_visual,
+        )
+        teto = self.cfg.llm.max_tokens_voz if modo_voz else self.cfg.llm.max_tokens
+        return {
+            "usuario": usuario,
+            "system": ctx.system,
+            "mensagens": ctx.para_chat(mensagem),
+            "plano": plano.to_dict(),
+            "memorias_usadas": {k: [m.conteudo for m in v]
+                               for k, v in memorias.items() if v},
+            "ferramentas": resultados,
+            "max_tokens": teto,
+            "identidade": identidade,
+        }
+
     def falar_sozinha(self, ideia: str, *, usuario: str | None = None,
                       modo_voz: bool = True) -> Resultado:
         """Produz uma fala espontânea a partir de um impulso aprovado.

@@ -272,14 +272,41 @@ class ContextBuilder:
 
     # ------------------------------------------------------------ limpeza
 
+    # Sentinelas tecnicas usadas por eva/tools/builtin.py -- traduzidas
+    # aqui, num unico lugar, para nunca chegarem cruas ao modelo. BUG REAL
+    # JA VISTO: com o dict cru no contexto, o modelo abriu uma resposta
+    # falada literalmente com "Sem_resultado" (o valor exato do campo
+    # "aviso" de buscar()) antes de continuar raciocinando por conta
+    # propria -- ele nao tinha como saber que aquilo era um codigo interno
+    # e nao uma palavra da conversa. Fallback generico cobre codigo de
+    # erro futuro que ainda nao esteja mapeado aqui.
+    _NOTAS_ERRO_FERRAMENTA = {
+        "sem_resultado": "a busca não encontrou nada útil",
+        "divisao_por_zero": "não dá pra dividir por zero",
+        "expressao_invalida": "essa conta não fechou, algo na expressão está errado",
+        "cidade_nao_encontrada": "não achei essa cidade",
+        "falha_rede": "não consegui conectar para checar isso agora",
+        "searxng_indisponivel": "a busca está fora do ar agora",
+        "falha_busca": "a busca falhou por algum motivo",
+    }
+
     def _limpar_ferramentas(self, resultados: dict) -> dict:
-        """Remove metadados internos que não interessam ao modelo."""
+        """Remove metadados internos e traduz sentinelas de erro/aviso
+        para nota curta em português -- ver _NOTAS_ERRO_FERRAMENTA acima.
+        """
         limpo = {}
         for nome, r in resultados.items():
-            if isinstance(r, dict):
-                limpo[nome] = {k: v for k, v in r.items() if not k.startswith("_")}
-            else:
+            if not isinstance(r, dict):
                 limpo[nome] = r
+                continue
+            codigo = r.get("erro") or r.get("aviso")
+            if codigo:
+                limpo[nome] = {
+                    "nota": self._NOTAS_ERRO_FERRAMENTA.get(
+                        codigo, "essa ferramenta não conseguiu responder agora")
+                }
+            else:
+                limpo[nome] = {k: v for k, v in r.items() if not k.startswith("_")}
         return limpo
 
     def _limpar_historico(self, historico: list[dict]) -> list[dict]:

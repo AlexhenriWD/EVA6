@@ -205,6 +205,23 @@ class ConscienciaConfig:
 
 
 @dataclass
+class DashboardConfig:
+    """Painel local de controle e debug -- ver eva/dashboard.py.
+
+    Roda um servidor HTTP simples (stdlib, sem dependência nova) na sua
+    própria máquina. Liga por padrão porque é ferramenta de debug -- em
+    uso de longo prazo sem necessidade de inspecionar nada, pode desligar
+    com EVA_DASHBOARD=0.
+    """
+    ativa: bool = os.environ.get("EVA_DASHBOARD", "1") == "1"
+    # 127.0.0.1, não 0.0.0.0: sem isso o painel (sem autenticação nenhuma)
+    # ficaria acessível para qualquer outro dispositivo na sua rede local.
+    # Mude só se souber exatamente o que está fazendo.
+    host: str = os.environ.get("EVA_DASHBOARD_HOST", "127.0.0.1")
+    porta: int = int(os.environ.get("EVA_DASHBOARD_PORT", "8790"))
+
+
+@dataclass
 class VisaoConfig:
     """Reação a tela -- captura local do PC, MiniCPM-V para análise.
 
@@ -309,6 +326,7 @@ class EVAConfig:
     memoria: MemoriaConfig = field(default_factory=MemoriaConfig)
     estado: EstadoConfig = field(default_factory=EstadoConfig)
     identidade: IdentidadeConfig = field(default_factory=IdentidadeConfig)
+    dashboard: DashboardConfig = field(default_factory=DashboardConfig)
     consciencia: ConscienciaConfig = field(default_factory=ConscienciaConfig)
     visao: VisaoConfig = field(default_factory=VisaoConfig)
     voz: VozConfig = field(default_factory=VozConfig)
