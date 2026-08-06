@@ -189,6 +189,41 @@ def split_into_sentences(text: str, min_chars: int = 20) -> List[str]:
     return merged
 
 
+_FIM_FRASE_RE = re.compile(r'(?<=[.!?])\s+')
+
+
+def extrair_frases_fechadas(buffer: str, min_chars: int = 20) -> tuple[List[str], str]:
+    """Do buffer acumulado do streaming do LLM, separa as frases já
+    FECHADAS (terminam em .!? seguido de espaço) do resto, que ainda
+    pode crescer.
+
+    Prima de split_into_sentences: aquela decide sobre o TEXTO INTEIRO já
+    pronto; esta decide sobre um buffer que ainda está sendo escrito,
+    token a token. Fragmento curto (< min_chars) não sai sozinho -- fica
+    esperando fundir com o próximo fechamento, mesmo espírito de
+    split_into_sentences, só que prospectivo em vez de retrospectivo
+    (aqui não dá pra olhar pra frente, só esperar mais texto chegar).
+
+    Herda a mesma limitação de split_into_sentences: abreviação com ponto
+    ("Dr.", "3.14") pode cortar frase no lugar errado. Regex simples não
+    resolve isso com confiança; não é problema novo, é o mesmo trade-off
+    que o caminho não-streaming já aceita.
+    """
+    partes = _FIM_FRASE_RE.split(buffer)
+    if len(partes) <= 1:
+        return [], buffer
+
+    fechadas: List[str] = []
+    pendente = ""
+    for trecho in partes[:-1]:
+        pendente = f"{pendente} {trecho}".strip() if pendente else trecho
+        if len(pendente) >= min_chars:
+            fechadas.append(pendente)
+            pendente = ""
+    resto = f"{pendente} {partes[-1]}".strip() if pendente else partes[-1]
+    return fechadas, resto
+
+
 # ══════════════════════════════════════════════════════════════════
 # PONTE: generator SÍNCRONO/bloqueante → async generator
 # ══════════════════════════════════════════════════════════════════

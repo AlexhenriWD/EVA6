@@ -113,6 +113,9 @@ class MemoriaConfig:
     # Quantos itens de cada tipo entram no contexto por vez. Numeros baixos
     # de proposito: contexto grande dilui o que importa e custa tokens.
     max_fatos: int = 6
+    # Teto separado de max_fatos: história dela é conteúdo diferente de fato
+    # sobre a pessoa, e não deveria competir pelo mesmo espaço/relevância.
+    max_historia: int = int(os.environ.get("EVA_MAX_HISTORIA", "2"))
     max_episodios: int = 4
     max_procedimentos: int = 3
     max_personalidade: int = 3

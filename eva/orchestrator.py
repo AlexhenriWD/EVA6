@@ -45,7 +45,7 @@ from .decision import DecisorPorLLM, DecisorPorRegras, Plano
 from .identity import Pessoa, promover
 from .llm import ClienteLLM, ErroLLM
 from .memory.extractor import extrair_por_llm, extrair_por_regras
-from .memory.store import BancoMemoria
+from .memory.store import BancoMemoria, USUARIO_HISTORIA
 from .state import GerenciadorEstado
 from .tools.builtin import carregar_ferramentas
 
@@ -64,6 +64,29 @@ class Resultado:
     system: str = ""
     ms: int = 0
     erro: str | None = None
+
+
+class RespostaEmStream:
+    """Iterável dos pedaços de texto de uma resposta em streaming.
+
+    `.resultado` fica None até a iteração terminar; depois de esgotado,
+    tem o Resultado completo (pós-processamento já feito). Existe porque
+    generator não aceita atributo arbitrário -- o padrão antigo
+    (`gerar.resultado`) setava no objeto FUNÇÃO, que ninguém de fora
+    consegue alcançar. Sem consumidor real de stream=True até hoje,
+    ninguém tinha notado.
+    """
+    def __init__(self):
+        self._gerador = None
+        self.resultado: Resultado | None = None
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self._gerador is None:
+            raise StopIteration
+        return next(self._gerador)
 
 
 class _ConfigExtrator:
@@ -168,7 +191,7 @@ class EVA:
         identidade = self._identidade(usuario)
 
         # 3. buscar memória
-        memorias = self._buscar_memorias(plano, usuario)
+        memorias = self._buscar_memorias(plano, usuario, mensagem)
 
         # 4. executar ferramentas
         resultados = self._executar_ferramentas(plano)
@@ -259,7 +282,7 @@ class EVA:
             usuario=usuario, limite=self.cfg.memoria.janela_historico)
         plano = self.decisor.decidir(mensagem, historico)
         identidade = self._identidade(usuario)
-        memorias = self._buscar_memorias(plano, usuario)
+        memorias = self._buscar_memorias(plano, usuario, mensagem)
         resultados = self._executar_ferramentas(plano)
         ctx = self.builder.montar(
             plano=plano, memorias=memorias, resultados_ferramentas=resultados,
@@ -300,7 +323,7 @@ class EVA:
 
         historico = self.memoria.historico(
             usuario=usuario, limite=self.cfg.memoria.janela_historico)
-        memorias = self._buscar_memorias(plano, usuario)
+        memorias = self._buscar_memorias(plano, usuario, ideia)
 
         ctx = self.builder.montar(
             plano=plano, memorias=memorias, resultados_ferramentas={},
@@ -334,6 +357,7 @@ class EVA:
                           ctx, mensagens, teto, inicio):
         """Gera a resposta em pedaços; o pós-processo roda no fim."""
         partes: list[str] = []
+        envelope = RespostaEmStream()
 
         def gerar():
             erro = None
@@ -342,13 +366,14 @@ class EVA:
                     partes.append(pedaco)
                     yield pedaco
             except ErroLLM as e:
+                # Erro do LLM não vira texto pra falar/mostrar -- fica só em
+                # resultado.erro, igual o caminho não-streaming já faz.
                 erro = str(e)
-                yield f"\n[erro: {erro}]"
 
             resposta = "".join(partes)
             novas = self._pos_processar(mensagem, resposta, plano, usuario,
                                         sucesso=erro is None)
-            gerar.resultado = Resultado(
+            envelope.resultado = Resultado(
                 resposta=resposta, plano=plano, usuario=usuario,
                 memorias_usadas={k: [m.conteudo for m in v] for k, v in memorias.items() if v},
                 ferramentas=resultados, memorias_novas=novas, contexto=ctx.bruto,
@@ -356,8 +381,8 @@ class EVA:
                 ms=int((time.time() - inicio) * 1000), erro=erro,
             )
 
-        gerar.resultado = None
-        return gerar()
+        envelope._gerador = gerar()
+        return envelope
 
     # ------------------------------------------------------------ etapas
 
@@ -374,7 +399,7 @@ class EVA:
             self.memoria.salvar_pessoa(usuario, relacao=p.relacao)
         return p.linha()
 
-    def _buscar_memorias(self, plano: Plano, usuario: str) -> dict[str, list]:
+    def _buscar_memorias(self, plano: Plano, usuario: str, mensagem: str) -> dict[str, list]:
         saida: dict[str, list] = {}
 
         if plano.precisa_memoria and plano.consulta_memoria:
@@ -404,6 +429,23 @@ class EVA:
                 saida["semantica"] = (saida.get("semantica", []) + extras)[
                     : self.cfg.memoria.max_fatos
                 ]
+
+        # História/lore da própria EVA -- independente de precisa_memoria, de
+        # propósito: essa flag decide se a pergunta precisa saber algo sobre A
+        # PESSOA, não sobre a EVA. "sobre_si" desativa precisa_memoria e sem
+        # este passo a busca de história nunca rodaria exatamente na pergunta
+        # que deveria usá-la.
+        if mensagem.strip():
+            historia = self.memoria.buscar(
+                mensagem, usuario=USUARIO_HISTORIA, tipo="semantica",
+                limite=self.cfg.memoria.max_historia,
+                score_minimo=self.cfg.memoria.score_minimo,
+            )
+            if historia:
+                existentes = {m.id for m in saida.get("semantica", [])}
+                extras = [m for m in historia if m.id not in existentes]
+                if extras:
+                    saida["semantica"] = saida.get("semantica", []) + extras
         return saida
 
     def _executar_ferramentas(self, plano: Plano) -> dict:

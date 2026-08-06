@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import queue
 import time
 from dataclasses import dataclass, field
 
@@ -333,6 +334,88 @@ class ClienteBridge:
         await self._enviar({"type": "play", "guild_id": str(guild_id)})
         await self.ws.send(pcm)
 
+    async def _falar_stream(self, guild_id: str, mensagem: str, usuario: str,
+                            contexto_visual: str | None):
+        """Substitui responder_async()+falar() no turno de voz: o LLM gera
+        frase a frase, cada frase é sintetizada e mandada pro bridge assim
+        que fica pronta -- a EVA começa a falar antes de terminar de pensar
+        a resposta inteira.
+        """
+        if not self.tts:
+            return None
+        if not self.tts.motor._carregado:
+            await self.tts.motor.inicializar()
+
+        fila: queue.Queue = queue.Queue()
+        asyncio.create_task(asyncio.to_thread(
+            self._produzir_stream_de_voz, mensagem, usuario, contexto_visual, fila))
+
+        est = self.estado(guild_id)
+        primeiro = True
+        resultado = None
+        while True:
+            tipo, dado = await asyncio.to_thread(fila.get)
+            if tipo == "audio":
+                if primeiro:
+                    est.falando = True
+                    await self._enviar({"type": "play_start", "guild_id": str(guild_id)})
+                    primeiro = False
+                await self._enviar({"type": "play_chunk", "guild_id": str(guild_id)})
+                await self.ws.send(dado)
+            elif tipo == "fim":
+                resultado = dado
+                break
+            elif tipo == "erro":
+                print(f"[voz-stream] {dado}")
+                break
+
+        if not primeiro:
+            await self._enviar({"type": "play_end", "guild_id": str(guild_id)})
+        else:
+            est.falando = False
+        return resultado
+
+    def _produzir_stream_de_voz(self, mensagem, usuario, contexto_visual, fila) -> None:
+        """Roda inteiro numa thread dedicada: monta contexto, consome o
+        streaming do LLM, sintetiza frase a frase, põe áudio na fila. Nada
+        bloqueante toca o event loop direto -- mesma política do resto do
+        bridge_client.
+        """
+        try:
+            stream = self.eva.responder(
+                mensagem, usuario=usuario, stream=True, modo_voz=True,
+                contexto_visual=contexto_visual)
+        except Exception as e:
+            fila.put(("erro", str(e)))
+            return
+
+        from ..voice.audio_utils import extrair_frases_fechadas
+
+        buffer = ""
+        try:
+            for pedaco in stream:
+                buffer += pedaco
+                frases, buffer = extrair_frases_fechadas(buffer)
+                for frase in frases:
+                    self._sintetizar_e_enfileirar(frase, fila)
+        except Exception as e:
+            fila.put(("erro", str(e)))
+            return
+
+        if buffer.strip():
+            self._sintetizar_e_enfileirar(buffer, fila)
+
+        fila.put(("fim", stream.resultado))
+
+    def _sintetizar_e_enfileirar(self, frase: str, fila: "queue.Queue") -> None:
+        try:
+            pcm = self.tts.motor.gerar_frase_sync(frase)
+        except Exception as e:
+            print(f"[tts-stream] erro sintetizando {frase[:40]!r}: {e}")
+            return
+        if pcm:
+            fila.put(("audio", pcm))
+
     # ---------------------------------------------------------- recepção
 
     async def _ao_receber_audio(self, guild_id: str, user_id: str, pcm: bytes) -> None:
@@ -375,17 +458,14 @@ class ClienteBridge:
             # o que o outro contou. `modo_voz=True` acrescenta a linha
             # "MODO: VOZ" treinada e baixa o teto de 400 para 120 tokens --
             # 400 tokens são uns 40 segundos de fala.
-            r = await self.eva.responder_async(
-                t.texto, usuario=str(user_id), modo_voz=True,
-                contexto_visual=self._contexto_visual_para(t.texto))
-            if r.erro:
-                print(f"[eva] {r.erro}")
-                return
-            if not r.resposta:
+            r = await self._falar_stream(
+                guild_id, t.texto, str(user_id), self._contexto_visual_para(t.texto))
+            if r is None or not r.resposta:
+                if r and r.erro:
+                    print(f"[eva] {r.erro}")
                 return
 
             print(f"[eva] {r.resposta}")
-            await self.falar(guild_id, r.resposta)
             self.consciencia(guild_id).ela_falou()
 
             # Lacuna de conhecimento: a mensagem tocou em algo que pode

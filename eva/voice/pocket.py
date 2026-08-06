@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import threading
 import time
 from pathlib import Path
 from typing import AsyncIterator, Optional, Union
@@ -122,6 +123,7 @@ class PocketTTSEngine:
 
         # Pocket TTS não é thread-safe: uma geração por vez por instância.
         self._lock = asyncio.Lock()
+        self._lock_sync = threading.Lock()
         self._carregado = False
         self._lock_carga = asyncio.Lock()
 
@@ -202,6 +204,33 @@ class PocketTTSEngine:
                 self.model.generate_audio, self.voice_state, texto
             )
         return torch_audio_to_int16(tensor), self.sample_rate
+
+    def gerar_frase_sync(self, texto: str) -> bytes:
+        """Sintetiza UMA frase e devolve PCM 48kHz estéreo já alinhado a
+        frame. Bloqueante e SÍNCRONA de propósito -- pra ser chamada de
+        dentro da thread dedicada do streaming de voz (bridge_client), nunca
+        do event loop direto.
+
+        Sem split por sentença aqui dentro: a frase já chega fechada de fora
+        (extrair_frases_fechadas, audio_utils.py). Escala FIXA
+        (float32_to_int16_fixed_scale), não normalização por pico -- senão o
+        volume salta de frase pra frase. Resample por frase, não por
+        pedacinho de 5-20ms: uma frase inteira (meio segundo a poucos
+        segundos) não sofre o artefato de transiente do filtro FIR que
+        motivou o acúmulo de 120ms em stream_para_discord -- aquele bug era
+        sobre fragmentos bem menores que isso.
+        """
+        if not self._carregado:
+            raise ErroPocketTTS("motor não inicializado -- chame inicializar() antes")
+        texto = texto.strip()
+        if not texto:
+            return b""
+        with self._lock_sync:
+            tensor = self.model.generate_audio(self.voice_state, texto)
+        amostras = torch_audio_to_float32(tensor)
+        int16 = float32_to_int16_fixed_scale(amostras)
+        estereo = resample_and_stereo(int16, self.sample_rate)
+        return alinhar_frames(estereo.tobytes(), FRAME_DISCORD)
 
     async def gerar_para_discord(self, texto: str) -> bytes:
         """PCM s16le 48kHz estéreo, pronto para o bridge.

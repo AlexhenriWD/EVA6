@@ -47,6 +47,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 TIPOS = ("episodica", "semantica", "procedural", "personalidade")
+USUARIO_HISTORIA = "_eva_historia"  # escopo reservado -- história/lore
+                                     # dela mesma, nunca é um usuário real
 
 # O schema roda em duas etapas, e a ordem importa: um banco criado antes do
 # multiusuario nao tem a coluna `usuario`, e um indice sobre ela falharia
