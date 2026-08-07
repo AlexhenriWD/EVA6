@@ -202,6 +202,37 @@ class SistemaVisual:
             return None
         return self.cena.descricao
 
+    def analisar_agora(self) -> str | None:
+        """Captura e analisa AGORA, ignorando o detector de diferença --
+        usado quando a pessoa pede explicitamente pra olhar a tela
+        (visao_relevante() deu True). Vale pagar o custo de mais uma
+        chamada ao MiniCPM-V mesmo que nada tenha mudado o suficiente
+        pra disparar o tick normal: contexto_atual() sozinho depende do
+        último tick de fundo ter rodado E aprovado como MACRO, o que não
+        tem relação nenhuma com o instante em que a pergunta foi feita.
+
+        Diferente de _analisar_mudanca(), NÃO aplica o filtro de
+        similaridade -- aqui a pessoa quer saber o que está na tela
+        agora, não se mudou o bastante pra virar evento.
+        """
+        if not self.ativo:
+            return None
+        try:
+            quadros = self._capturar_rajada()
+            descricao = self.cliente.analisar(quadros, PROMPT_CENA)
+        except ErroVisao as e:
+            if self.cfg.debug:
+                print(f"[visao] erro na análise sob demanda: {e}")
+            return None
+        except Exception as e:
+            if self.cfg.debug:
+                print(f"[visao] erro inesperado na análise sob demanda: {e}")
+            return None
+        if not descricao:
+            return None
+        self.cena = RegistroCena(descricao, time.time())
+        return descricao
+
     # ---------------------------------------------------------- ciclo
 
     def ligar(self) -> None:

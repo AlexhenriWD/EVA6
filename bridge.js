@@ -131,9 +131,13 @@ wss.on('connection', (ws) => {
   ws.on('message', async (data, isBinary) => {
     if (isBinary) {
       if (pendingAudioFor) {
-        const { guild_id } = pendingAudioFor;
+        const { guild_id, streaming } = pendingAudioFor;
         pendingAudioFor = null;
-        await playAudio(guild_id, data);
+        if (streaming) {
+          pushPlayChunk(guild_id, data);
+        } else {
+          await playAudio(guild_id, data);
+        }
       }
       return;
     }
@@ -152,7 +156,16 @@ wss.on('connection', (ws) => {
       case 'join':  await handleJoin(ws, msg);  break;
       case 'leave': await handleLeave(ws, msg); break;
       case 'play':
-        pendingAudioFor = { guild_id: msg.guild_id };
+        pendingAudioFor = { guild_id: msg.guild_id, streaming: false };
+        break;
+      case 'play_start':
+        startPlayStream(msg.guild_id);
+        break;
+      case 'play_chunk':
+        pendingAudioFor = { guild_id: msg.guild_id, streaming: true };
+        break;
+      case 'play_end':
+        endPlayStream(msg.guild_id);
         break;
       // NOVO v3
       case 'send_message': await handleSendMessage(ws, msg); break;
@@ -488,7 +501,17 @@ async function handleJoin(ws, msg) {
       }
     });
 
-    voiceStates.set(guild_id, { connection, player, receiver, subscriptions, channel_id });
+    voiceStates.set(guild_id, {
+      connection,
+      player,
+      receiver,
+      subscriptions,
+      channel_id,
+      streamAtivo: null,
+      filaAudio: Buffer.alloc(0),
+      streamFinalizando: false,
+      timerStream: null,
+    });
     sendJson(ws, { type: 'joined', guild_id, channel_id, channel_name: channel.name });
     console.log(`✅ Bridge ativo para guild ${guild_id}`);
 
@@ -509,11 +532,15 @@ async function handleLeave(ws, msg) {
   reconnectingGuilds.delete(guild_id);
 
   if (state) {
+    pararTimerStream(state);
     for (const [, sub] of state.subscriptions) {
       try { sub.opusStream.destroy(); } catch {}
       try { sub.decoder.destroy();   } catch {}
     }
     state.subscriptions.clear();
+    if (state.streamAtivo) {
+      try { state.streamAtivo.push(null); } catch {}
+    }
     // FIX v2: destroy antes de delete para garantir cleanup no Discord
     try { state.connection.destroy(); } catch {}
     voiceStates.delete(guild_id);
@@ -570,6 +597,31 @@ function pcmBufferToStream(buffer, frameBytes = CONFIG.FRAME_SIZE) {
   });
 }
 
+function pararTimerStream(state) {
+  if (state && state.timerStream) {
+    clearInterval(state.timerStream);
+    state.timerStream = null;
+  }
+}
+
+// FIX (estalo/"pipocando" na transição real<->silêncio): PCM cru pula
+// abruptamente de amplitude real pra zero (ou zero pra real) toda vez
+// que um frame de silêncio de preenchimento entra ou sai -- isso é uma
+// transiente de alta frequência, ouve-se como clique/estalo. Fade ao
+// longo do próprio frame de 20ms suaviza a transição sem ser percebido
+// como um "fade" de verdade -- só elimina o degrau abrupto.
+function aplicarFade(frame, direcao) {
+  const saida = Buffer.from(frame);
+  const totalAmostras = saida.length / 2; // int16 = 2 bytes cada
+  for (let i = 0; i < totalAmostras; i++) {
+    const offset = i * 2;
+    const fator = direcao === 'saida' ? 1 - (i / totalAmostras) : (i / totalAmostras);
+    const valor = saida.readInt16LE(offset);
+    saida.writeInt16LE(Math.round(valor * fator), offset);
+  }
+  return saida;
+}
+
 async function playAudio(guild_id, pcmBuffer) {
   const state = voiceStates.get(guild_id);
   if (!state) {
@@ -589,6 +641,7 @@ async function playAudio(guild_id, pcmBuffer) {
     const readable = pcmBufferToStream(pcmBuffer);
     readable.on('error', (err) => {
       console.error(`❌ Erro no stream de PCM (guild ${guild_id}): ${err.message}`);
+      pararTimerStream(state);
     });
     const resource = createAudioResource(readable, { inputType: 'raw', inlineVolume: false });
     player.play(resource);
@@ -602,11 +655,98 @@ async function playAudio(guild_id, pcmBuffer) {
   }
 
   player.once(AudioPlayerStatus.Idle, () => {
+    pararTimerStream(state);
     console.log(`✅ Reprodução finalizada (guild ${guild_id})`);
     if (pythonSocket && pythonSocket.readyState === 1) {
       sendJson(pythonSocket, { type: 'play_done', guild_id });
     }
   });
+}
+
+// ─────────────────────────────────────────
+// REPRODUÇÃO EM STREAMING (frase a frase, conforme a EVA sintetiza)
+// ─────────────────────────────────────────
+function startPlayStream(guild_id) {
+  const state = voiceStates.get(guild_id);
+  if (!state) {
+    sendJson(pythonSocket, { type: 'play_done', guild_id });
+    return;
+  }
+  pararTimerStream(state);
+  if (state.streamAtivo) {
+    try { state.streamAtivo.push(null); } catch {}
+  }
+
+  const readable = new Readable({
+    highWaterMark: CONFIG.FRAME_SIZE * 4,
+    read() {},
+  });
+  readable.on('error', (err) => {
+    console.error(`❌ Erro no stream de voz (guild ${guild_id}): ${err.message}`);
+    pararTimerStream(state);
+  });
+
+  state.streamAtivo = readable;
+  state.filaAudio = Buffer.alloc(0);
+  state.streamFinalizando = false;
+  state.ultimoTipoFrame = null;
+  state.ultimoFrameReal = null;
+
+  const SILENCIO = Buffer.alloc(CONFIG.FRAME_SIZE);
+  state.timerStream = setInterval(() => {
+    let frame;
+    let tipoAtual;
+
+    if (state.filaAudio.length >= CONFIG.FRAME_SIZE) {
+      frame = state.filaAudio.subarray(0, CONFIG.FRAME_SIZE);
+      state.filaAudio = state.filaAudio.subarray(CONFIG.FRAME_SIZE);
+      tipoAtual = 'real';
+    } else if (state.streamFinalizando && state.filaAudio.length === 0) {
+      pararTimerStream(state);
+      readable.push(null);
+      return;
+    } else {
+      frame = SILENCIO;
+      tipoAtual = 'silencio';
+    }
+
+    if (tipoAtual === 'silencio' && state.ultimoTipoFrame === 'real') {
+      frame = aplicarFade(state.ultimoFrameReal || frame, 'saida');
+    } else if (tipoAtual === 'real' && state.ultimoTipoFrame === 'silencio') {
+      frame = aplicarFade(frame, 'entrada');
+    }
+    if (tipoAtual === 'real') {
+      state.ultimoFrameReal = frame;
+    }
+    state.ultimoTipoFrame = tipoAtual;
+
+    readable.push(frame);
+  }, 20);
+
+  const resource = createAudioResource(readable, { inputType: 'raw', inlineVolume: false });
+  state.player.play(resource);
+  console.log(`🔊 Streaming de voz iniciado (guild ${guild_id})`);
+
+  state.player.once(AudioPlayerStatus.Idle, () => {
+    pararTimerStream(state);
+    state.streamAtivo = null;
+    console.log(`✅ Streaming de voz finalizado (guild ${guild_id})`);
+    if (pythonSocket && pythonSocket.readyState === 1) {
+      sendJson(pythonSocket, { type: 'play_done', guild_id });
+    }
+  });
+}
+
+function pushPlayChunk(guild_id, chunk) {
+  const state = voiceStates.get(guild_id);
+  if (!state || !state.streamAtivo) return;
+  state.filaAudio = Buffer.concat([state.filaAudio || Buffer.alloc(0), chunk]);
+}
+
+function endPlayStream(guild_id) {
+  const state = voiceStates.get(guild_id);
+  if (!state || !state.streamAtivo) return;
+  state.streamFinalizando = true;
 }
 
 // ─────────────────────────────────────────

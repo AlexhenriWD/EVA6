@@ -461,9 +461,13 @@ class EVA:
 
     def _pos_processar(self, mensagem: str, resposta: str, plano: Plano,
                        usuario: str, sucesso: bool) -> list:
-        # histórico
-        self.memoria.registrar_turno("user", mensagem, usuario=usuario)
+        # histórico -- só registra o par se a EVA respondeu de verdade.
+        # Registrar o turno do usuário sozinho deixava entradas "user"
+        # seguidas no histórico na próxima mensagem -- ChatML tolera, mas
+        # quebra com erro duro em template de alternância estrita
+        # (Mistral/Nemo, usado por Violet-Lotus e outros modelos de RP).
         if resposta:
+            self.memoria.registrar_turno("user", mensagem, usuario=usuario)
             self.memoria.registrar_turno("assistant", resposta, usuario=usuario)
 
         reg = self.memoria.pessoa(usuario)

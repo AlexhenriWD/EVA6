@@ -87,6 +87,13 @@ class LLMConfig:
     # se sentir que ela ficou insistindo em piada ou saindo do personagem.
     carisma: bool = os.environ.get("EVA_CARISMA", "1") == "1"
 
+    # "ancora": PERSONA curto e exato, pro modelo treinado (eva-3b/eva-7b
+    # LoRA) -- NUNCA usar com ele, diverge do formato de treino em
+    # silêncio (mesmo aviso do topo do context.py). "prompt": personagem
+    # completo, pra modelos de RP sem fine-tuning (lumimaid e afins) que
+    # seguem bem system prompt rico.
+    modo_persona: str = os.environ.get("EVA_MODO_PERSONA", "ancora")
+
 
 @dataclass
 class DecisionConfig:

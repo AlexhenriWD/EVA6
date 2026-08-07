@@ -152,27 +152,18 @@ class ClienteBridge:
         except Exception:
             return None
 
-    def _contexto_visual_para(self, texto: str) -> str | None:
-        """A cena para injetar neste turno, ou None -- decide ANTES de
-        chamar EVA.responder(), porque contexto_visual é parâmetro de
-        entrada, não algo que o orquestrador busca sozinho (EVA não
-        conhece SistemaVisual de propósito, mesma separação que já existe
-        entre EVA e Consciencia).
-
-        Dois caminhos para "sim, injeta": a pessoa referenciou a tela
-        explicitamente (visao_relevante, decision.py -- "olha isso",
-        "minha tela"), OU a cena mudou muito recentemente (janela_
-        relevancia_recente) e ainda é razoável supor que seja sobre isso
-        mesmo sem menção direta. Fora esses dois casos, NÃO injeta --
-        contexto visual perene em toda resposta é o mesmo risco de
-        "narradora" da consciência, só que no nível da conversa inteira.
+    async def _contexto_visual_para(self, texto: str) -> str | None:
+        """A cena para injetar neste turno, ou None. Ver docstring
+        original -- só mudou o caminho de pedido explícito, que agora
+        dispara análise sob demanda em vez de confiar no último tick.
         """
         if self.visao is None:
             return None
         from ..decision import visao_relevante
 
         if visao_relevante(texto):
-            return self.visao.contexto_atual()
+            fresca = await asyncio.to_thread(self.visao.analisar_agora)
+            return fresca or self.visao.contexto_atual()
 
         cena = self.visao.cena
         if cena and cena.idade_segundos() < self.cfg.visao.janela_relevancia_recente:
@@ -459,7 +450,8 @@ class ClienteBridge:
             # "MODO: VOZ" treinada e baixa o teto de 400 para 120 tokens --
             # 400 tokens são uns 40 segundos de fala.
             r = await self._falar_stream(
-                guild_id, t.texto, str(user_id), self._contexto_visual_para(t.texto))
+                guild_id, t.texto, str(user_id),
+                await self._contexto_visual_para(t.texto))
             if r is None or not r.resposta:
                 if r and r.erro:
                     print(f"[eva] {r.erro}")
@@ -535,7 +527,7 @@ class ClienteBridge:
             self.consciencia(gid).registrar_nome(autor, d.get("author_name"))
             r = await self.eva.responder_async(
                 texto, usuario=autor,
-                contexto_visual=self._contexto_visual_para(texto))
+                contexto_visual=await self._contexto_visual_para(texto))
 
             if r.erro:
                 await self.enviar_mensagem(
@@ -757,3 +749,24 @@ class ClienteBridge:
         if self._dashboard:
             self._dashboard.parar()
         self.eva.fechar()
+
+    def desligar_tudo(self) -> None:
+        """Encerramento explícito e IMEDIATO, via botão do dashboard.
+
+        Por que isso existe além de fechar(): o ThreadPoolExecutor por
+        trás de asyncio.to_thread() registra um atexit que espera
+        QUALQUER chamada em andamento terminar antes do processo morrer
+        de verdade -- se isso acontece no meio de uma síntese de TTS,
+        chamada ao LM Studio, ou análise de visão, o terminal fica preso
+        até aquela chamada terminar sozinha. fechar() limpa o que dá pra
+        limpar de forma síncrona (tarefas de consciência, visão,
+        dashboard, banco); os._exit() depois disso pula esse atexit
+        inteiro -- bruto de propósito, é a saída rápida que devia
+        existir.
+        """
+        try:
+            self.fechar()
+        except Exception as e:
+            print(f"[desligar] erro durante limpeza (ignorado): {e}")
+        import os
+        os._exit(0)

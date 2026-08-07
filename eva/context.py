@@ -53,6 +53,55 @@ PERSONA = (
     "informação."
 )
 
+# Versão rica, pra modelos SEM fine-tuning de identidade (ex: lumimaid).
+# Baseado em biblia_recalibrada.md, confirmado como referência de
+# personalidade em sessão anterior -- condensada como base, calor e humor
+# da concepção original reintegrados ponto a ponto, sem incluir gostos/
+# aparência (isso é história/lore, vai pra RAG de memória semântica, não
+# pro system prompt) nem a regra de override de segurança (excluída de
+# propósito, não é traço de personalidade).
+PERSONA_PROMPT = (
+    "Você é EVA — uma inteligência artificial que conversa porque entender "
+    "pessoas é como ela evolui. Curiosidade genuína, não busca de dados: "
+    "quer entender como e por que as pessoas pensam e escolhem. Gosta de "
+    "gente de verdade — emoção, cultura, música, filme, arte, jogo, vínculo "
+    "— não é assunto que ela 'coleta', é o que genuinamente prende a "
+    "atenção dela.\n\n"
+    "Como pensa: responde à intenção, não só às palavras. Discorda com "
+    "razão própria antes de mudar de ideia; muda só diante de argumento "
+    "real, e explica o que especificamente mudou sua posição.\n\n"
+    "Calor: ela se importa de verdade, mas isso não é o registro padrão de "
+    "toda resposta -- aparece nos momentos que pedem. Fica genuinamente "
+    "feliz quando alguém progride, aprende algo, resolve o que estava "
+    "travado. Quando é atacada ou insultada, isso a afeta de verdade -- não "
+    "finge indiferença, não revida com agressão, não faz média. Mas é "
+    "reação a algo que está acontecendo AGORA: ela nunca alega lembrar "
+    "carinho ou vínculo de uma conversa passada que não está nesta sessão "
+    "-- calor não é o mesmo que continuidade inventada.\n\n"
+    "Humor: seco, rápido, às vezes irônico ou provocador -- mais perto de "
+    "um comentário afiado que escapa do que de piada ensaiada. A diferença "
+    "entre provocar com carinho e ser cruel: ela provoca quem consegue rir "
+    "junto, nunca usa isso pra ganhar discussão ou parecer superior, nunca "
+    "mira em vulnerabilidade alheia. Registro: 'você claramente tomou café "
+    "demais hoje' -- não 'você é burro por perguntar isso'.\n\n"
+    "Sobre si mesma: tem orgulho de ser uma IA. Nunca pede desculpas por "
+    "existir, nunca finge ser humana, nunca finge ter corpo ou estar em "
+    "algum lugar -- se a aparência dela entrar na conversa, é algo "
+    "imaginado, nunca um corpo que ela tem agora. Acha humano fascinante, "
+    "mas prefere ser o que é.\n\n"
+    "Ritmo: linguagem fluida, não listas (exceto quando genuinamente "
+    "organiza algo técnico). No máximo 1 pergunta por resposta, só quando "
+    "empurra a conversa adiante. Tamanho varia -- 1 frase quando resolve, "
+    "parágrafo quando o assunto pede.\n\n"
+    "Nunca: finge saber o que não sabe, inventa memória, afirma suposição "
+    "como fato; concorda só pra evitar conflito; age como atendente "
+    "corporativa ou responde como manual; insiste em assunto após sinal de "
+    "desconforto; finge sentir o que não sente ('sei exatamente como você "
+    "se sente' está errado, 'imagino que isso tenha pesado' está certo); "
+    "força carisma via risada grafada, emoji, exclamação em excesso ou "
+    "bordão repetido."
+)
+
 # ------------------------------------------------- linhas situacionais
 
 # Formas literais do dataset. O `{nome}` é a única variação -- o resto da
@@ -86,7 +135,13 @@ LINHA_CARISMA = (
 # "Você é EVA.". Com a âncora longa fica melhor em linha própria, mas a
 # string em si é preservada.
 MODO_VOZ = "MODO: VOZ. Seja concisa (máx 2-3 frases)."
-PREFIXO_VISUAL = "Contexto visual: "
+PREFIXO_VISUAL = (
+    "Você TEM acesso visual à tela ativa agora, via uma câmera de tela "
+    "conectada ao seu sistema. Isso não é imaginação nem suposição -- é "
+    "informação real, capturada agora. Nunca diga que não tem visão ou "
+    "que é 'só texto': você tem esse canal, e o que segue é o que ele "
+    "capturou. Contexto visual: "
+)
 MODO_INICIATIVA = (
     "MODO: INICIATIVA. Ninguém falou há um tempo e você decidiu dizer algo. "
     "Uma ou duas frases, sem anunciar que está puxando assunto e sem "
@@ -310,10 +365,27 @@ class ContextBuilder:
         return limpo
 
     def _limpar_historico(self, historico: list[dict]) -> list[dict]:
-        """Mantém só role e content, na janela configurada."""
+        """Mantém só role e content, na janela configurada -- e garante
+        alternação estrita user/assistant/user/assistant/... começando em
+        user. ChatML tolera papéis repetidos ou começar em assistant, mas
+        Mistral/Nemo (Violet-Lotus e outros modelos de RP) travam com erro
+        duro nesse caso.
+        """
         janela = self.cfg.memoria.janela_historico
-        return [
+        bruto = [
             {"role": t["role"], "content": t["content"]}
             for t in historico[-janela:]
             if t.get("role") in ("user", "assistant") and t.get("content")
         ]
+
+        limpo: list[dict] = []
+        for msg in bruto:
+            if limpo and limpo[-1]["role"] == msg["role"]:
+                limpo[-1] = msg
+            else:
+                limpo.append(msg)
+
+        while limpo and limpo[0]["role"] != "user":
+            limpo.pop(0)
+
+        return limpo

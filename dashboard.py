@@ -140,6 +140,8 @@ class _Handler(BaseHTTPRequestHandler):
             self._post_acao(corpo)
         elif caminho == "/api/prompt-preview":
             self._post_prompt_preview(corpo)
+        elif caminho == "/api/desligar":
+            self._post_desligar()
         else:
             self._json(404, {"erro": "rota não encontrada"})
 
@@ -166,6 +168,12 @@ class _Handler(BaseHTTPRequestHandler):
             self._json(400, {"erro": str(e)})
         except Exception as e:
             self._json(500, {"erro": f"falha ao executar ação: {e}"})
+
+    def _post_desligar(self) -> None:
+        """Fecha tudo e mata o processo Python -- ver desligar_tudo()
+        no ClienteBridge pra entender por que é assim, bruto."""
+        self._json(200, {"ok": True, "mensagem": "encerrando..."})
+        threading.Timer(0.3, self.cliente.cliente_bridge.desligar_tudo).start()
 
     def _post_prompt_preview(self, corpo: dict) -> None:
         mensagem = corpo.get("mensagem", "")
@@ -388,6 +396,16 @@ PAGINA_HTML = """<!DOCTYPE html>
   <div class="sub" id="uptime">carregando...</div>
 
   <section>
+    <h2>Controle</h2>
+    <button style="background:#3a2020;border-color:#5a2a2a;color:#ff8a8a"
+            onclick="fecharTudo()">Fechar tudo</button>
+    <div class="desc" style="margin-top:6px">
+      Encerra o processo Python (bridge, visão, dashboard, banco) na hora.
+      Não fecha o bridge.js (Node) -- isso é outro terminal, feche à parte.
+    </div>
+  </section>
+
+  <section>
     <h2>Interruptores</h2>
     <div id="toggles"></div>
   </section>
@@ -439,6 +457,15 @@ async function api(caminho, opcoes) {
 
 function pill(v) {
   return `<span class="pill ${v ? 'on' : 'off'}">${v ? 'ligado' : 'desligado'}</span>`;
+}
+
+async function fecharTudo() {
+  if (!confirm('Fechar tudo? Isso encerra o processo da EVA agora.')) return;
+  await api('/api/desligar', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: '{}',
+  });
+  document.body.innerHTML = '<h1>EVA encerrada.</h1>';
 }
 
 async function alternar(chave, valor) {

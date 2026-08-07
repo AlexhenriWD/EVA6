@@ -109,9 +109,11 @@ CLIMA = re.compile(r"\b(clima|tempo|chuva|chover|temperatura|calor|frio|graus)\b
 # a tela em toda resposta sem necessidade.
 VISAO = re.compile(
     r"\b(v[êe] (isso|aqui|a[íi])|olha (isso|aqui|a tela)|olhando (isso|aqui)|"
-    r"minha tela|na tela|essa tela|nessa tela|"
+    r"enxerg\w*|"                    # NOVO: "enxergar a tela", "consegue enxergar"
+    r"\btela\b|"                     # NOVO: qualquer menção a "tela" já é sinal forte
+    r"sua vis[ãa]o|"                 # NOVO: "problema com a sua visão"
     r"o que (eu )?(t[ôo]|estou) (fazendo|jogando|vendo|mostrando)|"
-    r"(esse|essa) (jogo|c[óo]digo|documento|programa|tela|janela)|"
+    r"(esse|essa) (jogo|c[óo]digo|documento|programa|janela)|"
     r"t[áa] vendo (isso|aqui)|consegue ver|voc[êe] (t[áa] |est[áa] )?vendo)\b",
     re.I,
 )
