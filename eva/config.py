@@ -75,24 +75,28 @@ class LLMConfig:
 
     # Como o bloco de dados e serializado no system prompt: "json" ou "prosa".
     #
-    # O JSON e o que o Context Builder sempre produziu, mas nao aparece em
-    # nenhum dos 1.135 exemplos de treino -- funciona por capacidade herdada
-    # do Qwen2.5-Instruct base, nao pela LoRA. A prosa fica mais perto do
-    # "Contexto visual: ..." que o modelo viu. Existem os dois aqui para dar
-    # para comparar sem editar codigo.
-    formato_contexto: str = os.environ.get("EVA_FORMATO_CONTEXTO", "json")
+    # O JSON so tinha respaldo empirico com o modelo fine-tunado abandonado
+    # -- nao aparece em nenhum dos 1.135 exemplos de treino, funcionava por
+    # capacidade herdada do Qwen2.5-Instruct base, nao pela LoRA. Sem esse
+    # modelo, JSON deixa de ter qualquer vantagem sobre prosa e passa a ser
+    # so risco (exige o modelo "parsear" estrutura em vez de so ler texto
+    # dividido em linhas). Padrao trocado pra "prosa" por isso.
+    formato_contexto: str = os.environ.get("EVA_FORMATO_CONTEXTO", "prosa")
 
     # Linha aditiva de humor/carisma (ver LINHA_CARISMA em context.py).
     # Ligada por padrão a pedido explícito -- desligue com EVA_CARISMA=0
     # se sentir que ela ficou insistindo em piada ou saindo do personagem.
     carisma: bool = os.environ.get("EVA_CARISMA", "1") == "1"
 
-    # "ancora": PERSONA curto e exato, pro modelo treinado (eva-3b/eva-7b
-    # LoRA) -- NUNCA usar com ele, diverge do formato de treino em
-    # silêncio (mesmo aviso do topo do context.py). "prompt": personagem
-    # completo, pra modelos de RP sem fine-tuning (lumimaid e afins) que
-    # seguem bem system prompt rico.
-    modo_persona: str = os.environ.get("EVA_MODO_PERSONA", "ancora")
+    # "ancora": PERSONA curto e exato, SÓ faz sentido com um modelo
+    # fine-tunado especificamente pra ela (eva-3b/eva-7b) -- diverge do
+    # formato de treino em silêncio com qualquer outro modelo (mesmo
+    # aviso do topo do context.py). "prompt": card completo (PERSONA_
+    # PROMPT em context.py), pra modelo normal sem fine-tuning de
+    # identidade -- lumimaid e afins. Padrão trocado pra "prompt": o
+    # modelo fine-tunado foi abandonado, então "ancora" só seria usada
+    # de propósito, não por padrão.
+    modo_persona: str = os.environ.get("EVA_MODO_PERSONA", "prompt")
 
 
 @dataclass
@@ -109,8 +113,28 @@ class DecisionConfig:
     api_key: str = os.environ.get("EVA_LLM_KEY", "lm-studio")
     modelo: str = os.environ.get("EVA_DECISION_MODEL", "eva")
     temperatura: float = 0.0  # decisao deve ser consistente, nao criativa
-    max_tokens: int = 200
+    # 200 nao bastava para modelo que "pensa" antes de responder (ex:
+    # minicpm-v-4.6) -- confirmado em teste real: o modelo gastava os 200
+    # tokens inteiros em reasoning_content e nunca chegava a escrever o
+    # JSON, finish_reason "length" no meio do raciocinio. O decision.py
+    # tambem tinha isso HARDCODED direto na chamada, ignorando esse campo
+    # -- corrigido junto, agora os dois concordam.
+    max_tokens: int = 700
     timeout: int = 60
+
+    # Groq como backend PRINCIPAL de decisão (rápido, na nuvem, não disputa
+    # VRAM com os outros modelos locais -- motivo real de ligar isso: três
+    # modelos locais competindo por GPU tornava a troca entre eles mais
+    # lenta). O local (campos acima) continua existindo e vira RESERVA
+    # automática -- se o Groq falhar ou bater limite de uso, cai pro LM
+    # Studio local sem intervenção manual, e só se os dois falharem cai
+    # pra decisão por regra (fallback que já existia).
+    groq_ativo: bool = os.environ.get("EVA_DECISION_GROQ", "0") == "1"
+    groq_url: str = os.environ.get("EVA_DECISION_GROQ_URL", "https://api.groq.com/openai/v1")
+    groq_modelo: str = os.environ.get("EVA_DECISION_GROQ_MODEL", "openai/gpt-oss-20b")
+    # Reaproveita a mesma chave que já existe pro STT via Groq -- um só
+    # lugar pra configurar a chave, não duas variáveis fazendo a mesma coisa.
+    groq_key: str = os.environ.get("GROQ_API_KEY", "")
 
 
 @dataclass
@@ -305,6 +329,16 @@ class VozConfig:
     stt_modelo: str = os.environ.get("EVA_STT_MODEL", "whisper-large-v3-turbo")
     stt_idioma: str = os.environ.get("EVA_STT_IDIOMA", "pt")
 
+    # Backend de STT: "groq" (padrao, via API) ou "whisper_cpp" (local,
+    # binario compilado com Vulkan -- medido ~2x mais rapido que a Groq
+    # no mesmo audio de 25s, por eliminar o round-trip de rede). Exige
+    # compilar com GGML_VULKAN=1: o caminho HIP/ROCm crashou em runtime
+    # nesta maquina. Se pedido mas o binario/modelo nao forem achados,
+    # cai pra Groq com aviso em vez de travar (ver criar_stt em stt.py).
+    stt_backend: str = os.environ.get("EVA_STT_BACKEND", "groq")
+    stt_whisper_cpp_exe: str = os.environ.get("EVA_STT_WHISPER_CPP_EXE", "")
+    stt_whisper_cpp_modelo: str = os.environ.get("EVA_STT_WHISPER_CPP_MODELO", "")
+
     # TTS: Pocket TTS, unico backend. Suporta portugues via o modelo
     # `portuguese_24l`. Piper e edge-tts foram removidos -- manter tres
     # caminhos de sintese significava tres timbres diferentes e tres formas
@@ -313,6 +347,17 @@ class VozConfig:
     tts_idioma: str = os.environ.get("EVA_TTS_IDIOMA", "pt")
     # WAV de referencia para clonar a voz (5 segundos bastam).
     tts_voz: str = os.environ.get("EVA_TTS_VOZ", "")
+
+    # Quanto acumular ANTES de mandar o play_start no streaming de voz
+    # frase-a-frase, em ms de audio (48kHz estereo 16 bits). Absorve a
+    # diferenca entre velocidade de sintese e velocidade de reproducao
+    # em tempo real -- sem isso, se a proxima frase demorar mais pra
+    # gerar do que a frase atual leva pra tocar, a fila de audio no
+    # bridge.js esvazia e ele preenche com silencio (efeito de fala
+    # cortada). 400ms e ponto de partida empirico: cobre o first-chunk
+    # latency tipico do Pocket TTS (~200ms) com folga, sem atrasar a
+    # resposta de forma perceptivel. Ajuste e meça no seu hardware.
+    tts_pre_buffer_ms: int = int(os.environ.get("EVA_TTS_PRE_BUFFER_MS", "400"))
 
     # Vocabulario passado ao Whisper para melhorar nomes proprios e termos
     # tecnicos que ele erraria sem contexto.

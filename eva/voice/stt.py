@@ -162,6 +162,157 @@ class GroqSTT:
             return self.transcrever_bytes(f.read(), os.path.basename(caminho), prompt)
 
 
+# --------------------------------------------------- whisper.cpp local
+
+import subprocess
+import tempfile
+from pathlib import Path
+
+
+class WhisperCppSTT:
+    """STT local via whisper.cpp (binário compilado com Vulkan).
+
+    Medido contra a Groq no mesmo áudio de 25s: 6.1s aqui vs 11.7s na
+    Groq -- quase 2x mais rápido, mesmos pesos (ggml-large-v3-turbo),
+    mesma transcrição. Elimina o round-trip de rede que era o maior
+    componente da latência de voz.
+
+    IMPORTANTE sobre o backend de aceleração: o binário PRECISA ter sido
+    compilado com Vulkan (GGML_VULKAN=1), não HIP/ROCm -- o caminho HIP
+    crashou em runtime nesta máquina (access violation, 0xC0000005,
+    provavelmente ligação de DLL). Isso é decidido na hora de compilar o
+    whisper.cpp, não em tempo de execução aqui -- esta classe não tem
+    como detectar ou trocar isso, só usar o binário que você apontar.
+
+    Mesma interface pública do GroqSTT (transcrever_bytes, disponivel)
+    de propósito -- bridge_client.py troca de um pro outro sem precisar
+    saber qual está por trás.
+    """
+
+    def __init__(
+        self,
+        exe: str,
+        modelo: str,
+        idioma: str | None = "pt",
+        timeout: int = 60,
+    ):
+        self.exe = exe
+        self.modelo = modelo
+        self.idioma = idioma
+        self.timeout = timeout
+
+    def disponivel(self) -> bool:
+        return bool(self.exe) and Path(self.exe).exists() and Path(self.modelo).exists()
+
+    def transcrever_bytes(
+        self,
+        audio: bytes,
+        nome: str = "audio.wav",
+        prompt: str | None = None,
+    ) -> Transcricao:
+        """`prompt` é aceito pela mesma assinatura do GroqSTT mas
+        ignorado aqui -- whisper.cpp não tem um parâmetro equivalente de
+        vocabulário guiado via linha de comando. O nome do parâmetro é
+        mantido só para os dois backends serem intercambiáveis sem
+        mudar a chamada em bridge_client.py.
+        """
+        if not self.disponivel():
+            raise ErroSTT(
+                f"whisper.cpp não disponível: exe={self.exe!r} "
+                f"modelo={self.modelo!r} -- confira os dois caminhos"
+            )
+        if not audio:
+            raise ErroSTT("áudio vazio")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            wav = Path(tmp) / nome
+            wav.write_bytes(audio)
+            prefixo = Path(tmp) / "saida"
+
+            cmd = [
+                self.exe,
+                "-m", self.modelo,
+                "-f", str(wav),
+                "-otxt", "-of", str(prefixo),
+                "-nt",  # sem timestamp
+            ]
+            if self.idioma:
+                cmd += ["-l", self.idioma]
+
+            try:
+                proc = subprocess.run(
+                    cmd, capture_output=True, timeout=self.timeout,
+                )
+            except subprocess.TimeoutExpired as e:
+                raise ErroSTT(f"whisper.cpp excedeu {self.timeout}s") from e
+
+            if proc.returncode != 0:
+                erro = proc.stderr.decode("utf-8", errors="replace")[:400]
+                raise ErroSTT(f"whisper.cpp saiu com erro {proc.returncode}: {erro}")
+
+            arq = prefixo.with_suffix(".txt")
+            texto = arq.read_text(encoding="utf-8").strip() if arq.exists() else ""
+
+        # whisper.cpp não expõe no_speech_prob por linha de comando --
+        # prob_sem_fala fica None. parece_ruido() já trata None com
+        # segurança (if t.prob_sem_fala is not None), então esse filtro
+        # específico simplesmente não dispara com este backend; os
+        # outros dois (texto vazio/curto, lista de alucinações) continuam
+        # funcionando normalmente. Perda de precisão, não bug.
+        return Transcricao(texto=texto)
+
+    def transcrever_arquivo(self, caminho: str, prompt: str | None = None) -> Transcricao:
+        with open(caminho, "rb") as f:
+            return self.transcrever_bytes(f.read(), Path(caminho).name, prompt)
+
+
+# --------------------------------------------------------------- fábrica
+
+def criar_stt(voz_cfg) -> tuple[object, str | None]:
+    """Cria o backend de STT configurado (`voz_cfg` é EVAConfig.voz).
+
+    Ao contrário do TTS (onde um fallback silencioso trocaria a voz da
+    EVA sem avisar, e por isso criar_tts() prefere quebrar), aqui um
+    fallback não troca identidade nenhuma -- só perde a vantagem de
+    latência do whisper.cpp local. Por isso, se EVA_STT_BACKEND=
+    whisper_cpp for pedido mas o binário/modelo não forem encontrados,
+    cai pra Groq em vez de travar a EVA de ouvir. O aviso volta como
+    segundo item da tupla para quem chama logar -- não é silencioso,
+    só não é fatal.
+
+    Devolve (instancia, aviso_ou_None).
+    """
+    nome = (voz_cfg.stt_backend or "groq").lower()
+
+    if nome == "whisper_cpp":
+        inst = WhisperCppSTT(
+            exe=voz_cfg.stt_whisper_cpp_exe,
+            modelo=voz_cfg.stt_whisper_cpp_modelo,
+            idioma=voz_cfg.stt_idioma,
+        )
+        if inst.disponivel():
+            return inst, None
+        aviso = (
+            f"EVA_STT_BACKEND=whisper_cpp mas não achei o binário/modelo "
+            f"(exe={voz_cfg.stt_whisper_cpp_exe!r}, "
+            f"modelo={voz_cfg.stt_whisper_cpp_modelo!r}). Caindo para "
+            f"Groq -- confira EVA_STT_WHISPER_CPP_EXE e "
+            f"EVA_STT_WHISPER_CPP_MODELO no .env."
+        )
+        return GroqSTT(
+            api_key=voz_cfg.stt_chave, modelo=voz_cfg.stt_modelo,
+            idioma=voz_cfg.stt_idioma,
+        ), aviso
+
+    if nome != "groq":
+        print(f"[stt] aviso: backend '{nome}' desconhecido, usando 'groq'.")
+
+    return GroqSTT(
+        api_key=voz_cfg.stt_chave, modelo=voz_cfg.stt_modelo,
+        idioma=voz_cfg.stt_idioma,
+    ), None
+
+
 # Frases que o Whisper costuma alucinar em silêncio ou ruído. Filtrar isso
 # evita a EVA responder a algo que ninguém disse -- o que numa call em
 # grupo aconteceria o tempo todo.

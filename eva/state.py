@@ -11,9 +11,16 @@ Duas decisoes de design importantes:
    turno, viraria humor volatil: eufórica numa mensagem, apática na
    seguinte. Com inercia, ele se comporta como disposicao acumulada.
 
-2. O estado NAO e verbalizado como numero. Ele entra no contexto como
-   dado estruturado, e o modelo foi treinado para deixar isso aparecer no
-   comportamento -- nao para dizer "minha curiosidade esta em 0.91".
+2. O estado NAO e verbalizado como numero cru. Ate a sessao de hoje, isso
+   dependia do modelo fine-tunado ter aprendido a tratar esses valores
+   como "nao-verbalizaveis" -- premissa que nunca se aplicou a nenhum
+   modelo generico (Lumimaid e afins), que nunca viu essa convencao no
+   proprio treino. Incidente real confirmado: numero decimal cru
+   ("energia 0.94") disparou narracao tipo "estatistica de personagem
+   decaindo" ("0.34 -> 0.32 (motivo)"), que nunca existiu no codigo --
+   pura alucinacao -- e se auto-reforcou via historico de conversa turno
+   a turno. Por isso agora e sempre texto qualitativo (baixa/moderada/
+   alta), nao numero, independente de qual modelo estiver rodando.
 """
 
 from __future__ import annotations
@@ -22,6 +29,17 @@ import json
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+
+
+def _descrever_nivel(valor: float) -> str:
+    """0-1 -> texto qualitativo. Ver docstring do modulo -- numero cru
+    nesse lugar especifico ja causou alucinacao real de narracao de
+    estatistica; texto tira o gatilho independente do modelo."""
+    if valor < 0.35:
+        return "baixa"
+    if valor < 0.7:
+        return "moderada"
+    return "alta"
 
 
 @dataclass
@@ -45,15 +63,27 @@ class EstadoInterno:
     def para_contexto(self) -> dict:
         """Versao enxuta para o Context Builder.
 
-        Arredonda para 2 casas: precisao maior nao muda comportamento e so
-        gasta token. Campos vazios sao omitidos.
+        Descritiva, NAO numerica -- incidente real confirmado: expor
+        decimal cru ("energia 0.94, curiosidade 0.57...") fez um modelo de
+        RP (Lumimaid) alucinar uma narracao de "estatistica decaindo"
+        tipo "0.34 -> 0.32 (motivo)" que nunca existiu no codigo -- nada
+        aqui jamais gerou esse formato, e a busca confirma isso. Uma vez
+        gerado, entrava no historico como fala real dela e o proprio
+        historico ensinava a repetir, degradando turno a turno (visto
+        caindo ate 0.00 em sessao real). Numero decimal convida esse tipo
+        de leitura "e um jogo com estatistica" em modelo treinado nesse
+        genero; texto qualitativo tira o gatilho.
         """
         d = {
-            "energia": round(self.energia, 2),
-            "curiosidade": round(self.curiosidade, 2),
-            "confianca": round(self.confianca, 2),
-            "estresse": round(self.estresse, 2),
+            "energia": _descrever_nivel(self.energia),
+            "curiosidade": _descrever_nivel(self.curiosidade),
+            "confianca": _descrever_nivel(self.confianca),
         }
+        # Estresse e diferente dos outros -- 0 e o caso comum, e mencionar
+        # "estresse: baixo" toda hora e ruido. So entra quando de fato
+        # subiu o bastante pra importar.
+        if self.estresse >= 0.35:
+            d["estresse"] = _descrever_nivel(self.estresse)
         if self.foco:
             d["foco"] = self.foco
         return d

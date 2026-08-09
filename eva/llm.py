@@ -18,6 +18,44 @@ class ErroLLM(Exception):
     pass
 
 
+# Sem isso, o Python manda "Python-urllib/3.x" como User-Agent -- assinatura
+# bem conhecida, bloqueada por sistema de proteção tipo Cloudflare (erro
+# 1010, confirmado em teste real: curl com header normal funcionou, Python
+# sem User-Agent nenhum não). LM Studio local nunca reparou nisso (sem
+# proteção desse tipo na frente), só apareceu ao apontar pra API externa.
+USER_AGENT = "EVA/1.0 (+https://github.com/)"
+
+# Rede de segurança contra o modelo alucinar uma conversa inteira sozinho
+# (padrão "Human: ...\nAI: ...\nHuman: ..." em loop) quando o template de
+# chat do servidor está mal configurado para o modelo carregado e ele não
+# sabe onde a resposta termina -- achado real em teste: dois modelos
+# "diferentes" produziram o MESMO vazamento cru, o que apontava pro
+# pipeline (sem stop nenhum configurado), não para característica de
+# modelo. Cobre os rótulos genéricos mais comuns em dado de instrução
+# (Human/AI, em inglês, é o padrão mais frequente em dataset sintético) e
+# os rótulos que o próprio card usa (User/EVA), caso o modelo tente
+# alucinar continuando o padrão dos exemplos em vez de só responder uma
+# vez. LIMITADO A 4 ITENS -- confirmado em teste real: Groq rejeita com
+# HTTP 400 acima disso ("'stop': maximum number of items is 4"). Tirei
+# "\nAssistant:" (o mais redundante -- "\nAI:" já cobre o mesmo tipo de
+# rótulo genérico de turno de IA; os vazamentos reais confirmados foram
+# Human:/AI: e User:/EVA:, os quatro que sobraram). Não é substituto de
+# corrigir o template errado -- é proteção para quando isso ainda não foi
+# corrigido ou falha de novo com outro modelo.
+STOP_PADRAO = ["\nHuman:", "\nUser:", "\nAI:", "\nEVA:"]
+
+# Versão maior, só pra completar()/completar_stream() da CONVERSA (não
+# decisão) -- essa nunca vai pro Groq (só o decisor vai), então não tem
+# o teto de 4 itens. Achado real: "Human:" vazou sem quebra de linha na
+# frente ("... pergunta de conversa? Human: Só conversa..."), então
+# STOP_PADRAO (só variante com \n) não bateu. Cobre variante com espaço
+# também, que é como apareceu de verdade.
+STOP_CONVERSA = [
+    "\nHuman:", " Human:", "\nUser:", " User:",
+    "\nAI:", " AI:", "\nEVA:", " EVA:",
+]
+
+
 class ClienteLLM:
     def __init__(self, config):
         self.cfg = config
@@ -31,6 +69,7 @@ class ClienteLLM:
             headers={
                 "Content-Type": "application/json",
                 "Authorization": f"Bearer {getattr(self.cfg, 'api_key', 'x')}",
+                "User-Agent": USER_AGENT,
             },
         )
         try:
@@ -52,6 +91,7 @@ class ClienteLLM:
         temperatura: float | None = None,
         max_tokens: int | None = None,
         modelo: str | None = None,
+        parar: list[str] | None = None,
     ) -> str:
         payload = {
             "model": modelo or self.cfg.modelo,
@@ -59,6 +99,7 @@ class ClienteLLM:
             "temperature": self.cfg.temperatura if temperatura is None else temperatura,
             "max_tokens": max_tokens or self.cfg.max_tokens,
             "top_p": getattr(self.cfg, "top_p", 0.9),
+            "stop": STOP_PADRAO if parar is None else parar,
             "stream": False,
         }
         dados = self._post("/chat/completions", payload)
@@ -74,6 +115,7 @@ class ClienteLLM:
         temperatura: float | None = None,
         max_tokens: int | None = None,
         modelo: str | None = None,
+        parar: list[str] | None = None,
     ) -> dict | None:
         """Tool-calling nativo (schema OpenAI) -- devolve os argumentos já
         parseados, ou None se o modelo respondeu em texto livre em vez de
@@ -104,6 +146,7 @@ class ClienteLLM:
             "messages": mensagens,
             "temperature": self.cfg.temperatura if temperatura is None else temperatura,
             "max_tokens": max_tokens or self.cfg.max_tokens,
+            "stop": STOP_PADRAO if parar is None else parar,
             "tools": [ferramenta],
             "tool_choice": {
                 "type": "function",
@@ -133,7 +176,7 @@ class ClienteLLM:
                 f"argumentos da ferramenta não são JSON válido: {bruto[:200]}") from e
 
     def completar_stream(self, mensagens: list[dict], temperatura: float | None = None,
-                         max_tokens: int | None = None):
+                         max_tokens: int | None = None, parar: list[str] | None = None):
         """Gera a resposta token a token. Útil para a resposta aparecer
         conforme é produzida, em vez de tudo de uma vez no fim."""
         payload = {
@@ -142,6 +185,7 @@ class ClienteLLM:
             "temperature": self.cfg.temperatura if temperatura is None else temperatura,
             "max_tokens": max_tokens or self.cfg.max_tokens,
             "top_p": getattr(self.cfg, "top_p", 0.9),
+            "stop": STOP_PADRAO if parar is None else parar,
             "stream": True,
         }
         url = self.cfg.base_url.rstrip("/") + "/chat/completions"
@@ -151,6 +195,7 @@ class ClienteLLM:
             headers={
                 "Content-Type": "application/json",
                 "Authorization": f"Bearer {getattr(self.cfg, 'api_key', 'x')}",
+                "User-Agent": USER_AGENT,
             },
         )
         try:
@@ -177,7 +222,10 @@ class ClienteLLM:
         try:
             url = self.cfg.base_url.rstrip("/") + "/models"
             req = urllib.request.Request(
-                url, headers={"Authorization": f"Bearer {getattr(self.cfg, 'api_key', 'x')}"}
+                url, headers={
+                    "Authorization": f"Bearer {getattr(self.cfg, 'api_key', 'x')}",
+                    "User-Agent": USER_AGENT,
+                }
             )
             with urllib.request.urlopen(req, timeout=5):
                 return True
@@ -188,7 +236,10 @@ class ClienteLLM:
         try:
             url = self.cfg.base_url.rstrip("/") + "/models"
             req = urllib.request.Request(
-                url, headers={"Authorization": f"Bearer {getattr(self.cfg, 'api_key', 'x')}"}
+                url, headers={
+                    "Authorization": f"Bearer {getattr(self.cfg, 'api_key', 'x')}",
+                    "User-Agent": USER_AGENT,
+                }
             )
             with urllib.request.urlopen(req, timeout=5) as r:
                 d = json.loads(r.read())

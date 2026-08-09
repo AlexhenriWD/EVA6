@@ -25,6 +25,7 @@ import json
 import sys
 
 from .config import carregar_config
+from .memory.store import USUARIO_HISTORIA
 from .orchestrator import EVA
 
 VERDE = "\033[32m"
@@ -56,6 +57,21 @@ def mostrar_debug(r) -> None:
     print(_cor(f"  └ {r.ms}ms", CINZA))
 
 
+def mostrar_prompt(r) -> None:
+    """Mostra o system prompt EXATO que foi enviado ao modelo neste turno.
+
+    Existe porque `memória[semantica]` no debug normal mostra o que foi
+    RECUPERADO, não necessariamente o que chegou no texto final -- os dois
+    deveriam ser sempre a mesma coisa, mas só rodar isto confirma. Usado
+    pra diagnosticar "o fato apareceu no debug mas o modelo não usou": se
+    o fato estiver aqui embaixo e o modelo mesmo assim o ignorar, o
+    problema é do modelo/servidor, não do pipeline da EVA.
+    """
+    print(_cor("\n──── system prompt enviado ────", CINZA))
+    print(r.system)
+    print(_cor("────────────────────────────────\n", CINZA))
+
+
 def mostrar_diagnostico(eva: EVA) -> None:
     d = eva.diagnostico()
     print(f"\n{_cor('EVA — diagnóstico', NEGRITO)}\n")
@@ -84,10 +100,22 @@ def mostrar_diagnostico(eva: EVA) -> None:
     # --- voz ---
     import os as _os
     print(f"\n  {_cor('voz', NEGRITO)}")
-    tem_groq = bool(_os.environ.get("GROQ_API_KEY"))
-    print(f"  STT (Groq): {'chave presente' if tem_groq else 'SEM GROQ_API_KEY'}")
-    if not tem_groq:
-        print(_cor("              pegue em console.groq.com e coloque no .env", CINZA))
+    backend_stt = eva.cfg.voz.stt_backend
+    if backend_stt == "whisper_cpp":
+        from pathlib import Path as _Path
+        exe_ok = bool(eva.cfg.voz.stt_whisper_cpp_exe) and _Path(eva.cfg.voz.stt_whisper_cpp_exe).exists()
+        modelo_ok = bool(eva.cfg.voz.stt_whisper_cpp_modelo) and _Path(eva.cfg.voz.stt_whisper_cpp_modelo).exists()
+        ok = exe_ok and modelo_ok
+        print(f"  STT (whisper.cpp): "
+              f"{'binário e modelo encontrados' if ok else 'binário/modelo NÃO encontrados -- cai pra Groq'}")
+        if not ok:
+            print(_cor("              confira EVA_STT_WHISPER_CPP_EXE e "
+                       "EVA_STT_WHISPER_CPP_MODELO no .env", CINZA))
+    else:
+        tem_groq = bool(_os.environ.get("GROQ_API_KEY"))
+        print(f"  STT (Groq): {'chave presente' if tem_groq else 'SEM GROQ_API_KEY'}")
+        if not tem_groq:
+            print(_cor("              pegue em console.groq.com e coloque no .env", CINZA))
 
     try:
         from .voice.tts import diagnostico as diag_tts
@@ -141,6 +169,7 @@ def loop_conversa(eva: EVA, debug: bool) -> None:
             continue
 
         r = eva.responder(msg)
+        eva._ultimo_resultado = r
         if r.erro:
             print(_cor(f"\n[erro] {r.erro}\n", AMARELO))
             continue
@@ -164,16 +193,25 @@ def _comando(eva: EVA, linha: str) -> bool:
     if cmd == "/ajuda":
         print("""
   /debug        liga/desliga a visão do que o sistema fez
+  /prompt       mostra o system prompt EXATO enviado na última resposta
   /memoria      o que a EVA sabe sobre você
+  /historia     fatos sobre a própria EVA (identidade/lore, seed_historia_eva.py)
   /estado       mundo interno (energia, curiosidade...)
-  /lembrar X    guarda um fato
-  /esquecer X   remove memórias que casem com X
+  /lembrar X    guarda um fato sobre você
+  /esquecer X   remove memórias sobre VOCÊ que casem com X
+  /esquecer_historia X   remove fatos da EVA (identidade/lore) que casem com X
   /limpar       apaga o histórico da conversa (memórias ficam)
   /sair
 """)
     elif cmd == "/debug":
         eva._debug_cli = not getattr(eva, "_debug_cli", False)
         print(f"debug {'ligado' if eva._debug_cli else 'desligado'}")
+    elif cmd == "/prompt":
+        ultimo = getattr(eva, "_ultimo_resultado", None)
+        if ultimo is None:
+            print("nenhuma resposta ainda nesta sessão -- manda uma mensagem antes")
+        else:
+            mostrar_prompt(ultimo)
     elif cmd == "/memoria":
         contagem = eva.memoria.contar()
         if not contagem:
@@ -184,6 +222,17 @@ def _comando(eva: EVA, linha: str) -> bool:
                 print(f"\n  {tipo}:")
                 for m in itens:
                     print(f"    - {m.conteudo}  {_cor(f'(conf {m.confianca:.2f})', CINZA)}")
+        print()
+    elif cmd == "/historia":
+        # Escopo separado de /memoria de propósito -- USUARIO_HISTORIA não
+        # é "sobre você", é sobre a EVA. Sem este comando não existia
+        # jeito nenhum de auditar o que estava lá pela CLI.
+        itens = eva.memoria.listar(usuario=USUARIO_HISTORIA, tipo="semantica", limite=100)
+        if not itens:
+            print("  (nada guardado ainda -- rode seed_historia_eva.py)")
+        else:
+            for m in itens:
+                print(f"    [{m.id}] {m.conteudo}")
         print()
     elif cmd == "/estado":
         e = eva.estado.estado
@@ -206,6 +255,17 @@ def _comando(eva: EVA, linha: str) -> bool:
         else:
             n = eva.esquecer(arg)
             print(f"{n} memória(s) removida(s)")
+    elif cmd == "/esquecer_historia":
+        # eva.esquecer() sempre busca no escopo de cfg.usuario -- nunca
+        # em USUARIO_HISTORIA, que é onde vivem os fatos da própria EVA.
+        # Por isso /esquecer nunca conseguia remover nada de lá (bug real
+        # encontrado em sessão de teste: sempre devolvia "0 removida(s)"
+        # mesmo com o termo certo). Comando separado, escopo explícito.
+        if not arg:
+            print("uso: /esquecer_historia <termo>")
+        else:
+            n = eva.esquecer(arg, usuario=USUARIO_HISTORIA)
+            print(f"{n} fato(s) da história da EVA removido(s)")
     elif cmd == "/limpar":
         eva.memoria.con.execute("DELETE FROM conversas WHERE usuario=?",
                                 (eva.cfg.usuario,))
@@ -225,6 +285,12 @@ def main(argv=None) -> int:
                    choices=["semantica", "episodica", "procedural", "personalidade"])
     p.add_argument("--memorias", action="store_true", help="lista as memórias e sai")
     p.add_argument("--mensagem", "-m", help="envia uma mensagem e sai (sem loop)")
+    p.add_argument("--multicanal", action="store_true",
+                   help="com --mensagem, trata como bloco multicanal já formatado "
+                        "(\"[canal] quem: texto\" por linha) -- para testar o "
+                        "formato sem precisar de call de verdade")
+    p.add_argument("--mostrar-prompt", action="store_true",
+                   help="com --mensagem, mostra o system prompt exato enviado ao modelo")
     args = p.parse_args(argv)
 
     cfg = carregar_config()
@@ -251,13 +317,15 @@ def main(argv=None) -> int:
             return 0
 
         if args.mensagem:
-            r = eva.responder(args.mensagem)
+            r = eva.responder(args.mensagem, modo_multicanal=args.multicanal)
             if r.erro:
                 print(f"[erro] {r.erro}", file=sys.stderr)
                 return 1
             print(r.resposta)
             if args.debug:
                 mostrar_debug(r)
+            if args.mostrar_prompt:
+                mostrar_prompt(r)
             return 0
 
         loop_conversa(eva, args.debug)

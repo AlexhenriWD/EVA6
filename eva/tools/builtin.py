@@ -219,4 +219,14 @@ def buscar(consulta: str) -> dict:
 
 def carregar_ferramentas():
     """Garante que as ferramentas foram registradas. Retorna o registro."""
+    try:
+        from . import minecraft_tools  # noqa: F401 -- import registra via decorador, não usa o nome
+    except Exception as e:
+        # Minecraft é opcional -- sem o cliente/bridge disponível, as
+        # ferramentas de minecraft_* simplesmente não existem, e todo o
+        # resto do projeto continua funcionando normal. Mesma filosofia de
+        # degradação graciosa do resto deste arquivo (clima, buscar).
+        import sys
+        print(f"[ferramentas] minecraft_tools não carregou ({e}) -- "
+              f"ferramentas de Minecraft indisponíveis nesta sessão", file=sys.stderr)
     return registro

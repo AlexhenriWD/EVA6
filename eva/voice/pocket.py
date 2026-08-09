@@ -232,6 +232,70 @@ class PocketTTSEngine:
         estereo = resample_and_stereo(int16, self.sample_rate)
         return alinhar_frames(estereo.tobytes(), FRAME_DISCORD)
 
+    def gerar_frase_stream_sync(
+        self, texto: str, chunk_bytes: int = FRAME_DISCORD * 6, lote_ms: int = 120
+    ):
+        """Sintetiza UMA frase via generate_audio_stream (streaming real
+        do Pocket TTS, ~200ms até o primeiro pedaço), gerando PCM 48kHz
+        estéreo pronto pro Discord conforme o modelo produz -- ao
+        contrário de gerar_frase_sync, não espera o clipe inteiro da
+        frase terminar antes de devolver o primeiro byte.
+
+        Generator SÍNCRONO e bloqueante de propósito, igual
+        gerar_frase_sync: generate_audio_stream do próprio modelo já é
+        um generator bloqueante comum (não asyncio), então dá pra
+        consumir direto aqui dentro da thread dedicada do streaming de
+        voz -- sem precisar da ponte iterate_blocking_generator que
+        stream_para_discord usa (aquela existe pra quando quem chama
+        está no event loop; aqui já estamos numa thread comum).
+
+        Mesmo acúmulo de ~120ms antes de resamplear que
+        stream_para_discord usa e pelo mesmo motivo (resamplear pedaço
+        de 5-20ms cru gera estática, transiente do filtro FIR), e mesma
+        escala fixa em vez de normalização por pico (volume não pode
+        saltar entre pedaços vizinhos). chunk_bytes por padrão é ~120ms
+        (6 frames de 20ms) em vez de 1 frame -- manda pedaço grande o
+        bastante pra não virar uma mensagem WebSocket a cada 20ms, sem
+        perder a granularidade que evita esperar a frase inteira.
+        """
+        if not self._carregado:
+            raise ErroPocketTTS("motor não inicializado -- chame inicializar() antes")
+        texto = texto.strip()
+        if not texto:
+            return
+
+        buffer = bytearray()
+        acumulado = np.zeros(0, dtype=np.float32)
+        min_amostras = max(1, int(self.sample_rate * lote_ms / 1000))
+
+        def processar_lote(amostras: np.ndarray) -> bytes:
+            int16 = float32_to_int16_fixed_scale(amostras)
+            return resample_and_stereo(int16, self.sample_rate).tobytes()
+
+        with self._lock_sync:
+            for pedaco in self.model.generate_audio_stream(self.voice_state, texto):
+                acumulado = np.concatenate(
+                    [acumulado, torch_audio_to_float32(pedaco)])
+
+                if len(acumulado) >= min_amostras:
+                    buffer.extend(processar_lote(acumulado))
+                    acumulado = np.zeros(0, dtype=np.float32)
+                    while len(buffer) >= chunk_bytes:
+                        yield bytes(buffer[:chunk_bytes])
+                        del buffer[:chunk_bytes]
+
+        if len(acumulado):
+            buffer.extend(processar_lote(acumulado))
+
+        if buffer:
+            resto = len(buffer) % FRAME_DISCORD
+            if resto:
+                buffer.extend(b"\x00" * (FRAME_DISCORD - resto))
+            while buffer:
+                fim = min(chunk_bytes, len(buffer))
+                yield bytes(buffer[:fim])
+                del buffer[:fim]
+
     async def gerar_para_discord(self, texto: str) -> bytes:
         """PCM s16le 48kHz estéreo, pronto para o bridge.
 

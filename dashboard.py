@@ -46,6 +46,13 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
+# Minecraft vive num módulo próprio (eva/tools/minecraft_tools.py), com
+# conexão/thread dedicada -- não é atributo de ClienteBridge como visão/
+# consciência são. Import de módulo inteiro, não símbolo solto, porque o
+# dashboard só lê funções públicas (status_dashboard, definir_iniciativa),
+# nunca toca estado interno (_cliente, _tarefa_atual) direto.
+from eva.tools import minecraft_tools
+
 # Chaves aceitas pelo endpoint /api/toggle, mapeadas para uma função que
 # aplica o valor no cfg. Whitelist explícita -- uma chave não listada aqui
 # é rejeitada com 400, nunca ignorada em silêncio (silêncio seria pior:
@@ -64,6 +71,10 @@ def _aplicar_toggles(cfg):
         "carisma": lambda v: setattr(cfg.llm, "carisma", v),
         "memoria_llm": lambda v: setattr(cfg.memoria, "extrair_com_llm", v),
         "consolidar": lambda v: setattr(cfg.memoria, "consolidar_com_llm", v),
+        # Diferente de visão -- essa é de verdade ao vivo, sem precisar
+        # reiniciar. Ver definir_iniciativa em minecraft_tools.py: o ciclo
+        # já está sempre rodando, só checa essa flag a cada volta.
+        "minecraft_iniciativa": lambda v: minecraft_tools.definir_iniciativa(v),
     }
 
 
@@ -79,6 +90,8 @@ _TOGGLES_INFO = [
      "Cobre fato dito de forma indireta, além das regras. Roda em segundo plano."),
     ("consolidar", "Consolidação periódica de memória",
      "Resume memórias antigas parecidas a cada N turnos. Requer embeddings ligado."),
+    ("minecraft_iniciativa", "Minecraft: iniciativa própria",
+     "Ela decide sozinha, periodicamente, se quer começar uma tarefa no jogo sem ninguém pedir."),
 ]
 
 
@@ -220,6 +233,7 @@ class ServidorDashboard:
                 "carisma": cfg.llm.carisma,
                 "memoria_llm": cfg.memoria.extrair_com_llm,
                 "consolidar": cfg.memoria.consolidar_com_llm,
+                "minecraft_iniciativa": minecraft_tools.status_dashboard()["iniciativa_ativa"],
             }[chave]
             toggles.append({"chave": chave, "rotulo": rotulo,
                             "descricao": descricao, "valor": valor})
@@ -273,6 +287,7 @@ class ServidorDashboard:
             "memoria": {"por_tipo": memoria_total, "usuarios": usuarios},
             "visao": info_visao,
             "consciencia_por_guild": consciencias,
+            "minecraft": minecraft_tools.status_dashboard(),
         }
 
     def executar_acao(self, acao: str, corpo: dict) -> dict:
@@ -309,9 +324,13 @@ class ServidorDashboard:
             n = self.eva.esquecer(termo, usuario=usuario)
             return {"removidas": n}
 
+        if acao == "minecraft_cancelar_tarefa":
+            return minecraft_tools.minecraft_cancelar_tarefa()
+
         raise ValueError(
             f"ação desconhecida: {acao!r}. Válidas: visao_ligar, "
-            f"visao_desligar, visao_tick_agora, esquecer_memoria"
+            f"visao_desligar, visao_tick_agora, esquecer_memoria, "
+            f"minecraft_cancelar_tarefa"
         )
 
     # ------------------------------------------------------------ ciclo
@@ -437,6 +456,11 @@ PAGINA_HTML = """<!DOCTYPE html>
   </section>
 
   <section>
+    <h2>Minecraft</h2>
+    <div id="minecraft"></div>
+  </section>
+
+  <section>
     <h2>Pré-visualizar prompt (não chama o modelo)</h2>
     <textarea id="pv_mensagem" placeholder="Digite uma mensagem de teste..."></textarea>
     <div class="grid2" style="margin-top:8px">
@@ -556,6 +580,22 @@ async function carregar() {
                           : '<div class="vazio">sem impulsos na fila</div>'}
       ${s.fios.length ? `<div class="kv" style="margin-top:4px">fios: ${s.fios.join('; ')}</div>` : ''}
     </div>`).join('') : '<div class="vazio">nenhum canal de voz ativo agora</div>';
+
+  const mc = e.minecraft;
+  if (!mc.conectado) {
+    document.getElementById('minecraft').innerHTML = `
+      <div class="linha"><div class="rotulo">Conectado</div>${pill(false)}</div>
+      <div class="vazio" style="margin-top:6px">Sem conexão ainda -- conecta sozinho na primeira vez que
+        alguma ferramenta de Minecraft for usada (node minecraft_bridge.js precisa estar rodando).</div>`;
+  } else {
+    const t = mc.tarefa;
+    document.getElementById('minecraft').innerHTML = `
+      <div class="linha"><div class="rotulo">Conectado</div>${pill(true)}</div>
+      <div class="kv" style="margin-top:6px">vida ${mc.vida ?? '-'} &nbsp;·&nbsp; fome ${mc.fome ?? '-'}</div>
+      ${mc.posicao ? `<div class="kv">posição (${mc.posicao.x}, ${mc.posicao.y}, ${mc.posicao.z})</div>` : ''}
+      <div class="kv" style="margin-top:8px"><b>Tarefa:</b> ${t ? `${t.objetivo} -- ${t.status} (${t.passos} passo(s))` : '(nenhuma ainda)'}</div>
+      ${t && t.status === 'ativa' ? `<button onclick="acao('minecraft_cancelar_tarefa')">Cancelar tarefa</button>` : ''}`;
+  }
 }
 
 carregar();

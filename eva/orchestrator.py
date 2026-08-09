@@ -41,9 +41,9 @@ from dataclasses import dataclass, field
 
 from .config import EVAConfig, carregar_config
 from .context import ContextBuilder
-from .decision import DecisorPorLLM, DecisorPorRegras, Plano
+from .decision import DecisorPorLLM, DecisorPorRegras, Plano, clientes_decisao
 from .identity import Pessoa, promover
-from .llm import ClienteLLM, ErroLLM
+from .llm import ClienteLLM, ErroLLM, STOP_CONVERSA
 from .memory.extractor import extrair_por_llm, extrair_por_regras
 from .memory.store import BancoMemoria, USUARIO_HISTORIA
 from .state import GerenciadorEstado
@@ -135,7 +135,8 @@ class EVA:
         self.llm_extrator = ClienteLLM(_ConfigExtrator(self.cfg.memoria))
 
         if self.cfg.decisao.usar_llm:
-            self.decisor = DecisorPorLLM(ClienteLLM(self.cfg.decisao), self.ferramentas)
+            principal, reserva = clientes_decisao(self.cfg.decisao)
+            self.decisor = DecisorPorLLM(principal, self.ferramentas, cliente_reserva=reserva)
         else:
             self.decisor = DecisorPorRegras()
 
@@ -167,12 +168,21 @@ class EVA:
         stream: bool = False,
         modo_voz: bool = False,
         contexto_visual: str | None = None,
+        modo_multicanal: bool = False,
     ):
         """Executa um turno completo. Com stream=True devolve um gerador.
 
         `usuario` é o id de quem falou (id do Discord, por exemplo). Sem ele,
         cai no dono da instância -- que é o certo para a CLI, e errado para
         qualquer integração multiusuário, então as integrações passam sempre.
+
+        `modo_multicanal=True` é para quando `mensagem` já vem pré-formatada
+        como várias linhas "[canal] quem: texto" (ver bridge_client, que
+        decide quando agregar várias falas antes de chamar aqui). Nesse
+        caso `usuario` continua sendo uma pessoa só -- por ora, quem
+        encerrou a janela de agregação -- porque memória/identidade são por
+        pessoa; não existe ainda um conceito de "memória do grupo". Ponto
+        conhecido de simplificação, não esquecido.
         """
         inicio = time.time()
         usuario = usuario or self.cfg.usuario
@@ -206,6 +216,7 @@ class EVA:
             identidade=identidade,
             modo_voz=modo_voz,
             contexto_visual=contexto_visual,
+            modo_multicanal=modo_multicanal,
         )
         mensagens = ctx.para_chat(mensagem)
 
@@ -221,7 +232,7 @@ class EVA:
 
         # 6. gerar resposta
         try:
-            resposta = self.llm.completar(mensagens, max_tokens=teto)
+            resposta = self.llm.completar(mensagens, max_tokens=teto, parar=STOP_CONVERSA)
             erro = None
         except ErroLLM as e:
             resposta = ""
@@ -335,7 +346,7 @@ class EVA:
 
         teto = self.cfg.llm.max_tokens_voz if modo_voz else self.cfg.llm.max_tokens
         try:
-            resposta = self.llm.completar(mensagens, max_tokens=teto)
+            resposta = self.llm.completar(mensagens, max_tokens=teto, parar=STOP_CONVERSA)
             erro = None
         except ErroLLM as e:
             resposta, erro = "", str(e)
@@ -362,7 +373,7 @@ class EVA:
         def gerar():
             erro = None
             try:
-                for pedaco in self.llm.completar_stream(mensagens, max_tokens=teto):
+                for pedaco in self.llm.completar_stream(mensagens, max_tokens=teto, parar=STOP_CONVERSA):
                     partes.append(pedaco)
                     yield pedaco
             except ErroLLM as e:
@@ -559,7 +570,17 @@ class EVA:
             "formato_contexto": self.cfg.llm.formato_contexto,
             "memorias": self.memoria.contar(),
             "usuarios": self.memoria.usuarios(),
-            "estado": self.estado.estado.para_contexto(),
+            # Números sempre completos, direto do estado bruto -- NÃO
+            # para_contexto(). Aquele virou qualitativo e omite estresse
+            # perto de 0 de propósito (é pro prompt do modelo, ver
+            # state.py); diagnóstico é o painel que você vê, precisa dos
+            # quatro números sempre, mesmo que estresse esteja baixo.
+            "estado": {
+                "energia": round(self.estado.estado.energia, 2),
+                "curiosidade": round(self.estado.estado.curiosidade, 2),
+                "confianca": round(self.estado.estado.confianca, 2),
+                "estresse": round(self.estado.estado.estresse, 2),
+            },
             "interacoes": self.estado.estado.total_interacoes,
             "ferramentas": self.ferramentas.nomes(),
             "decisor": "llm" if self.cfg.decisao.usar_llm else "regras",
@@ -637,6 +658,13 @@ class EVA:
         SQLite pode já estar fechado -- daí o except genérico no fim: uma
         falha aqui é invisível para o usuário por natureza (a resposta já
         foi entregue), então não vale derrubar nada, só avisar no log.
+
+        O log do resultado (sucesso, vazio ou erro) SEMPRE aparece, não só
+        com EVA_DEBUG=1 -- esse era o motivo real de "a EVA quase não
+        guarda nada" parecer misterioso: se o modelo extrator falhasse por
+        qualquer motivo (schema mal seguido, modelo trocado, timeout), não
+        existia sintoma nenhum, nem no console. Sem essa visibilidade,
+        qualquer ajuste na extração é tiro no escuro.
         """
         try:
             historico = self.memoria.historico(usuario=usuario, limite=8)
@@ -647,11 +675,12 @@ class EVA:
                     usuario=usuario, fonte=item["fonte"],
                     confianca=item["confianca"],
                 )
-            if fatos and self.cfg.debug:
+            if fatos:
                 print(f"[memoria-llm] {usuario}: {[f['conteudo'] for f in fatos]}")
+            elif self.cfg.debug:
+                print(f"[memoria-llm] {usuario}: nada extraído neste turno")
         except Exception as e:
-            if self.cfg.debug:
-                print(f"[memoria-llm] erro ao extrair para {usuario}: {e}")
+            print(f"[memoria-llm] erro ao extrair para {usuario}: {e}")
 
     def _disparar_consolidacao(self, usuario: str) -> None:
         """Mesmo padrão de _disparar_extracao_llm: thread solta no

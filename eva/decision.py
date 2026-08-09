@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 
 
 @dataclass
@@ -373,29 +373,98 @@ Ferramentas disponíveis:
 Mensagem: {mensagem}"""
 
 
-class DecisorPorLLM:
-    """Decisor que usa um modelo. Cai para regras se o modelo falhar."""
+def clientes_decisao(cfg_decisao):
+    """Monta o par (cliente principal, cliente reserva) pra qualquer
+    decisão pequena e estruturada -- usado pelo decisor de ferramentas E
+    pelo loop de tarefa do Minecraft. Um lugar só de propósito: bug real
+    já aconteceu por causa disso não existir antes -- o loop de tarefa
+    tinha sua própria cópia da lógica, desatualizada em relação ao
+    decisor principal, e continuou tentando um modelo local que já tinha
+    sido descarregado depois que o Groq virou principal ali mas não aqui.
 
-    def __init__(self, cliente, registro, fallback: DecisorPorRegras | None = None):
+    Sem Groq configurado, devolve (cliente_local, None) -- reserva nula,
+    sem fallback nenhum, exatamente como já era antes do Groq existir.
+    """
+    from .llm import ClienteLLM
+    if cfg_decisao.groq_ativo and cfg_decisao.groq_key:
+        cfg_groq = replace(
+            cfg_decisao, base_url=cfg_decisao.groq_url,
+            api_key=cfg_decisao.groq_key, modelo=cfg_decisao.groq_modelo,
+        )
+        return ClienteLLM(cfg_groq), ClienteLLM(cfg_decisao)
+    return ClienteLLM(cfg_decisao), None
+
+
+def completar_com_reserva(principal, reserva, prompt: str) -> str:
+    """Tenta o cliente principal; se falhar (exceção) OU devolver algo
+    sem JSON reconhecível, tenta a reserva antes de desistir.
+
+    Achado real: resposta "com sucesso" mas sem JSON dentro (Groq às
+    vezes devolve isso sob instabilidade) não é uma exceção -- sem essa
+    checagem extra, esse caso nunca acionava a reserva, só o de conexão/
+    erro HTTP acionava. Os dois motivos de falha agora levam ao mesmo
+    lugar. Deixa a exceção do ÚLTIMO que falhar propagar, pra quem chama
+    decidir o que fazer com isso.
+    """
+    def _tem_json(texto: str) -> bool:
+        return bool(re.search(r"\{.*\}", texto, re.S))
+
+    try:
+        resultado = principal.completar(
+            [{"role": "user", "content": prompt}], temperatura=0.0,
+            max_tokens=principal.cfg.max_tokens,
+        )
+        if reserva is None or _tem_json(resultado):
+            return resultado
+        print(f"[decisao] principal respondeu sem JSON reconhecível, tentando reserva local")
+    except Exception as e:
+        if reserva is None:
+            raise
+        print(f"[decisao] principal falhou ({e}), tentando reserva local")
+
+    return reserva.completar(
+        [{"role": "user", "content": prompt}], temperatura=0.0,
+        max_tokens=reserva.cfg.max_tokens,
+    )
+
+
+class DecisorPorLLM:
+    """Decisor que usa um modelo. Cai para regras se o modelo falhar.
+
+    `cliente` é o backend PRINCIPAL (Groq, se configurado -- ver
+    DecisionConfig.groq_ativo). `cliente_reserva` é opcional -- quando
+    dado, é tentado automaticamente se o principal falhar (erro de rede,
+    limite de uso, etc.) antes de cair pra decisão por regra. Existe pra
+    manter o LM Studio local funcionando como rede de segurança sem
+    precisar de intervenção manual quando o Groq estiver indisponível.
+    """
+
+    def __init__(self, cliente, registro, fallback: DecisorPorRegras | None = None,
+                 cliente_reserva=None):
         self.cliente = cliente
+        self.cliente_reserva = cliente_reserva
         self.registro = registro
         self.fallback = fallback or DecisorPorRegras()
+
+    def _completar_com_reserva(self, prompt: str) -> str:
+        return completar_com_reserva(self.cliente, self.cliente_reserva, prompt)
 
     def decidir(self, mensagem: str, historico: list[dict] | None = None) -> Plano:
         prompt = PROMPT_DECISOR.format(
             ferramentas=self.registro.descrever(), mensagem=mensagem
         )
         try:
-            bruto = self.cliente.completar(
-                [{"role": "user", "content": prompt}], temperatura=0.0, max_tokens=200
-            )
+            bruto = self._completar_com_reserva(prompt)
             m = re.search(r"\{.*\}", bruto, re.S)
             if not m:
+                print(f"[decisao] resposta sem JSON, primeiros 200 chars: {bruto[:200]!r}")
                 raise ValueError("sem JSON na resposta")
             d = json.loads(m.group(0))
-        except Exception:
+        except Exception as e:
             # Decisor quebrado não pode derrubar a conversa -- as regras
-            # cobrem o caso e o usuário nem percebe.
+            # cobrem o caso e o usuário nem percebe. Log fica no console,
+            # não vai pro usuário -- só o motivo curto abaixo é visível.
+            print(f"[decisao] decisor LLM falhou, caindo pra regras: {e}")
             plano = self.fallback.decidir(mensagem, historico)
             plano.motivo = "fallback: decisor LLM falhou"
             return plano

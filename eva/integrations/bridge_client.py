@@ -65,7 +65,7 @@ from ..voice.audio import (
     para_pcm_discord,
     pcm_para_wav,
 )
-from ..voice.stt import GroqSTT, parece_ruido
+from ..voice.stt import Transcricao, criar_stt, parece_ruido
 from ..voice.tts import ErroTTS, criar_tts
 
 
@@ -78,6 +78,16 @@ class EstadoGuild:
     fim_da_fala: float = 0.0
     processando: asyncio.Lock = field(default_factory=asyncio.Lock)
 
+    # --- multicanal: agregação quando mais de uma pessoa fala por perto ---
+    # user_id -> timestamp da última fala dessa pessoa. Usado só para
+    # decidir "tem mais gente ativa agora?" -- não é histórico de verdade,
+    # memória isso já existe em outro lugar.
+    ultima_fala_por: dict = field(default_factory=dict)
+    # (user_id, texto, timestamp) acumulado enquanto a janela de
+    # agregação está aberta.
+    buffer_multicanal: list = field(default_factory=list)
+    tarefa_agregacao: asyncio.Task | None = None
+
 
 class ClienteBridge:
     def __init__(self, config: EVAConfig | None = None, url: str = "ws://localhost:8765"):
@@ -85,11 +95,9 @@ class ClienteBridge:
         self.url = url
         self.eva = EVA(self.cfg)
 
-        self.stt = GroqSTT(
-            api_key=self.cfg.voz.stt_chave,
-            modelo=self.cfg.voz.stt_modelo,
-            idioma=self.cfg.voz.stt_idioma,
-        )
+        self.stt, aviso_stt = criar_stt(self.cfg.voz)
+        if aviso_stt:
+            print(f"[stt] {aviso_stt}")
         self.tts = None
         self.erro_tts: str | None = None
         try:
@@ -133,6 +141,17 @@ class ClienteBridge:
         self._audio_pendente: dict | None = None
         # Silêncio a ignorar após a EVA falar, em segundos
         self.janela_eco = 0.6
+        # Multicanal: se ALGUÉM MAIS falou dentro desse tempo, a fala atual
+        # entra em modo agregação em vez de responder na hora -- é o que
+        # decide "isso parece uma troca entre várias pessoas" vs "uma
+        # pessoa só falando", que é o caso comum e não deve ganhar espera
+        # nenhuma.
+        self.janela_multiplas_pessoas = 5.0
+        # Quanto esperar por MAIS fala (de qualquer pessoa) antes de
+        # fechar a janela e mandar tudo agregado -- reinicia a cada fala
+        # nova que chega, então é silêncio de todo mundo por esse tempo,
+        # não um teto fixo desde a primeira fala.
+        self.janela_debounce_multicanal = 1.8
 
     def estado(self, guild_id: str) -> EstadoGuild:
         return self.guilds.setdefault(str(guild_id), EstadoGuild())
@@ -151,6 +170,30 @@ class ClienteBridge:
             return self.eva.memoria.pessoa(str(usuario)).get("nome") or None
         except Exception:
             return None
+
+    async def _transcrever(self, audio: bytes, nome: str = "call.wav") -> Transcricao:
+        """Transcreve com UMA retentativa rápida antes de desistir.
+
+        Falha transitória de rede é o caso comum na Groq (ausente no
+        whisper.cpp local, que não depende de rede) -- não deveria
+        custar o turno de voz inteiro. Levanta a exceção da ÚLTIMA
+        tentativa se as duas falharem, para quem chama continuar
+        tratando do jeito que já tratava (a assinatura de erro não
+        muda, só passa a acontecer depois de 2 tentativas em vez de 1).
+        """
+        ultimo_erro: Exception | None = None
+        for tentativa in range(2):
+            try:
+                return await asyncio.to_thread(
+                    self.stt.transcrever_bytes, audio, nome,
+                    self.cfg.voz.stt_vocabulario,
+                )
+            except Exception as e:
+                ultimo_erro = e
+                if tentativa == 0:
+                    print(f"[stt] falhou, tentando de novo: {e}")
+                    await asyncio.sleep(0.3)
+        raise ultimo_erro
 
     async def _contexto_visual_para(self, texto: str) -> str | None:
         """A cena para injetar neste turno, ou None. Ver docstring
@@ -326,11 +369,27 @@ class ClienteBridge:
         await self.ws.send(pcm)
 
     async def _falar_stream(self, guild_id: str, mensagem: str, usuario: str,
-                            contexto_visual: str | None):
-        """Substitui responder_async()+falar() no turno de voz: o LLM gera
+                            contexto_visual: str | None,
+                            modo_multicanal: bool = False):
+        """SEM CHAMADOR ATUALMENTE -- _responder_a voltou a usar falar()
+        (não-streaming), por pedido explícito depois de teste real com
+        áudio saindo fragmentado/incompreensível. Mantido aqui sem
+        remover -- se algum dia a causa raiz do problema de streaming for
+        encontrada e corrigida, isso volta a ser útil sem reescrever do
+        zero. Não chama isso de lugar nenhum por enquanto.
+
+        Substitui responder_async()+falar() no turno de voz: o LLM gera
         frase a frase, cada frase é sintetizada e mandada pro bridge assim
         que fica pronta -- a EVA começa a falar antes de terminar de pensar
         a resposta inteira.
+
+        Antes do PRIMEIRO play_start, acumula um pré-buffer local de
+        `tts_pre_buffer_ms` (config.py) em vez de mandar cada pedaço assim
+        que chega -- é a folga que evita a fala cortada: se a próxima
+        frase demorar mais pra sintetizar do que a atual leva pra tocar,
+        essa folga absorve a diferença antes que a fila do bridge.js
+        esvazie e ele preencha com silêncio. Só o INÍCIO da resposta
+        espera; depois do pré-buffer preenchido, cada pedaço vai direto.
         """
         if not self.tts:
             return None
@@ -339,18 +398,33 @@ class ClienteBridge:
 
         fila: queue.Queue = queue.Queue()
         asyncio.create_task(asyncio.to_thread(
-            self._produzir_stream_de_voz, mensagem, usuario, contexto_visual, fila))
+            self._produzir_stream_de_voz, mensagem, usuario, contexto_visual,
+            fila, modo_multicanal))
 
         est = self.estado(guild_id)
-        primeiro = True
         resultado = None
+        iniciou = False
+        pre_buffer = bytearray()
+        # bytes/ms de PCM 48kHz estéreo 16 bits: 48000 * 2 canais * 2 bytes / 1000
+        alvo_pre_buffer = int(192 * self.cfg.voz.tts_pre_buffer_ms)
+
+        async def _iniciar_reproducao(dados: bytes) -> None:
+            est.falando = True
+            await self._enviar({"type": "play_start", "guild_id": str(guild_id)})
+            await self._enviar({"type": "play_chunk", "guild_id": str(guild_id)})
+            await self.ws.send(dados)
+
         while True:
             tipo, dado = await asyncio.to_thread(fila.get)
             if tipo == "audio":
-                if primeiro:
-                    est.falando = True
-                    await self._enviar({"type": "play_start", "guild_id": str(guild_id)})
-                    primeiro = False
+                if not iniciou:
+                    pre_buffer.extend(dado)
+                    if len(pre_buffer) < alvo_pre_buffer:
+                        continue
+                    await _iniciar_reproducao(bytes(pre_buffer))
+                    pre_buffer.clear()
+                    iniciou = True
+                    continue
                 await self._enviar({"type": "play_chunk", "guild_id": str(guild_id)})
                 await self.ws.send(dado)
             elif tipo == "fim":
@@ -360,13 +434,20 @@ class ClienteBridge:
                 print(f"[voz-stream] {dado}")
                 break
 
-        if not primeiro:
+        if not iniciou and pre_buffer:
+            # Resposta curta o bastante pra nunca bater o alvo de
+            # pré-buffer -- manda o que tem em vez de nunca falar nada.
+            await _iniciar_reproducao(bytes(pre_buffer))
+            iniciou = True
+
+        if iniciou:
             await self._enviar({"type": "play_end", "guild_id": str(guild_id)})
         else:
             est.falando = False
         return resultado
 
-    def _produzir_stream_de_voz(self, mensagem, usuario, contexto_visual, fila) -> None:
+    def _produzir_stream_de_voz(self, mensagem, usuario, contexto_visual, fila,
+                                modo_multicanal: bool = False) -> None:
         """Roda inteiro numa thread dedicada: monta contexto, consome o
         streaming do LLM, sintetiza frase a frase, põe áudio na fila. Nada
         bloqueante toca o event loop direto -- mesma política do resto do
@@ -375,7 +456,7 @@ class ClienteBridge:
         try:
             stream = self.eva.responder(
                 mensagem, usuario=usuario, stream=True, modo_voz=True,
-                contexto_visual=contexto_visual)
+                contexto_visual=contexto_visual, modo_multicanal=modo_multicanal)
         except Exception as e:
             fila.put(("erro", str(e)))
             return
@@ -399,10 +480,36 @@ class ClienteBridge:
         fila.put(("fim", stream.resultado))
 
     def _sintetizar_e_enfileirar(self, frase: str, fila: "queue.Queue") -> None:
+        """Sintetiza uma frase e põe os pedaços de áudio na fila, na
+        ordem em que ficam prontos -- via generate_audio_stream, não
+        espera o clipe inteiro da frase terminar.
+
+        Se o streaming falhar ANTES de produzir qualquer pedaço, tenta
+        uma vez no modo bloqueante (gerar_frase_sync) como rede de
+        segurança -- cobre falha específica do caminho de streaming sem
+        perder a frase inteira, mesmo espírito da retentativa do STT.
+        Se já tiver produzido pedaço e falhar no meio, NÃO cai pro
+        bloqueante: isso duplicaria o início da frase, que já foi
+        enfileirado -- melhor perder o resto da frase do que repetir o
+        começo dela.
+        """
+        produziu_algo = False
+        try:
+            for pedaco in self.tts.motor.gerar_frase_stream_sync(frase):
+                fila.put(("audio", pedaco))
+                produziu_algo = True
+            return
+        except Exception as e:
+            if produziu_algo:
+                print(f"[tts-stream] streaming falhou no meio de {frase[:40]!r}: "
+                      f"{e} -- frase parcial, sem retentativa (evita duplicar áudio)")
+                return
+            print(f"[tts-stream] streaming falhou, tentando modo bloqueante: {e}")
+
         try:
             pcm = self.tts.motor.gerar_frase_sync(frase)
         except Exception as e:
-            print(f"[tts-stream] erro sintetizando {frase[:40]!r}: {e}")
+            print(f"[tts-stream] modo bloqueante também falhou em {frase[:40]!r}: {e}")
             return
         if pcm:
             fila.put(("audio", pcm))
@@ -416,9 +523,11 @@ class ClienteBridge:
         if est.falando or (time.time() - est.fim_da_fala) < self.janela_eco:
             return
 
-        # Uma conversa por vez: se já está respondendo, descarta em vez de
-        # enfileirar -- resposta atrasada a uma fala antiga confunde mais
-        # do que ajuda numa conversa por voz.
+        # Uma resposta de cada vez: se já está gerando/falando, descarta em
+        # vez de enfileirar -- resposta atrasada a uma fala antiga confunde
+        # mais do que ajuda numa conversa por voz. Note que isso guarda só
+        # a fase de RESPONDER, não a de transcrever -- ver comentário mais
+        # abaixo sobre por que a transcrição ficou fora do lock.
         if est.processando.locked():
             return
 
@@ -426,38 +535,82 @@ class ClienteBridge:
         if esta_silencioso(pcm):
             return
 
+        # Transcrição fica FORA do lock de propósito: se isso estivesse
+        # dentro do `async with est.processando`, a fala da segunda pessoa
+        # nunca conseguiria nem ser transcrita enquanto a da primeira ainda
+        # estivesse em andamento -- inviabilizaria agregação de verdade,
+        # porque a decisão "tem mais gente falando" depende de conseguir
+        # processar as duas em paralelo.
+        wav = pcm_para_wav(pcm)
+        try:
+            t = await self._transcrever(wav)
+        except Exception as e:
+            print(f"[stt] {e}")
+            return
+
+        if parece_ruido(t):
+            return
+
+        print(f"[call] {user_id}: {t.texto}")
+        self.consciencia(guild_id).alguem_falou(
+            str(user_id), t.texto, nome=self._nome(user_id))
+
+        agora = time.time()
+        outra_pessoa_ativa = any(
+            uid != str(user_id) and (agora - ts) < self.janela_multiplas_pessoas
+            for uid, ts in est.ultima_fala_por.items()
+        )
+        est.ultima_fala_por[str(user_id)] = agora
+
+        if not outra_pessoa_ativa:
+            # Caminho de sempre: uma pessoa só, responde na hora, sem
+            # espera nenhuma acrescentada.
+            await self._responder_a(guild_id, t.texto, str(user_id))
+            return
+
+        # Mais de uma pessoa ativa: agrega em vez de responder já. Cancela
+        # a janela pendente (se tiver) e abre outra -- é isso que faz o
+        # debounce esperar silêncio de TODO MUNDO, não um teto fixo desde
+        # a primeira fala.
+        print(f"[multicanal] {user_id} entrou na janela de agregação "
+              f"({len(est.buffer_multicanal) + 1} fala(s) até agora)")
+        est.buffer_multicanal.append((str(user_id), t.texto, agora))
+        if est.tarefa_agregacao is not None and not est.tarefa_agregacao.done():
+            est.tarefa_agregacao.cancel()
+        est.tarefa_agregacao = asyncio.create_task(
+            self._fechar_janela_multicanal(guild_id))
+
+    async def _responder_a(self, guild_id: str, mensagem: str, usuario: str,
+                           modo_multicanal: bool = False) -> None:
+        """Gera e fala a resposta de um turno -- caminho compartilhado
+        pelo modo de uma pessoa só e pelo modo multicanal agregado.
+
+        NÃO usa mais streaming (gerar_frase_stream_sync / play_start +
+        play_chunk) -- revertido a pedido explícito, depois de teste real
+        mostrar áudio saindo fragmentado/incompreensível com streaming
+        ligado. Delay maior (espera a resposta inteira, depois sintetiza
+        inteira, só então toca) é preferível a voz ilegível. `falar()`
+        (síntese completa via gerar_para_discord -- split por sentença,
+        normalização única, mensagem "play" só, sem fragmentar) é o mesmo
+        caminho que a fala espontânea (falar_sozinha) sempre usou e nunca
+        teve esse problema.
+        """
+        est = self.estado(guild_id)
         async with est.processando:
-            wav = pcm_para_wav(pcm)
-            try:
-                t = await asyncio.to_thread(
-                    self.stt.transcrever_bytes, wav, "call.wav",
-                    self.cfg.voz.stt_vocabulario,
-                )
-            except Exception as e:
-                print(f"[stt] {e}")
-                return
-
-            if parece_ruido(t):
-                return
-
-            print(f"[call] {user_id}: {t.texto}")
-            self.consciencia(guild_id).alguem_falou(
-                str(user_id), t.texto, nome=self._nome(user_id))
-
-            # `usuario=` é o que separa a memória de cada pessoa na call.
-            # Sem ele, tudo cai no dono da instância e a EVA cita para um
-            # o que o outro contou. `modo_voz=True` acrescenta a linha
-            # "MODO: VOZ" treinada e baixa o teto de 400 para 120 tokens --
-            # 400 tokens são uns 40 segundos de fala.
-            r = await self._falar_stream(
-                guild_id, t.texto, str(user_id),
-                await self._contexto_visual_para(t.texto))
-            if r is None or not r.resposta:
+            contexto_visual = await self._contexto_visual_para(mensagem)
+            r = await asyncio.to_thread(
+                self.eva.responder, mensagem, usuario=usuario, modo_voz=True,
+                contexto_visual=contexto_visual, modo_multicanal=modo_multicanal,
+            )
+            if r is None or r.erro:
                 if r and r.erro:
                     print(f"[eva] {r.erro}")
                 return
+            if not r.resposta:
+                return
 
             print(f"[eva] {r.resposta}")
+            await self.falar(guild_id, r.resposta)
             self.consciencia(guild_id).ela_falou()
 
             # Lacuna de conhecimento: a mensagem tocou em algo que pode
@@ -468,6 +621,38 @@ class ClienteBridge:
             if r.plano.possivel_lacuna:
                 asyncio.create_task(
                     self._pesquisar_e_registrar(guild_id, r.plano.possivel_lacuna))
+
+    async def _fechar_janela_multicanal(self, guild_id: str) -> None:
+        """Espera o debounce e, se ninguém mais falou nesse tempo, monta o
+        bloco multicanal com tudo que chegou e dispara UMA resposta.
+
+        Se uma fala nova chegar antes do sleep terminar, esta tarefa é
+        CANCELADA por `_ao_receber_audio` antes de uma nova ser criada --
+        então chegar até o fim do sleep aqui já significa "ninguém mais
+        falou por `janela_debounce_multicanal` segundos", sem precisar
+        checar isso de novo.
+        """
+        try:
+            await asyncio.sleep(self.janela_debounce_multicanal)
+        except asyncio.CancelledError:
+            return
+
+        est = self.estado(guild_id)
+        itens = est.buffer_multicanal
+        est.buffer_multicanal = []
+        est.tarefa_agregacao = None
+        if not itens:
+            return
+
+        linhas = [f"[voz] {self._nome(uid) or uid}: {texto}" for uid, texto, _ in itens]
+        bloco = "\n".join(linhas)
+        print(f"[multicanal] janela fechada, {len(itens)} fala(s) agregada(s):\n{bloco}")
+        # `usuario=` fica sendo quem falou por último -- memória e
+        # identidade são por pessoa, ainda não existe "memória do grupo".
+        # Simplificação assumida, não esquecida (ver docstring de
+        # EVA.responder em orchestrator.py).
+        ultimo_usuario = itens[-1][0]
+        await self._responder_a(guild_id, bloco, ultimo_usuario, modo_multicanal=True)
 
     # ------------------------------------------------------------ texto
 
@@ -556,10 +741,7 @@ class ClienteBridge:
             dados = await asyncio.to_thread(
                 lambda: urllib.request.urlopen(anexo["url"], timeout=30).read()
             )
-            t = await asyncio.to_thread(
-                self.stt.transcrever_bytes, dados, anexo.get("name", "audio.ogg"),
-                self.cfg.voz.stt_vocabulario,
-            )
+            t = await self._transcrever(dados, anexo.get("name", "audio.ogg"))
         except Exception as e:
             await self.enviar_mensagem(canal, f"Não consegui transcrever: {str(e)[:200]}")
             return None
@@ -733,7 +915,8 @@ class ClienteBridge:
         d = self.eva.diagnostico()
         d.update({
             "bridge_url": self.url,
-            "stt": "ok" if self.stt.disponivel() else "sem GROQ_API_KEY",
+            "stt": (f"{self.cfg.voz.stt_backend}: ok" if self.stt.disponivel()
+                    else f"{self.cfg.voz.stt_backend}: indisponível"),
             "tts": self.tts.nome if self.tts else f"indisponível ({self.erro_tts})",
             "guilds_ativas": [g for g, e in self.guilds.items() if e.canal_id],
         })
