@@ -65,7 +65,7 @@ FATOS = [
 
     # Adicionados a partir do card testado em sessão de RP -- só o que é
     # NOVO em relação ao que já estava aqui, e só o que é fato/gosto, não
-    # regra de comportamento (regra vive no PERSONA_PROMPT, sempre
+    # regra de comportamento (regra vive na PERSONA, sempre
     # presente, não faz sentido depender de busca semântica achar).
     "Ela se interessa por psicologia e filosofia -- entender como e por "
     "que as pessoas pensam magnetiza a curiosidade dela tanto quanto "

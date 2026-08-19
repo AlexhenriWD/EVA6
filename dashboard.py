@@ -36,6 +36,18 @@ se cria o ClienteEmbeddings). Depois disso, `self.embeddings is not None`
 SistemaVisual. Esses dois exigem reiniciar para mudar de OFF para ON (ou
 vice-versa "de verdade", destruindo o objeto). O dashboard deixa isso
 explícito na UI em vez de fingir que o toggle funcionaria.
+
+SEÇÃO "ROBÔ FÍSICO" (NOVA)
+------------------------------
+Mesmo padrão da seção Minecraft (módulo próprio com conexão/thread
+dedicada, lido por função pública -- eva/tools/robot_tools.py), com uma
+diferença de propósito: robot_tools.status_dashboard() FAZ I/O de rede
+de verdade (busca o estado atual do robô, com timeout curto de 2s) em
+vez de só ler atributo -- porque o corpo aqui é físico, e saber "qual
+câmera está ativa agora" (não qual estava ativa há 15s) importa mais do
+que custa. Também expõe dois botões de ação (parar / EMERGENCY STOP) que
+NENHUMA outra seção deste painel tem -- as outras seções controlam
+software; esta controla hardware que pode bater em alguma coisa.
 """
 
 from __future__ import annotations
@@ -46,12 +58,15 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
-# Minecraft vive num módulo próprio (eva/tools/minecraft_tools.py), com
-# conexão/thread dedicada -- não é atributo de ClienteBridge como visão/
-# consciência são. Import de módulo inteiro, não símbolo solto, porque o
-# dashboard só lê funções públicas (status_dashboard, definir_iniciativa),
-# nunca toca estado interno (_cliente, _tarefa_atual) direto.
+# Minecraft e Robô vivem em módulos próprios (eva/tools/minecraft_tools.py,
+# eva/tools/robot_tools.py), cada um com conexão/thread dedicada -- não são
+# atributo de ClienteBridge como visão/consciência são. Import de módulo
+# inteiro, não símbolo solto, porque o dashboard só lê funções públicas
+# (status_dashboard, definir_iniciativa, ...), nunca toca estado interno
+# (_cliente, _tarefa_atual) direto.
 from eva.tools import minecraft_tools
+from eva.tools import robot_tools
+from eva.voice.tts import BACKENDS as TTS_BACKENDS, ErroTTS
 
 # Chaves aceitas pelo endpoint /api/toggle, mapeadas para uma função que
 # aplica o valor no cfg. Whitelist explícita -- uma chave não listada aqui
@@ -75,6 +90,8 @@ def _aplicar_toggles(cfg):
         # reiniciar. Ver definir_iniciativa em minecraft_tools.py: o ciclo
         # já está sempre rodando, só checa essa flag a cada volta.
         "minecraft_iniciativa": lambda v: minecraft_tools.definir_iniciativa(v),
+        # Mesmo padrão, ver definir_iniciativa em robot_tools.py.
+        "robo_iniciativa": lambda v: robot_tools.definir_iniciativa(v),
     }
 
 
@@ -92,6 +109,10 @@ _TOGGLES_INFO = [
      "Resume memórias antigas parecidas a cada N turnos. Requer embeddings ligado."),
     ("minecraft_iniciativa", "Minecraft: iniciativa própria",
      "Ela decide sozinha, periodicamente, se quer começar uma tarefa no jogo sem ninguém pedir."),
+    ("robo_iniciativa", "Robô: iniciativa própria",
+     "Ela decide sozinha, periodicamente, se quer se mexer (olhar em volta ou andar um pouco). "
+     "DESLIGADO por padrão por bom motivo -- ligue só depois de confirmar que a direção das "
+     "rodas e a identificação de câmera estão certas na seção Robô Físico abaixo."),
 ]
 
 
@@ -153,6 +174,8 @@ class _Handler(BaseHTTPRequestHandler):
             self._post_acao(corpo)
         elif caminho == "/api/prompt-preview":
             self._post_prompt_preview(corpo)
+        elif caminho == "/api/tts":
+            self._post_tts(corpo)
         elif caminho == "/api/desligar":
             self._post_desligar()
         else:
@@ -181,6 +204,23 @@ class _Handler(BaseHTTPRequestHandler):
             self._json(400, {"erro": str(e)})
         except Exception as e:
             self._json(500, {"erro": f"falha ao executar ação: {e}"})
+
+    def _post_tts(self, corpo: dict) -> None:
+        backend = corpo.get("backend")
+        if backend not in TTS_BACKENDS:
+            self._json(400, {"erro": f"backend desconhecido: {backend!r}. "
+                                     f"Válidos: {sorted(TTS_BACKENDS)}"})
+            return
+        try:
+            resultado = self.cliente.cliente_bridge.trocar_tts(backend)
+            self._json(200, {"ok": True, **resultado})
+        except ErroTTS as e:
+            # A mensagem de erro de criar_tts() já é específica (chave
+            # faltando, pacote não instalado, voice_id vazio, etc.) --
+            # devolve ela crua pro dashboard mostrar, em vez de só "falhou".
+            # Isso é o que resolve "troquei e não vi nada acontecer": agora
+            # o motivo aparece na hora, na tela, sem precisar de console.
+            self._json(400, {"erro": str(e)})
 
     def _post_desligar(self) -> None:
         """Fecha tudo e mata o processo Python -- ver desligar_tudo()
@@ -220,6 +260,56 @@ class ServidorDashboard:
         self._servidor: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
         self._inicio = time.time()
+        # Cache curto de "modelo disponível": montar_estado() é chamado a
+        # cada poll do frontend, e checar isso faz um GET /v1/models de
+        # verdade no LM Studio (ver ClienteLLM.disponivel em llm.py) --
+        # sem cache, isso rodava a cada 2s (intervalo antigo do polling),
+        # enchendo o log do LM Studio de ruído sem nenhum ganho: se o
+        # modelo estava disponível 2s atrás, quase certamente ainda está.
+        self._cache_modelo: tuple[float, bool] | None = None
+        self._cache_modelo_ttl = 10.0
+        # Mesmo padrão do cache de modelo acima, pro SearXNG: sem isso,
+        # cada poll do dashboard faria uma requisição HTTP extra pro
+        # container. Existe porque a instabilidade do SearXNG (ver log de
+        # docker) até agora só aparecia quando uma busca falhava NO MEIO
+        # de uma conversa -- não tinha jeito de checar "tá no ar?" sem
+        # esperar isso acontecer de novo.
+        self._cache_searxng: tuple[float, tuple[bool, str]] | None = None
+        self._cache_searxng_ttl = 15.0
+
+    def _modelo_disponivel_cacheado(self) -> bool:
+        agora = time.time()
+        if self._cache_modelo is not None:
+            quando, valor = self._cache_modelo
+            if agora - quando < self._cache_modelo_ttl:
+                return valor
+        valor = self.eva.llm.disponivel()
+        self._cache_modelo = (agora, valor)
+        return valor
+
+    def _searxng_disponivel_cacheado(self) -> tuple[bool, str]:
+        """(disponivel, detalhe_do_erro). Timeout curto (2s) de propósito:
+        isto roda a cada poll do dashboard, não pode travar a UI esperando
+        um container que pode estar fora do ar.
+        """
+        agora = time.time()
+        if self._cache_searxng is not None:
+            quando, valor = self._cache_searxng
+            if agora - quando < self._cache_searxng_ttl:
+                return valor
+        import os
+        import urllib.error
+        import urllib.request
+        url = os.environ.get("EVA_SEARXNG_URL", "http://127.0.0.1:8080").rstrip("/") + "/healthz"
+        try:
+            with urllib.request.urlopen(url, timeout=2) as r:
+                valor = (r.status == 200, "")
+        except urllib.error.URLError as e:
+            valor = (False, str(e.reason)[:100])
+        except Exception as e:
+            valor = (False, str(e)[:100])
+        self._cache_searxng = (agora, valor)
+        return valor
 
     def montar_estado(self) -> dict:
         cfg = self.cfg
@@ -234,6 +324,7 @@ class ServidorDashboard:
                 "memoria_llm": cfg.memoria.extrair_com_llm,
                 "consolidar": cfg.memoria.consolidar_com_llm,
                 "minecraft_iniciativa": minecraft_tools.status_dashboard()["iniciativa_ativa"],
+                "robo_iniciativa": robot_tools.status_dashboard()["iniciativa_ativa"],
             }[chave]
             toggles.append({"chave": chave, "rotulo": rotulo,
                             "descricao": descricao, "valor": valor})
@@ -268,9 +359,14 @@ class ServidorDashboard:
             memoria_total, usuarios = {}, []
 
         try:
-            modelo_disponivel = self.eva.llm.disponivel()
+            modelo_disponivel = self._modelo_disponivel_cacheado()
         except Exception:
             modelo_disponivel = False
+
+        try:
+            searxng_ok, searxng_erro = self._searxng_disponivel_cacheado()
+        except Exception as e:
+            searxng_ok, searxng_erro = False, str(e)[:100]
 
         return {
             "uptime_s": round(time.time() - self._inicio, 1),
@@ -278,6 +374,16 @@ class ServidorDashboard:
             "somente_reinicio": {
                 "embeddings_ativo": cfg.memoria.usar_embeddings,
                 "visao_configurada": cfg.visao.ativa,
+            },
+            "tts": {
+                "backend_pedido": cfg.voz.tts_backend,
+                "backend_ativo": cb.tts.nome if cb.tts else None,
+                "disponiveis": sorted(TTS_BACKENDS),
+                "erro": cb.erro_tts,
+            },
+            "searxng": {
+                "disponivel": searxng_ok,
+                "erro": searxng_erro or None,
             },
             "modelo": {
                 "nome": cfg.llm.modelo,
@@ -288,6 +394,7 @@ class ServidorDashboard:
             "visao": info_visao,
             "consciencia_por_guild": consciencias,
             "minecraft": minecraft_tools.status_dashboard(),
+            "robo": robot_tools.status_dashboard(),
         }
 
     def executar_acao(self, acao: str, corpo: dict) -> dict:
@@ -327,10 +434,20 @@ class ServidorDashboard:
         if acao == "minecraft_cancelar_tarefa":
             return minecraft_tools.minecraft_cancelar_tarefa()
 
+        if acao == "robo_parar":
+            return robot_tools.parar_dashboard()
+
+        if acao == "robo_estop":
+            motivo = corpo.get("motivo") or "acionado pelo painel"
+            return robot_tools.estop_dashboard(motivo)
+
+        if acao == "robo_reset_estop":
+            return robot_tools.reset_estop_dashboard()
+
         raise ValueError(
             f"ação desconhecida: {acao!r}. Válidas: visao_ligar, "
             f"visao_desligar, visao_tick_agora, esquecer_memoria, "
-            f"minecraft_cancelar_tarefa"
+            f"minecraft_cancelar_tarefa, robo_parar, robo_estop, robo_reset_estop"
         )
 
     # ------------------------------------------------------------ ciclo
@@ -403,6 +520,8 @@ PAGINA_HTML = """<!DOCTYPE html>
     padding: 7px 14px; font-size: 13px; cursor: pointer; margin-top: 8px;
   }
   button:hover { background: #343947; }
+  button.perigo { background: #3a2020; border-color: #5a2a2a; color: #ff8a8a; }
+  button.perigo:hover { background: #4a2626; }
   pre { background: #0f1115; border: 1px solid #2a2e37; border-radius: 6px;
     padding: 12px; font-size: 12px; overflow-x: auto; white-space: pre-wrap;
     word-break: break-word; max-height: 400px; overflow-y: auto; }
@@ -440,6 +559,29 @@ PAGINA_HTML = """<!DOCTYPE html>
   </section>
 
   <section>
+    <h2>Voz (TTS)</h2>
+    <div id="tts_status"></div>
+    <div class="grid2" style="margin-top:8px">
+      <select id="tts_select"></select>
+      <button onclick="trocarTts()" style="margin-top:0">Trocar agora</button>
+    </div>
+    <div class="desc" style="margin-top:6px">
+      Troca em tempo real -- não precisa editar .env nem reiniciar nada.
+      Se der erro (chave faltando, backend não instalado), aparece aqui na hora.
+    </div>
+  </section>
+
+  <section>
+    <h2>Busca (SearXNG)</h2>
+    <div id="searxng_status"></div>
+    <div class="desc" style="margin-top:6px">
+      Checa http://.../healthz a cada poll (cache de 15s) -- é a ferramenta
+      "buscar" que a EVA usa. Se aparecer indisponível aqui, ela vai
+      alucinar em vez de pesquisar quando pedirem uma busca.
+    </div>
+  </section>
+
+  <section>
     <h2>Memória</h2>
     <div id="memoria"></div>
   </section>
@@ -458,6 +600,20 @@ PAGINA_HTML = """<!DOCTYPE html>
   <section>
     <h2>Minecraft</h2>
     <div id="minecraft"></div>
+  </section>
+
+  <section>
+    <h2>Robô Físico</h2>
+    <div id="robo"></div>
+    <div class="desc" style="margin-top:10px; padding-top:10px; border-top:1px solid #262a33">
+      <b>USB</b> = webcam de navegação (o "olho" que vê pra onde o carro anda).
+      <b>PICAM</b> = câmera na garra/cabeça (o "rosto" que se move com o braço).
+      São hardwares completamente diferentes (USB via OpenCV, PICAM via
+      Picamera2) -- não dá pra uma virar a outra por engano no código, mas o
+      <i>índice</i> da USB (qual /dev/videoN) pode mudar se o cabo for
+      replugado. Se "câmera ativa" abaixo não bater com o que você espera
+      ver, é o primeiro lugar a olhar.
+    </div>
   </section>
 
   <section>
@@ -509,6 +665,32 @@ async function acao(nome, extra) {
   return r;
 }
 
+async function roboEstop() {
+  if (!confirm('EMERGENCY STOP no robô agora?')) return;
+  await acao('robo_estop');
+}
+
+async function roboResetEstop() {
+  const r = await acao('robo_reset_estop');
+  if (r.resultado && r.resultado.erro) {
+    alert('Não consegui liberar: ' + JSON.stringify(r.resultado));
+  }
+}
+
+async function trocarTts() {
+  const backend = document.getElementById('tts_select').value;
+  const r = await api('/api/tts', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({backend}),
+  });
+  const status = document.getElementById('tts_status');
+  if (r.erro) {
+    status.innerHTML = `<div class="kv" style="color:#e88">Falhou: ${r.erro}</div>`;
+  } else {
+    carregar();
+  }
+}
+
 async function preverPrompt() {
   const mensagem = document.getElementById('pv_mensagem').value;
   const usuario = document.getElementById('pv_usuario').value;
@@ -551,6 +733,22 @@ async function carregar() {
     <div class="kv">${pill(e.modelo.disponivel)}</div>
     <div class="kv" style="grid-column:1/-1">${e.modelo.url}</div>`;
 
+  const tts = e.tts;
+  document.getElementById('tts_status').innerHTML = tts.erro
+    ? `<div class="kv" style="color:#e88"><b>sem voz -- ${tts.backend_pedido} falhou:</b> ${tts.erro}</div>`
+    : `<div class="kv">ativo agora: <b>${tts.backend_ativo || '(nenhum)'}</b></div>`;
+  const selectTts = document.getElementById('tts_select');
+  if (selectTts.dataset.preenchido !== '1') {
+    selectTts.innerHTML = tts.disponiveis.map(b => `<option value="${b}">${b}</option>`).join('');
+    selectTts.dataset.preenchido = '1';
+  }
+  if (tts.backend_ativo) selectTts.value = tts.backend_ativo;
+
+  const sx = e.searxng;
+  document.getElementById('searxng_status').innerHTML = sx.disponivel
+    ? `<div class="kv">${pill(true)} respondendo</div>`
+    : `<div class="kv">${pill(false)} ${sx.erro || 'sem resposta'}</div>`;
+
   const porTipo = Object.entries(e.memoria.por_tipo)
     .map(([k, v]) => `${k}: <b>${v}</b>`).join(' &nbsp;·&nbsp; ') || 'vazio';
   document.getElementById('memoria').innerHTML = `
@@ -576,6 +774,7 @@ async function carregar() {
   document.getElementById('consciencia').innerHTML = guilds.length ? guilds.map(([gid, s]) => `
     <div style="margin-bottom:10px">
       <div class="kv"><b>canal ${gid}</b> -- silêncio ${s.silencio}s, ${s.ocupada ? 'ocupada' : 'livre'}</div>
+      ${s.ultimo_veredito ? `<div class="kv" style="margin-top:2px">último veredito: ${s.ultimo_veredito}</div>` : ''}
       ${s.impulsos.length ? s.impulsos.map(i => `<div class="impulso">${i}</div>`).join('')
                           : '<div class="vazio">sem impulsos na fila</div>'}
       ${s.fios.length ? `<div class="kv" style="margin-top:4px">fios: ${s.fios.join('; ')}</div>` : ''}
@@ -596,10 +795,49 @@ async function carregar() {
       <div class="kv" style="margin-top:8px"><b>Tarefa:</b> ${t ? `${t.objetivo} -- ${t.status} (${t.passos} passo(s))` : '(nenhuma ainda)'}</div>
       ${t && t.status === 'ativa' ? `<button onclick="acao('minecraft_cancelar_tarefa')">Cancelar tarefa</button>` : ''}`;
   }
+
+  const ro = e.robo;
+  const roboDiv = document.getElementById('robo');
+  if (!ro.conectado) {
+    roboDiv.innerHTML = `
+      <div class="linha"><div class="rotulo">Conectado</div>${pill(false)}</div>
+      <div class="vazio" style="margin-top:6px">Sem conexão ainda -- conecta sozinho na primeira vez que
+        alguma ferramenta de robô for usada (eva_command_server.py precisa estar rodando no robô).</div>`;
+  } else if (ro.erro_estado) {
+    roboDiv.innerHTML = `
+      <div class="linha"><div class="rotulo">Conectado</div>${pill(true)}</div>
+      <div class="kv" style="color:#e88; margin-top:6px">Não consegui buscar o estado agora: ${ro.erro_estado}</div>
+      <button onclick="acao('robo_parar')">Parar mesmo assim</button>
+      <button class="perigo" onclick="roboEstop()">EMERGENCY STOP</button>`;
+  } else {
+    const est = ro.estado || {};
+    const cam = est.camera || {};
+    const seg = est.safety || {};
+    const sensores = seg.last_sensor_data || {};
+    const camAtiva = (cam.active_camera || '?').toUpperCase();
+    const camDetalhe = camAtiva === 'USB'
+      ? `USB (navegação) -- device index ${cam.usb_id ?? '?'}`
+      : camAtiva === 'PICAM'
+      ? `PICAM (garra/cabeça, "rosto") -- picam_id ${cam.picam_id ?? '?'}`
+      : `desconhecida (${camAtiva})`;
+    roboDiv.innerHTML = `
+      <div class="linha"><div class="rotulo">Conectado</div>${pill(true)}</div>
+      <div class="linha"><div class="rotulo">Emergency stop</div>${pill(!seg.emergency_stop)}</div>
+      <div class="linha"><div class="rotulo">Watchdog OK</div>${pill(seg.watchdog_ok !== false)}</div>
+      <div class="kv" style="margin-top:8px"><b>Câmera ativa:</b> ${camDetalhe}</div>
+      <div class="kv">modo: ${est.mode ?? '-'} &nbsp;·&nbsp; trocando câmera: ${cam.switching ? 'sim' : 'não'}</div>
+      <div class="kv" style="margin-top:6px">bateria: ${sensores.battery_v != null ? sensores.battery_v + 'V' : 'sem leitura'}
+        &nbsp;·&nbsp; obstáculo: ${sensores.ultrasonic_cm != null ? sensores.ultrasonic_cm + 'cm' : 'sem leitura'}</div>
+      <div style="margin-top:10px">
+        <button onclick="acao('robo_parar')">Parar</button>
+        <button class="perigo" onclick="roboEstop()">EMERGENCY STOP</button>
+        ${seg.emergency_stop ? `<button onclick="roboResetEstop()">Liberar emergency stop</button>` : ''}
+      </div>`;
+  }
 }
 
 carregar();
-setInterval(carregar, 2000);
+setInterval(carregar, 15000);
 </script>
 </body>
 </html>

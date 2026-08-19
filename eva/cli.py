@@ -102,15 +102,23 @@ def mostrar_diagnostico(eva: EVA) -> None:
     print(f"\n  {_cor('voz', NEGRITO)}")
     backend_stt = eva.cfg.voz.stt_backend
     if backend_stt == "whisper_cpp":
-        from pathlib import Path as _Path
-        exe_ok = bool(eva.cfg.voz.stt_whisper_cpp_exe) and _Path(eva.cfg.voz.stt_whisper_cpp_exe).exists()
-        modelo_ok = bool(eva.cfg.voz.stt_whisper_cpp_modelo) and _Path(eva.cfg.voz.stt_whisper_cpp_modelo).exists()
-        ok = exe_ok and modelo_ok
+        import urllib.request as _urlreq
+        import urllib.error as _urlerr
+        url = eva.cfg.voz.stt_whisper_cpp_url
+        ok = False
+        if url:
+            try:
+                _urlreq.urlopen(url, timeout=2)
+                ok = True
+            except _urlerr.HTTPError:
+                ok = True  # respondeu algo (mesmo 404 na raiz) -- servidor de pé
+            except Exception:
+                ok = False  # recusou conexão -- servidor não está rodando
         print(f"  STT (whisper.cpp): "
-              f"{'binário e modelo encontrados' if ok else 'binário/modelo NÃO encontrados -- cai pra Groq'}")
+              f"{'servidor respondendo em ' + url if ok else 'servidor NÃO respondeu -- cai pra Groq'}")
         if not ok:
-            print(_cor("              confira EVA_STT_WHISPER_CPP_EXE e "
-                       "EVA_STT_WHISPER_CPP_MODELO no .env", CINZA))
+            print(_cor(f"              suba o servidor (./server -m ... --port ...) "
+                       f"e confira EVA_STT_WHISPER_CPP_URL ({url or 'vazio'}) no .env", CINZA))
     else:
         tem_groq = bool(_os.environ.get("GROQ_API_KEY"))
         print(f"  STT (Groq): {'chave presente' if tem_groq else 'SEM GROQ_API_KEY'}")

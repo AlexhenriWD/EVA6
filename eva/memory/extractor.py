@@ -67,6 +67,59 @@ Regras:
 Conversa:
 {conversa}"""
 
+# ------------------------------------------------- auto-reflexão da EVA
+#
+# Diferente de PROMPT_LLM (fatos sobre QUEM FALA com ela), isto observa a
+# EVA -- o que ela pareceu genuinamente gostar de falar, que traço de
+# personalidade apareceu com clareza nessa troca específica. Roda raro
+# (ver ConscienciaConfig/MemoriaConfig -- gatilho por turnos, não por
+# turno), com confiança baixa de propósito: é INFERÊNCIA sobre um padrão,
+# não fato declarado por ninguém. Um lote pequeno de turnos pode sugerir
+# um traço que não se repete depois -- por isso a confiança fica baixa e
+# a fonte fica marcada ('auto_reflexao'), para ser auditável e podável
+# depois se um "traço" acabar não se confirmando com o tempo. Isso é
+# deliberadamente simples na v1: sem promoção de confiança por repetição,
+# sem votação entre observações -- ver se aparece deriva/alucinação de
+# traço antes de complicar.
+PROMPT_AUTORREFLEXAO = """Você está observando um TRECHO de conversa em que \
+EVA (uma IA com personalidade própria) participou, para notar o que esse \
+trecho específico revela sobre COMO ELA É -- não sobre a pessoa com quem \
+fala.
+
+Regras:
+- Extraia no máximo 2 observações, só se o trecho realmente sustentar algo.
+- Baseie-se só no que EVA disse/fez aqui. Não invente traço que não apareceu.
+- Não repita o que já é óbvio do personagem dela (curiosa, direta, honesta) \
+-- procure algo mais específico: um assunto que ela claramente gostou de \
+puxar, um jeito de reagir que se destacou, um tipo de humor que funcionou.
+- Escreva na terceira pessoa, curto, como um fato sobre ela \
+(ex: "Gosta de puxar comparação entre programação e música quando surge \
+a chance.").
+- Se o trecho não sustentar nada específico, chame a ferramenta com lista \
+vazia -- é o caso mais comum, não force achar padrão onde não tem.
+
+Trecho:
+{conversa}"""
+
+FERRAMENTA_AUTORREFLEXAO = {
+    "type": "function",
+    "function": {
+        "name": "registrar_observacao",
+        "description": "Registra o que este trecho revela sobre a personalidade da EVA.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "observacoes": {
+                    "type": "array",
+                    "description": "Até 2 observações. Vazia se nada específico apareceu.",
+                    "items": {"type": "string"},
+                },
+            },
+            "required": ["observacoes"],
+        },
+    },
+}
+
 # Schema OpenAI para tool-calling nativo -- ver ClienteLLM.completar_com_
 # ferramenta em llm.py. Substituiu o formato antigo (pedir "responda em
 # JSON" na instrução e parsear o texto solto da resposta): o modelo é
@@ -197,5 +250,58 @@ def extrair_por_llm(conversa: list[dict], cliente, max_fatos: int = 5) -> list[d
                 "conteudo": conteudo,
                 "fonte": "llm",
                 "confianca": 0.55,
+            })
+    return saida
+
+
+def extrair_personalidade_propria(conversa: list[dict], cliente, max_itens: int = 2) -> list[dict]:
+    """Observa um trecho de conversa e extrai o que ele revela sobre a
+    personalidade DA PRÓPRIA EVA -- não sobre quem fala com ela.
+
+    Mesmo mecanismo de extrair_por_llm (tool-calling, schema fixo), prompt
+    e schema diferentes (ver PROMPT_AUTORREFLEXAO/FERRAMENTA_AUTORREFLEXAO
+    acima). Devolve itens já no formato que BancoMemoria.adicionar() espera,
+    tipo="semantica" fixo -- essas observações entram no MESMO pipe de
+    busca que já existe para a história/lore da EVA (ver USUARIO_HISTORIA
+    em orchestrator.py: _buscar_memorias busca tipo="semantica" desse
+    usuário reservado, independente de precisa_memoria). Não é preciso
+    nenhum código novo de recuperação -- só popular esse mesmo lugar.
+
+    confianca=0.4, mais baixa que extrair_por_llm (0.55): isso é inferência
+    de padrão de comportamento a partir de um trecho pequeno, categoria
+    mais especulativa que "fato que o usuário declarou sobre si mesmo".
+    """
+    texto = "\n".join(
+        f"{'Usuário' if t['role'] == 'user' else 'EVA'}: {t['content']}"
+        for t in conversa[-8:]
+    )
+    prompt = PROMPT_AUTORREFLEXAO.replace("{conversa}", texto)
+
+    try:
+        argumentos = cliente.completar_com_ferramenta(
+            [{"role": "user", "content": prompt}],
+            FERRAMENTA_AUTORREFLEXAO,
+            temperatura=0.0, max_tokens=200,
+        )
+    except Exception:
+        return []
+
+    if argumentos is None:
+        return []
+
+    dados = argumentos.get("observacoes", [])
+    if not isinstance(dados, list):
+        return []
+
+    saida = []
+    for item in dados[:max_itens]:
+        conteudo = str(item).strip() if not isinstance(item, dict) else \
+            str(item.get("conteudo", item.get("observacao", ""))).strip()
+        if conteudo:
+            saida.append({
+                "tipo": "semantica",
+                "conteudo": conteudo,
+                "fonte": "auto_reflexao",
+                "confianca": 0.4,
             })
     return saida

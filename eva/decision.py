@@ -177,6 +177,59 @@ BUSCA_RELATO = re.compile(
     r"j[áa] pesquisei|j[áa] procurei)\b", re.I
 )
 
+# ------------------------------------------------- consulta de busca real
+#
+# BUSCA só detecta QUE existe pedido de busca -- não separa o pedido do
+# assunto. "pesquisa mais sobre isso" batia em BUSCA e a consulta virava
+# essa frase literal, mandada pro SearXNG palavra por palavra. Motor de
+# busca não resolve "isso" (não tem o resto da conversa), então voltava
+# lixo ou nada -- e por fora parecia a EVA "se recusando a pesquisar",
+# quando na verdade pesquisou a frase errada.
+_GATILHO_BUSCA = re.compile(
+    r"^\s*(voc[êe]\s+)?(pode|poderia|consegue|conseguiria|d[áa]\s+pra|"
+    r"d[áa]\s+para|gostaria\s+que\s+voc[êe])?\s*"
+    r"(pesquis(a|e|ar|asse|aria)|busc(a|e|ar|asse|aria)|procur(a|e|ar|asse|aria)|"
+    r"me\s+ach(a|ar)|ach(a|ar)\s+a[íi]|d[áa]\s+uma\s+olhada(\s+em)?|v[êe]\s+a[íi])\s*",
+    re.I,
+)
+
+_SO_ENCHIMENTO = re.compile(
+    r"^(sobre\s+|em\s+|no\s+|na\s+)?"
+    r"(isso|isto|aquilo|esse\s+assunto|essa\s+coisa|a[íi]|"
+    r"mais(\s+(sobre\s+)?(isso|isto|aquilo))?|pra\s+mim|por\s+favor|)"
+    r"[\s.,!?]*$",
+    re.I,
+)
+
+
+def extrair_consulta_busca(texto: str, historico: list[dict] | None = None) -> str | None:
+    """Assunto de um pedido de busca -- nunca o pedido cru.
+
+    Duas etapas: tira o verbo-gatilho e o modal que vem junto; se o que
+    sobra é só enchimento sem assunto (pronome, "mais sobre", "por
+    favor"), tenta resolver olhando a ÚLTIMA mensagem do usuário no
+    histórico -- é o caso mais comum de pronome apontando pra fora da
+    frase atual ("o que rolou de novo?" ... "pesquisa mais sobre isso").
+
+    Devolve None quando não há assunto extraível nem no histórico -- quem
+    chama decide o que fazer (busca explícita cai pro texto original como
+    último recurso; lacuna em segundo plano simplesmente desiste).
+    """
+    resto = _GATILHO_BUSCA.sub("", texto.strip(), count=1).strip(" ,.!?")
+
+    if resto and len(resto) >= 4 and not _SO_ENCHIMENTO.match(resto):
+        return resto
+
+    if historico:
+        for turno in reversed(historico):
+            if turno.get("role") != "user":
+                continue
+            candidato = (turno.get("content") or "").strip()
+            if candidato and len(candidato) >= 4 and not _SO_ENCHIMENTO.match(candidato):
+                return candidato[:200]
+
+    return None
+
 # ------------------------------------------------- lacuna de conhecimento
 #
 # Diferente de BUSCA (pedido explícito, busca AGORA para responder), isto
@@ -302,7 +355,11 @@ class DecisorPorRegras:
         # relato no passado. "pesquisei tanto e não achei sentido" é desabafo.
         busca_ja_acionada = False
         if BUSCA.search(texto) and p.carga_emocional < 0.5 and not BUSCA_RELATO.search(texto):
-            ferramentas.append({"nome": "buscar", "args": {"consulta": texto[:200]}})
+            consulta = extrair_consulta_busca(texto, historico)
+            if consulta is None:
+                consulta = texto[:200]
+                print(f"[decisao] busca sem assunto extraível, usando texto cru: {texto[:80]!r}")
+            ferramentas.append({"nome": "buscar", "args": {"consulta": consulta}})
             busca_ja_acionada = True
 
         # Lacuna de conhecimento: não busca AGORA (não atrasa a resposta),
@@ -311,7 +368,9 @@ class DecisorPorRegras:
         # aconteceria duas vezes por motivos diferentes.
         if (not busca_ja_acionada and p.carga_emocional < 0.5
                 and LACUNA_TEMA.search(texto) and LACUNA_TEMPORAL.search(texto)):
-            p.possivel_lacuna = texto[:200]
+            # Oportunista: se não achou assunto de verdade, não pesquisa nada em
+            # vez de gastar cota do Brave numa frase-gatilho sem conteúdo.
+            p.possivel_lacuna = extrair_consulta_busca(texto, historico) or texto[:200]
 
         if ferramentas:
             p.precisa_ferramenta = True
@@ -479,7 +538,13 @@ class DecisorPorLLM:
             f for f in d.get("ferramentas", [])
             if isinstance(f, dict) and self.registro.get(f.get("nome", ""))
         ]
-        return Plano(
+        for f in ferramentas:
+            if f.get("nome") == "buscar":
+                args = f.setdefault("args", {})
+                bruta = str(args.get("consulta", ""))
+                args["consulta"] = extrair_consulta_busca(bruta, historico) or bruta[:200] or mensagem[:200]
+
+        plano = Plano(
             intencao=d.get("intencao", "conversa"),
             precisa_memoria=bool(d.get("precisa_memoria", True)),
             precisa_ferramenta=bool(ferramentas),
@@ -491,3 +556,9 @@ class DecisorPorLLM:
             complexidade=float(d.get("complexidade", 0.5)),
             motivo="decisor LLM",
         )
+        # BUG REAL: possivel_lacuna nunca era copiada do decisor de regra pro
+        # plano final do LLM (o campo nem existe no JSON pedido ao modelo). Com
+        # EVA_DECISION_LLM=1, a pesquisa de segundo plano da iniciativa parava
+        # de disparar por completo, em silêncio.
+        plano.possivel_lacuna = base.possivel_lacuna
+        return plano

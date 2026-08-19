@@ -39,6 +39,7 @@ compartilhados nao: dois turnos simultaneos no mesmo cursor dao
 from __future__ import annotations
 
 import json
+import os
 import re
 import sqlite3
 import threading
@@ -403,6 +404,19 @@ class BancoMemoria:
 
     # ---------- leitura ----------
 
+    def calcular_embedding_consulta(self, texto: str) -> list[float] | None:
+        """Calcula o vetor de UMA consulta, para reusar em varias chamadas
+        de `buscar` com o mesmo texto (ver docstring de `buscar` sobre o
+        motivo de isso existir). None se embeddings estiver desligado ou a
+        chamada de rede falhar -- best-effort, mesma politica de sempre.
+        """
+        if self.embeddings is None:
+            return None
+        try:
+            return self.embeddings.gerar_consulta(texto)
+        except Exception:
+            return None
+
     def buscar(
         self,
         consulta: str,
@@ -411,9 +425,24 @@ class BancoMemoria:
         tipo: str | None = None,
         limite: int = 5,
         score_minimo: float = 0.0,
+        vetor_consulta: list[float] | None = None,
     ) -> list[Memoria]:
         """Busca por relevancia. BM25 sempre; embedding complementa quando
         `self.embeddings` esta configurado.
+
+        `vetor_consulta`: passe o vetor ja calculado (ver
+        `calcular_embedding_consulta`) quando for chamar `buscar` varias
+        vezes SEGUIDAS com o MESMO texto de consulta -- por exemplo,
+        orchestrator._buscar_memorias chama isso ate 4x por turno com
+        plano.consulta_memoria (uma vez por tipo: semantica/episodica/
+        procedural/personalidade) e mais 2x com `mensagem` (historia e
+        regras da propria EVA). Sem isso, cada uma dessas chamadas ia
+        disparar sua PRÓPRIA requisição de embedding pro LM Studio -- 4 a 6
+        chamadas de rede por turno so pra gerar o MESMO vetor de novo e de
+        novo. Achado real ao ler o caminho completo de `_buscar_memorias`
+        para investigar delay: nenhuma delas cacheava nada, cada tipo
+        embedava a consulta do zero. Parametro opcional para nao quebrar
+        quem ja chama `buscar` direto com um texto usado uma vez só.
 
         HIBRIDA, NAO SUBSTITUTA: BM25 continua rodando do jeito que sempre
         rodou -- nome proprio, termo raro, sigla ("Alex", "postgres")
@@ -466,7 +495,8 @@ class BancoMemoria:
         # ------------------------------------------------------ embedding
         if self.embeddings is not None:
             candidatos = self._buscar_por_embedding(
-                consulta, usuario=usuario, tipo=tipo, limite=limite * 3, agora=agora)
+                consulta, usuario=usuario, tipo=tipo, limite=limite * 3,
+                agora=agora, vetor_consulta=vetor_consulta)
             for mem in candidatos:
                 # Uma memoria que ja veio do BM25 fica com o MAIOR dos dois
                 # scores, nao a soma -- somar inflaria artificialmente algo
@@ -492,17 +522,68 @@ class BancoMemoria:
 
     def _buscar_por_embedding(
         self, consulta: str, *, usuario: str, tipo: str | None,
-        limite: int, agora: float,
+        limite: int, agora: float, vetor_consulta: list[float] | None = None,
     ) -> list[Memoria]:
         """Metade semantica da busca hibrida. So chamada por `buscar` --
         nao publica porque nao faz sentido sem o lado BM25 complementando.
+
+        ACHADO REAL (log de produção real, 14/08): gap consistente de ~2s
+        entre o embedding da consulta terminar e a chamada ao LLM
+        conversacional começar -- em TODO turno, incluindo os sem
+        ferramenta nenhuma ("Exatamente.", "Oi oi como vocês estão").
+        Delay fixo desse jeito, repetido igual em turnos completamente
+        diferentes, não tem cara de rede variável (SearXNG/Groq) -- tem
+        cara de trabalho de CPU que cresce com o tamanho do banco.
+
+        Suspeito principal: o SELECT abaixo não tem LIMIT nenhum -- escaneia
+        TODA memória ativa do usuário (ou do usuário reservado de
+        história) daquele tipo, e o loop de cosseno que segue roda em
+        Python puro, um vetor por vez (sem numpy vetorizado). Isso roda
+        SEIS vezes por turno (4 tipos com plano.consulta_memoria + 2 com
+        mensagem, ver _buscar_memorias em orchestrator.py). Pior: threads
+        Python não dão paralelismo real pra trabalho de CPU puro (GIL) --
+        então o ThreadPoolExecutor da rodada anterior ajuda a chamada de
+        rede do embedding, mas as 6 varreduras Python competem pelo mesmo
+        núcleo por baixo dos panos, quase se somando em vez de se
+        sobrepor. Com meses de sessão de teste acumulados no
+        memoria.db, isso vira um piso de latência que não depende do
+        conteúdo da mensagem -- exatamente o padrão constante visto no log.
+
+        `EVA_DEBUG_MEMORIA=1` liga o print de linhas escaneadas + tempo
+        gasto aqui, pra confirmar (ou descartar) essa hipótese com número
+        real antes de mexer em mais nada -- ver também o painel "Memória"
+        do dashboard, que já mostra contagem por tipo sem precisar de
+        nenhum código novo.
         """
         from .embeddings import blob_para_vetor, cosseno
 
-        try:
-            vetor_consulta = self.embeddings.gerar_consulta(consulta)
-        except Exception:
-            return []  # best-effort -- ver docstring de `buscar`
+        if vetor_consulta is None:
+            try:
+                vetor_consulta = self.embeddings.gerar_consulta(consulta)
+            except Exception:
+                return []  # best-effort -- ver docstring de `buscar`
+        if vetor_consulta is None:
+            return []
+
+        _depurar = os.environ.get("EVA_DEBUG_MEMORIA") == "1"
+        _t0 = time.time() if _depurar else 0.0
+
+        # LIMITE DE VARREDURA: sem isso, o SELECT abaixo cresce sem teto
+        # junto com o banco -- meses de sessão de teste acumulados viram
+        # piso de latência permanente. "ORDER BY COALESCE(acessado_em,
+        # criado_em) DESC" prioriza o que foi tocado (ou criado, se nunca
+        # buscado ainda) mais recentemente -- proxy razoável de relevância
+        # continuada, e sem o COALESCE uma memória nova que ainda não foi
+        # buscada nenhuma vez (acessado_em NULL) ficaria de fora do corte
+        # antes mesmo de ter chance de aparecer. Troca um pouco de recall
+        # (memória muito antiga e nunca mais acessada pode ficar de fora)
+        # por um teto de custo previsível -- mesmo raciocínio de "contexto
+        # pequeno e relevante vale mais que contexto grande" que já rege o
+        # resto do Context Builder. Configurável via
+        # EVA_MEMORIA_MAX_VARREDURA porque o tamanho "certo" depende de
+        # quanta memória você já acumulou -- meça com EVA_DEBUG_MEMORIA=1
+        # antes de decidir o valor.
+        max_varredura = int(os.environ.get("EVA_MEMORIA_MAX_VARREDURA", "300"))
 
         sql = ("SELECT * FROM memorias WHERE ativo=1 AND usuario=? "
                "AND embedding IS NOT NULL")
@@ -510,6 +591,8 @@ class BancoMemoria:
         if tipo:
             sql += " AND tipo=?"
             params.append(tipo)
+        sql += " ORDER BY COALESCE(acessado_em, criado_em) DESC LIMIT ?"
+        params.append(max_varredura)
 
         with self._lock:
             linhas = list(self.con.execute(sql, params))
@@ -532,6 +615,11 @@ class BancoMemoria:
             # calibracao inicial; ajuste observando buscas reais.
             score = sim * 10 * (0.6 + 0.4 * r["confianca"]) * (0.75 + 0.25 * recencia)
             pontuados.append(self._para_memoria(r, score=score))
+
+        if _depurar:
+            print(f"[memoria-embedding] tipo={tipo or 'todos'} usuario={usuario} "
+                  f"linhas_escaneadas={len(linhas)} (teto={max_varredura}) "
+                  f"tempo={int((time.time() - _t0) * 1000)}ms")
 
         pontuados.sort(key=lambda m: m.score, reverse=True)
         return pontuados[:limite]

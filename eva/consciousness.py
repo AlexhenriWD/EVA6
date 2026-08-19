@@ -55,6 +55,10 @@ from dataclasses import dataclass, field
 FORCA_PADRAO = {
     "fio": 0.70,
     "visual": 0.65,
+    "corporal": 0.65,  # mesmo peso de visual -- notar o próprio corpo é
+                       # tão específico quanto notar a tela. Só emitido
+                       # em transição de segurança/recusa, nunca por
+                       # movimento rotineiro -- ver robot_tools.py.
     "pesquisa": 0.60,
     "vazio": 0.35,
 }
@@ -63,6 +67,8 @@ FORCA_PADRAO = {
 TTL_PADRAO = {
     "fio": 900.0,      # 15 min -- fio é durável, o assunto não azeda rápido
     "visual": 60.0,    # a tela já mudou de novo
+    "corporal": 90.0,  # estado físico muda rápido -- comentar "acabei de
+                       # tomar um susto" 3min depois já ficou esquisito
     "pesquisa": 180.0,
     "vazio": 60.0,
 }
@@ -331,6 +337,14 @@ class Consciencia:
         """Gancho da fase 3. A visão chama aqui quando algo muda de verdade."""
         self.adicionar(criar_impulso("visual", descricao))
 
+    def evento_corporal(self, descricao: str) -> None:
+        """Transição de segurança do corpo físico (entrou/saiu de
+        emergency stop, watchdog caiu) ou recusa de comando de
+        movimento -- NUNCA movimento rotineiro bem-sucedido. Quem filtra
+        isso é robot_tools._detectar_transicao_seguranca/_descrever_recusa,
+        não aqui -- este método só empacota o que já chegou filtrado."""
+        self.adicionar(criar_impulso("corporal", descricao))
+
     def pesquisa_pronta(self, resumo: str) -> None:
         self.adicionar(criar_impulso("pesquisa", resumo))
 
@@ -408,7 +422,10 @@ class Consciencia:
                 return criar_impulso(
                     "fio", f"retomar {alvo}: {fio.assunto}", origem=fio.usuario,
                 )
-        return criar_impulso("vazio", "puxar assunto")
+        return criar_impulso(
+            "vazio", "puxar assunto",
+            forca=self.cfg.consciencia.forca_vazio,
+        )
 
     def _consumir(self, impulso: Impulso) -> None:
         if impulso in self.fila:
@@ -433,4 +450,8 @@ class Consciencia:
             "fios": [f.assunto for f in self.fios if not f.usado],
             "ultimo_falante": self.ultimo_falante,
             "ocupada": self.ocupada,
+            # Motivo real do último tick, com os números -- é o que
+            # permite responder "por que ela não puxou assunto" olhando o
+            # dashboard em vez de caçar no console (ver Veredito.__str__).
+            "ultimo_veredito": str(self.ultimo_veredito) if self.ultimo_veredito else None,
         }

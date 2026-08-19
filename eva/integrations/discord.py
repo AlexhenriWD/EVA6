@@ -60,6 +60,132 @@ def achar_bridge() -> Path | None:
     return None
 
 
+def _host_porta_de_url(url: str) -> tuple[str, int]:
+    """Extrai host e porta de uma URL tipo http://127.0.0.1:8090 -- usado
+    tanto pra montar a flag --port do whisper-server quanto pro ping de
+    prontidão em _whisper_server_respondendo.
+    """
+    from urllib.parse import urlparse
+    p = urlparse(url)
+    return p.hostname or "127.0.0.1", p.port or 8090
+
+
+def _whisper_server_respondendo(url: str, timeout: float = 1.5) -> bool:
+    """Ping simples pro whisper-server. HTTPError também conta como 'de
+    pé' (respondeu alguma coisa, só não tem handler na raiz "/"); só
+    URLError/timeout (conexão recusada, ninguém escutando ali) conta
+    como 'não está rodando'. Usado tanto pra decidir SE sobe um servidor
+    novo (evita subir em cima de um que você já iniciou na mão, o que
+    quebraria por porta em uso) quanto pra saber quando ele terminou de
+    carregar o modelo (ver SupervisorWhisper.esperar_pronto).
+    """
+    import urllib.error
+    import urllib.request
+    try:
+        urllib.request.urlopen(url, timeout=timeout)
+        return True
+    except urllib.error.HTTPError:
+        return True
+    except Exception:
+        return False
+
+
+class SupervisorWhisper:
+    """Sobe o whisper-server (whisper.cpp) como subprocesso, mesmo padrão
+    do Supervisor (bridge.js) logo abaixo.
+
+    ACHADO REAL que motivou isto existir: ver WhisperCppServerSTT em
+    stt.py -- o backend antigo (subprocess.run por CHAMADA, um processo
+    novo a cada frase) recarregava o modelo GGML inteiro do disco em
+    toda transcrição, deixando o tempo de STT praticamente constante
+    (~3s) independente da duração do áudio. Servidor residente resolve
+    isso; esta classe só cuida de nascer/morrer junto com a EVA em vez
+    de exigir uma janela de terminal separada pra isso, mesmo espírito
+    do Supervisor do bridge.js.
+
+    Só sobe se: (1) EVA_STT_WHISPER_CPP_SERVER_EXE está configurado, e
+    (2) nada já está respondendo em EVA_STT_WHISPER_CPP_URL -- assim, se
+    você preferir continuar subindo na mão num terminal separado (mesmo
+    padrão que o LM Studio já usa), basta deixar a variável de exe vazia
+    ou já ter o servidor rodando antes: o executar() abaixo detecta e
+    não tenta subir outro em cima (quebraria por porta já em uso).
+    """
+
+    def __init__(self, exe: str, modelo: str, url: str, threads: int | None = None):
+        self.exe = exe
+        self.modelo = modelo
+        self.url = url
+        self.threads = threads
+        self.proc: subprocess.Popen | None = None
+
+    def iniciar(self) -> None:
+        host, porta = _host_porta_de_url(self.url)
+        cmd = [self.exe, "-m", self.modelo, "--host", host, "--port", str(porta)]
+        if self.threads:
+            cmd += ["-t", str(self.threads)]
+
+        print(f"[whisper] iniciando whisper-server em {host}:{porta}...")
+        self.proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            # mesmo motivo do Supervisor abaixo: sem isso, log com
+            # caractere fora de cp1252/cp850 derruba o processo inteiro
+            # no Windows.
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+        )
+
+    async def esperar_pronto(self, timeout: float = 60.0) -> bool:
+        """Espera o servidor começar a responder via polling, em vez de
+        um sleep fixo -- carregar large-v3-turbo pode levar bem mais que
+        os 2s que bastam pro bridge.js (que é só Node subindo, sem
+        modelo nenhum pra carregar pra GPU). Sleep cego arriscaria a
+        primeira transcrição real chegar antes do modelo terminar de
+        carregar; polling evita essa corrida sem chutar um número fixo.
+        """
+        loop = asyncio.get_running_loop()
+        inicio = loop.time()
+        while loop.time() - inicio < timeout:
+            if self.proc and self.proc.poll() is not None:
+                print(f"[whisper] processo encerrou cedo (código {self.proc.poll()}) "
+                      f"-- confira o log [whisper] acima")
+                return False
+            if await loop.run_in_executor(None, _whisper_server_respondendo, self.url):
+                return True
+            await asyncio.sleep(0.5)
+        return False
+
+    async def repassar_saida(self) -> None:
+        """Mostra o log do whisper-server com prefixo -- mesmo padrão do
+        Supervisor.repassar_saida abaixo, pra distinguir dos outros dois
+        processos (Python principal e bridge.js) no mesmo console.
+        """
+        if not self.proc or not self.proc.stdout:
+            return
+        loop = asyncio.get_running_loop()
+        while True:
+            linha = await loop.run_in_executor(None, self.proc.stdout.readline)
+            if not linha:
+                break
+            print(f"[whisper] {linha.rstrip()}")
+        codigo = self.proc.poll()
+        print(f"[whisper] processo encerrou (código {codigo})")
+
+    def parar(self) -> None:
+        if not self.proc:
+            return
+        print("[whisper] encerrando servidor...")
+        try:
+            self.proc.terminate()
+            self.proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+        self.proc = None
+
+
 def diagnostico() -> bool:
     """Checa tudo que o modo Discord precisa. Retorna True se está pronto."""
     cfg = carregar_config()
@@ -226,9 +352,29 @@ async def executar(so_python: bool, porta: int) -> None:
         # dá um tempo para o WebSocket do Node subir antes de tentar conectar
         await asyncio.sleep(2)
 
+    # whisper-server: só sobe se configurado (exe presente) E nada já
+    # estiver respondendo na URL configurada -- ver docstring de
+    # SupervisorWhisper pro motivo dessas duas condições.
+    supervisor_whisper = None
+    if (cfg.voz.stt_backend == "whisper_cpp" and cfg.voz.stt_whisper_cpp_server_exe
+            and not _whisper_server_respondendo(cfg.voz.stt_whisper_cpp_url)):
+        supervisor_whisper = SupervisorWhisper(
+            exe=cfg.voz.stt_whisper_cpp_server_exe,
+            modelo=cfg.voz.stt_whisper_cpp_modelo,
+            url=cfg.voz.stt_whisper_cpp_url,
+            threads=cfg.voz.stt_whisper_cpp_threads,
+        )
+        supervisor_whisper.iniciar()
+        pronto = await supervisor_whisper.esperar_pronto()
+        if not pronto:
+            print("[whisper] AVISO: servidor não respondeu a tempo -- STT vai cair "
+                  "pra Groq (ver criar_stt em stt.py) até você conferir o log acima.")
+
     tarefas = [asyncio.create_task(cliente.rodar())]
     if supervisor:
         tarefas.append(asyncio.create_task(supervisor.repassar_saida()))
+    if supervisor_whisper:
+        tarefas.append(asyncio.create_task(supervisor_whisper.repassar_saida()))
 
     try:
         await asyncio.gather(*tarefas)
@@ -239,6 +385,8 @@ async def executar(so_python: bool, porta: int) -> None:
             t.cancel()
         if supervisor:
             supervisor.parar()
+        if supervisor_whisper:
+            supervisor_whisper.parar()
         cliente.fechar()
 
 

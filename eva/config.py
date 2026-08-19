@@ -88,15 +88,32 @@ class LLMConfig:
     # se sentir que ela ficou insistindo em piada ou saindo do personagem.
     carisma: bool = os.environ.get("EVA_CARISMA", "1") == "1"
 
-    # "ancora": PERSONA curto e exato, SÓ faz sentido com um modelo
-    # fine-tunado especificamente pra ela (eva-3b/eva-7b) -- diverge do
-    # formato de treino em silêncio com qualquer outro modelo (mesmo
-    # aviso do topo do context.py). "prompt": card completo (PERSONA_
-    # PROMPT em context.py), pra modelo normal sem fine-tuning de
-    # identidade -- lumimaid e afins. Padrão trocado pra "prompt": o
-    # modelo fine-tunado foi abandonado, então "ancora" só seria usada
-    # de propósito, não por padrão.
-    modo_persona: str = os.environ.get("EVA_MODO_PERSONA", "prompt")
+    # Penalidade de repetição -- sem isso, NENHUM parâmetro anti-repetição
+    # ia pro LM Studio, e o comportamento ficava inteiramente dependente do
+    # preset default do modelo carregado lá (pode estar fraco/desligado).
+    # Achado real: sessão de teste longa saiu com respostas quase
+    # idênticas pra mensagens de usuário diferentes -- sintoma clássico
+    # disso faltar, não necessariamente falha do modelo em si.
+    #
+    # repeat_penalty é o parâmetro nativo do llama.cpp (>1.0 penaliza
+    # token repetido, 1.0 = desligado). frequency_penalty/presence_penalty
+    # são o par equivalente da API OpenAI -- backend diferente pode
+    # respeitar um ou outro; mandar os dois não tem custo, o servidor
+    # ignora o que não reconhece. 1.15/0.3/0.3 são pontos de partida
+    # moderados -- teste e ajuste se sentir a fala engessada demais (alto
+    # repeat_penalty pode fazer o modelo evitar até repetição natural,
+    # tipo "sim, sim" ou uma palavra-chave que devia mesmo se repetir).
+    repeat_penalty: float = float(os.environ.get("EVA_REPEAT_PENALTY", "1.15"))
+    frequency_penalty: float = float(os.environ.get("EVA_FREQUENCY_PENALTY", "0.3"))
+    presence_penalty: float = float(os.environ.get("EVA_PRESENCE_PENALTY", "0.3"))
+
+    # Linha curta e sempre presente sobre capacidade real (roda local, ouve
+    # e fala em call de Discord, tem memória) -- ver AUTOCONHECIMENTO em
+    # context.py. Complementar ao RAG de história/capacidades, não
+    # substituto: cobre o caso em que a pergunta é vaga demais pra busca
+    # semântica achar algo específico. EVA_AUTOCONHECIMENTO=0 desliga se
+    # quiser comparar antes/depois.
+    autoconhecimento: bool = os.environ.get("EVA_AUTOCONHECIMENTO", "1") == "1"
 
 
 @dataclass
@@ -147,6 +164,12 @@ class MemoriaConfig:
     # Teto separado de max_fatos: história dela é conteúdo diferente de fato
     # sobre a pessoa, e não deveria competir pelo mesmo espaço/relevância.
     max_historia: int = int(os.environ.get("EVA_MAX_HISTORIA", "2"))
+    # Mesmo raciocínio, mas pras "regras" gerais de comportamento dela mesma
+    # (tipo procedural, usuário reservado -- ver seed_capacidades_eva.py e
+    # o bloco de busca em orchestrator._buscar_memorias). Baixo de propósito:
+    # é reforço pontual sobre algo relevante ao assunto, não é pra
+    # substituir a PERSONA.
+    max_regras_propria: int = int(os.environ.get("EVA_MAX_REGRAS", "2"))
     max_episodios: int = 4
     max_procedimentos: int = 3
     max_personalidade: int = 3
@@ -197,6 +220,20 @@ class MemoriaConfig:
         os.environ.get("EVA_CONSOLIDAR_INTERVALO", "50"))
     consolidar_dias_minimo: float = 14.0
 
+    # Auto-reflexão: a cada N turnos (por pessoa, mesma lógica de
+    # consolidar_a_cada_turnos), pede pro extrator (mesmo cliente da
+    # extração de fatos -- tipicamente o modelo pequeno/decisor) observar
+    # o que a conversa recente revelou sobre a PRÓPRIA EVA, e grava como
+    # história/lore dela (usuario reservado, tipo semantica, fonte
+    # 'auto_reflexao', confiança baixa -- ver extrair_personalidade_propria
+    # em memory/extractor.py e _autorrefletir em orchestrator.py). V1
+    # deliberadamente simples: sem promoção de confiança por repetição,
+    # sem poda automática de observação que não se confirma -- ver como se
+    # comporta em uso real antes de complicar.
+    autorreflexao_ativa: bool = os.environ.get("EVA_AUTORREFLEXAO", "1") == "1"
+    autorreflexao_a_cada_turnos: int = int(
+        os.environ.get("EVA_AUTORREFLEXAO_INTERVALO", "40"))
+
 
 @dataclass
 class EstadoConfig:
@@ -233,9 +270,28 @@ class ConscienciaConfig:
     silencio_minimo: float = float(os.environ.get("EVA_SILENCIO_MIN", "40"))
     cooldown_fala: float = float(os.environ.get("EVA_COOLDOWN_FALA", "30"))
     limiar_base: float = float(os.environ.get("EVA_LIMIAR_FALA", "0.55"))
+    # Força do impulso "vazio" (silêncio comprido, sem fio nem evento
+    # específico -- ver FORCA_PADRAO em consciousness.py). Padrão 0.35
+    # inalterado -- essa análise NÃO decidiu que o valor está errado, só
+    # tornou ele configurável: com limiar_base=0.55 e os coeficientes de
+    # estado atuais, a matemática do portão faz "vazio" só passar quando
+    # curiosidade E energia estão simultaneamente no máximo (1.0) e
+    # estresse é zero -- condição de borda, não "às vezes". O próprio
+    # comentário em consciousness.py já diz que isso é DE PROPÓSITO ("o
+    # mais fraco, quase sempre barrado"). Se você decidir que quer ela
+    # puxando assunto do nada com mais frequência em condição normal (não
+    # só de borda), suba este valor -- mas teste em
+    # ferramentas/simular_portao.py antes de rodar numa call de verdade,
+    # mesma política dos dois campos acima.
+    forca_vazio: float = float(os.environ.get("EVA_INICIATIVA_VAZIO_FORCA", "0.35"))
     intervalo_tick: float = 5.0
     max_fios: int = 8
     horas_para_fio_azedar: float = 48.0
+    # Cooldown da pesquisa por curiosidade (ver bridge_client._tentar_curiosidade).
+    # Separado do TTL do impulso "pesquisa" (180s) -- sem isso, cada vez que o
+    # impulso expirasse sem ninguém ter ouvido, o tick seguinte tentaria
+    # pesquisar de novo: rajada de chamadas ao SearXNG por hora de silêncio.
+    cooldown_curiosidade: float = float(os.environ.get("EVA_COOLDOWN_CURIOSIDADE", "600"))
 
 
 @dataclass
@@ -329,17 +385,40 @@ class VozConfig:
     stt_modelo: str = os.environ.get("EVA_STT_MODEL", "whisper-large-v3-turbo")
     stt_idioma: str = os.environ.get("EVA_STT_IDIOMA", "pt")
 
-    # Backend de STT: "groq" (padrao, via API) ou "whisper_cpp" (local,
-    # binario compilado com Vulkan -- medido ~2x mais rapido que a Groq
-    # no mesmo audio de 25s, por eliminar o round-trip de rede). Exige
-    # compilar com GGML_VULKAN=1: o caminho HIP/ROCm crashou em runtime
-    # nesta maquina. Se pedido mas o binario/modelo nao forem achados,
-    # cai pra Groq com aviso em vez de travar (ver criar_stt em stt.py).
+    # Backend de STT: "groq" (padrao, via API) ou "whisper_cpp" (local, via
+    # SERVIDOR HTTP persistente do whisper.cpp -- ver WhisperCppServerSTT
+    # em stt.py). Exige compilar com GGML_VULKAN=1: o caminho HIP/ROCm
+    # crashou em runtime nesta maquina. Se pedido mas o servidor nao
+    # responder, cai pra Groq com aviso em vez de travar (ver criar_stt).
     stt_backend: str = os.environ.get("EVA_STT_BACKEND", "groq")
-    stt_whisper_cpp_exe: str = os.environ.get("EVA_STT_WHISPER_CPP_EXE", "")
+
+    # URL do servidor whisper.cpp (examples/server do repositorio) -- pra
+    # onde o cliente HTTP (WhisperCppServerSTT, ver stt.py) manda cada
+    # transcrição. Também usada pra derivar host/porta na hora de SUBIR o
+    # servidor (ver stt_whisper_cpp_server_exe abaixo e SupervisorWhisper
+    # em integrations/discord.py) e pra checar se ele já está rodando
+    # antes de tentar subir outro em cima (evitaria erro de porta em uso).
+    stt_whisper_cpp_url: str = os.environ.get("EVA_STT_WHISPER_CPP_URL", "http://127.0.0.1:8090")
+
+    # Caminho do BINÁRIO do servidor (whisper-server.exe -- gerado no
+    # mesmo build do whisper-cli, dentro de build*/bin/Release ou
+    # equivalente). Preencha isso pra discord.py subir o servidor sozinho
+    # junto com o bridge.js. Deixe vazio se preferir subir na mão num
+    # terminal separado (mesmo padrão que o LM Studio já usa hoje) --
+    # nesse caso discord.py detecta que já tem algo respondendo em
+    # stt_whisper_cpp_url e não tenta subir outro.
+    stt_whisper_cpp_server_exe: str = os.environ.get("EVA_STT_WHISPER_CPP_SERVER_EXE", "")
+    # Mesmo modelo que já era usado com o whisper-cli -- reaproveita o
+    # nome de variável que você já tinha no .env.
     stt_whisper_cpp_modelo: str = os.environ.get("EVA_STT_WHISPER_CPP_MODELO", "")
+    # Threads pro servidor (-t). Antes era passado por CHAMADA (cli, uma
+    # vez por frase); agora é passado uma vez só, na inicialização do
+    # servidor. Vazio = usa o padrão do binário (4).
+    stt_whisper_cpp_threads: int | None = int(os.environ.get("EVA_STT_WHISPER_CPP_THREADS", "0")) or None
 
     # TTS: Pocket TTS, unico backend. Suporta portugues via o modelo
+    # DESTILADO `portuguese` (pocket-tts >= 2.0.0) -- ver eva/voice/pocket.py
+    # pro mapeamento completo e o motivo de ter trocado do preview
     # `portuguese_24l`. Piper e edge-tts foram removidos -- manter tres
     # caminhos de sintese significava tres timbres diferentes e tres formas
     # de quebrar, e a clonagem de voz do Pocket e o motivo de existir voz.
@@ -347,6 +426,10 @@ class VozConfig:
     tts_idioma: str = os.environ.get("EVA_TTS_IDIOMA", "pt")
     # WAV de referencia para clonar a voz (5 segundos bastam).
     tts_voz: str = os.environ.get("EVA_TTS_VOZ", "")
+    # Quantizacao int8 do modelo de TTS (~30% mais rapido em CPU, medido
+    # pelo Kyutai, principalmente nos modelos "_24l"). Desligada por
+    # padrao -- ver aviso em eva/voice/pocket.py.
+    tts_quantize: bool = os.environ.get("EVA_TTS_QUANTIZE", "0") == "1"
 
     # Quanto acumular ANTES de mandar o play_start no streaming de voz
     # frase-a-frase, em ms de audio (48kHz estereo 16 bits). Absorve a
@@ -358,6 +441,28 @@ class VozConfig:
     # latency tipico do Pocket TTS (~200ms) com folga, sem atrasar a
     # resposta de forma perceptivel. Ajuste e meça no seu hardware.
     tts_pre_buffer_ms: int = int(os.environ.get("EVA_TTS_PRE_BUFFER_MS", "400"))
+
+    # Streaming de voz (frase a frase, play_start/play_chunk/play_end) vs.
+    # bloqueante (espera a resposta inteira + sintese inteira, so entao
+    # toca). SEGUNDA tentativa e SEGUNDA reversao: primeira vez, suspeita
+    # era o modelo de TTS antigo (portuguese_24l) perto do limite de tempo
+    # real em CPU; trocamos pro modelo destilado + forcamos CPU no Pocket
+    # (POCKET_TTS_DEVICE=cpu, ver pocket.py -- havia GPU AMD/ROCm entrando
+    # por auto-deteccao, kernel de atencao marcado experimental pelo
+    # proprio PyTorch) e o audio CONTINUOU ruim. Ou seja: nao era so a
+    # sintese. Suspeita agora migra pro mecanismo de PLAYBACK em si --
+    # bridge.js monta o audio em tempo real com um timer manual de 20ms
+    # (setInterval) puxando de um buffer que os pedacos preenchem
+    # conforme chegam (startPlayStream/pushPlayChunk), bem mais frágil que
+    # o caminho bloqueante: aquele manda o clipe inteiro pronto pro
+    # @discordjs/voice de uma vez (createAudioResource com stream comum),
+    # sem nenhum timer nosso tentando bater 20ms certinho por cima de um
+    # event loop que também está fazendo I/O de rede. Padrao voltou a ser
+    # bloqueante; codigo do streaming continua existindo (nao apaga
+    # investimento de engenharia por uma reversao), so nao roda por
+    # padrao. Ver _falar_stream em bridge_client.py para o historico
+    # completo.
+    voz_streaming: bool = os.environ.get("EVA_VOZ_STREAMING", "0") == "1"
 
     # Vocabulario passado ao Whisper para melhorar nomes proprios e termos
     # tecnicos que ele erraria sem contexto.
@@ -371,7 +476,16 @@ class DiscordConfig:
     # Se definido, a EVA responde a tudo nesse canal sem precisar de mencao.
     canal_dedicado: str = os.environ.get("EVA_DISCORD_CANAL", "")
     # Segundos de silencio para considerar que a pessoa terminou de falar.
-    silencio_para_responder: float = float(os.environ.get("EVA_VOZ_SILENCIO", "1.0"))
+    # AGORA REALMENTE USADO: o bridge.js le EVA_VOZ_SILENCIO direto do
+    # ambiente (mesma variavel, ele converte pra ms) e passa pro
+    # `duration` do EndBehaviorType.AfterSilence do @discordjs/voice --
+    # antes esse valor so existia aqui e o bridge.js tinha 1000ms fixo no
+    # codigo. Esse numero e um piso de latencia que se soma a QUALQUER
+    # backend de STT (a captura so termina depois desse silencio). Baixei
+    # o padrao pra 0.7s como ponto de partida; abaixo disso corre risco de
+    # cortar fala com pausa natural no meio -- meça numa call real e
+    # ajuste caso perceba a EVA interrompendo antes da pessoa terminar.
+    silencio_para_responder: float = float(os.environ.get("EVA_VOZ_SILENCIO", "0.7"))
 
 
 @dataclass
@@ -436,10 +550,15 @@ def _avisar_env_divergente() -> None:
         return
 
     valores_arquivo = dotenv_values(caminho)
-    # Só as credenciais que costumam ficar "presas" por engano em setup
-    # antigo. Não checa tudo: EVA_HOME ou EVA_USER divergirem do .env é
-    # uso normal (override intencional via $env:), não bug a sinalizar.
-    for chave in ("GROQ_API_KEY", "DISCORD_TOKEN"):
+    # Só as credenciais/seletores que costumam ficar "presas" por engano
+    # em setup antigo. Não checa tudo: EVA_HOME ou EVA_USER divergirem do
+    # .env é uso normal (override intencional via $env:), não bug a
+    # sinalizar. EVA_TTS_BACKEND e CARTESIA_API_KEY entraram aqui pelo
+    # mesmo motivo que abriu esta função pro GROQ_API_KEY: "editei o .env
+    # e nada mudou" é exatamente o sintoma de uma variável de sistema
+    # antiga vencendo em silêncio, e antes disso não havia checagem
+    # nenhuma pra troca de backend de TTS.
+    for chave in ("GROQ_API_KEY", "DISCORD_TOKEN", "EVA_TTS_BACKEND", "CARTESIA_API_KEY"):
         do_arquivo = valores_arquivo.get(chave)
         efetivo = os.environ.get(chave)
         if do_arquivo and efetivo and do_arquivo != efetivo:

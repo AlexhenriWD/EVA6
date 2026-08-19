@@ -164,45 +164,59 @@ class GroqSTT:
 
 # --------------------------------------------------- whisper.cpp local
 
-import subprocess
-import tempfile
 from pathlib import Path
 
 
-class WhisperCppSTT:
-    """STT local via whisper.cpp (binário compilado com Vulkan).
+class WhisperCppServerSTT:
+    """STT local via SERVIDOR persistente do whisper.cpp (examples/server
+    do próprio repositório), não mais via `subprocess.run()` por chamada.
 
-    Medido contra a Groq no mesmo áudio de 25s: 6.1s aqui vs 11.7s na
-    Groq -- quase 2x mais rápido, mesmos pesos (ggml-large-v3-turbo),
-    mesma transcrição. Elimina o round-trip de rede que era o maior
-    componente da latência de voz.
+    ACHADO REAL (log de call em produção): o tempo de STT ficava
+    praticamente CONSTANTE (~3s) não importa se o áudio tinha 1s ou 25s
+    de fala -- sinal claro de custo FIXO dominando, não custo
+    proporcional ao áudio. Causa: a versão anterior desta classe rodava
+    `subprocess.run([exe, "-m", modelo, ...])` a cada frase, e isso
+    recarrega o modelo GGML inteiro (large-v3-turbo, alguns GB) do disco
+    em TODA transcrição -- exatamente o mesmo problema que "Just-in-time
+    model loading" resolve pro LM Studio, só que aqui não existia
+    equivalente.
 
-    IMPORTANTE sobre o backend de aceleração: o binário PRECISA ter sido
-    compilado com Vulkan (GGML_VULKAN=1), não HIP/ROCm -- o caminho HIP
-    crashou em runtime nesta máquina (access violation, 0xC0000005,
-    provavelmente ligação de DLL). Isso é decidido na hora de compilar o
-    whisper.cpp, não em tempo de execução aqui -- esta classe não tem
-    como detectar ou trocar isso, só usar o binário que você apontar.
+    Fix: subir o mesmo binário como SERVIDOR (`./server -m modelo.bin
+    --port 8090`), que carrega o modelo UMA vez e fica residente. Esta
+    classe só faz o HTTP POST por chamada, igual ao GroqSTT (reusa
+    _montar_multipart, sem dependência nova).
+
+    IMPORTANTE: o servidor precisa estar rodando ANTES da EVA, num
+    terminal separado -- mesmo padrão operacional que já existe pro LM
+    Studio (processo próprio, de fora do Python). Não é auto-spawned
+    daqui de propósito: evita gerenciar ciclo de vida de subprocesso
+    (crash/restart) só pra economizar um comando manual.
+
+        ./server -m F:\\models\\whisper\\ggml-large-v3-turbo.bin ^
+            --host 127.0.0.1 --port 8090 -t 8
+
+    Continua exigindo o binário compilado com Vulkan (GGML_VULKAN=1), não
+    HIP/ROCm -- o caminho HIP crashou em runtime nesta máquina (access
+    violation, 0xC0000005). Confira o nome exato do binário/flags na sua
+    versão compilada (`./server --help`) -- muda entre versões do
+    whisper.cpp, mesmo espírito de instabilidade de SDK já documentado em
+    cartesia.py.
 
     Mesma interface pública do GroqSTT (transcrever_bytes, disponivel)
     de propósito -- bridge_client.py troca de um pro outro sem precisar
     saber qual está por trás.
     """
 
-    def __init__(
-        self,
-        exe: str,
-        modelo: str,
-        idioma: str | None = "pt",
-        timeout: int = 60,
-    ):
-        self.exe = exe
-        self.modelo = modelo
+    def __init__(self, url: str, idioma: str | None = "pt", timeout: int = 30):
+        self.url = url.rstrip("/")
         self.idioma = idioma
         self.timeout = timeout
 
     def disponivel(self) -> bool:
-        return bool(self.exe) and Path(self.exe).exists() and Path(self.modelo).exists()
+        # Checagem leve, sem golpear rede na inicialização -- confia na
+        # config; erro de conexão real aparece com mensagem clara na
+        # primeira chamada de transcrever_bytes().
+        return bool(self.url)
 
     def transcrever_bytes(
         self,
@@ -212,54 +226,50 @@ class WhisperCppSTT:
     ) -> Transcricao:
         """`prompt` é aceito pela mesma assinatura do GroqSTT mas
         ignorado aqui -- whisper.cpp não tem um parâmetro equivalente de
-        vocabulário guiado via linha de comando. O nome do parâmetro é
+        vocabulário guiado via este endpoint. O nome do parâmetro é
         mantido só para os dois backends serem intercambiáveis sem
         mudar a chamada em bridge_client.py.
         """
-        if not self.disponivel():
-            raise ErroSTT(
-                f"whisper.cpp não disponível: exe={self.exe!r} "
-                f"modelo={self.modelo!r} -- confira os dois caminhos"
-            )
         if not audio:
             raise ErroSTT("áudio vazio")
 
-        with tempfile.TemporaryDirectory() as tmp:
-            wav = Path(tmp) / nome
-            wav.write_bytes(audio)
-            prefixo = Path(tmp) / "saida"
+        campos = {"response_format": "json", "temperature": "0"}
+        if self.idioma:
+            campos["language"] = self.idioma
 
-            cmd = [
-                self.exe,
-                "-m", self.modelo,
-                "-f", str(wav),
-                "-otxt", "-of", str(prefixo),
-                "-nt",  # sem timestamp
-            ]
-            if self.idioma:
-                cmd += ["-l", self.idioma]
+        corpo, content_type = _montar_multipart(campos, (nome, audio))
+        req = urllib.request.Request(
+            f"{self.url}/inference", data=corpo,
+            headers={"Content-Type": content_type},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as r:
+                bruto = r.read()
+        except urllib.error.HTTPError as e:
+            detalhe = e.read().decode("utf-8", errors="replace")[:300]
+            raise ErroSTT(f"whisper.cpp server HTTP {e.code}: {detalhe}") from e
+        except urllib.error.URLError as e:
+            raise ErroSTT(
+                f"não consegui falar com o whisper.cpp server em {self.url}: "
+                f"{e.reason} -- ele está rodando? Ver docstring de "
+                f"WhisperCppServerSTT pro comando de subir ele."
+            ) from e
 
-            try:
-                proc = subprocess.run(
-                    cmd, capture_output=True, timeout=self.timeout,
-                )
-            except subprocess.TimeoutExpired as e:
-                raise ErroSTT(f"whisper.cpp excedeu {self.timeout}s") from e
+        # Normaliza a resposta -- builds diferentes do server variam
+        # entre devolver JSON {"text": "..."} ou texto puro, mesmo
+        # espírito defensivo de _extrair_bytes em cartesia.py.
+        try:
+            texto = json.loads(bruto).get("text", "")
+        except (json.JSONDecodeError, AttributeError):
+            texto = bruto.decode("utf-8", errors="replace")
 
-            if proc.returncode != 0:
-                erro = proc.stderr.decode("utf-8", errors="replace")[:400]
-                raise ErroSTT(f"whisper.cpp saiu com erro {proc.returncode}: {erro}")
-
-            arq = prefixo.with_suffix(".txt")
-            texto = arq.read_text(encoding="utf-8").strip() if arq.exists() else ""
-
-        # whisper.cpp não expõe no_speech_prob por linha de comando --
+        # whisper.cpp não expõe no_speech_prob por este endpoint --
         # prob_sem_fala fica None. parece_ruido() já trata None com
         # segurança (if t.prob_sem_fala is not None), então esse filtro
         # específico simplesmente não dispara com este backend; os
         # outros dois (texto vazio/curto, lista de alucinações) continuam
         # funcionando normalmente. Perda de precisão, não bug.
-        return Transcricao(texto=texto)
+        return Transcricao(texto=texto.strip())
 
     def transcrever_arquivo(self, caminho: str, prompt: str | None = None) -> Transcricao:
         with open(caminho, "rb") as f:
@@ -285,19 +295,17 @@ def criar_stt(voz_cfg) -> tuple[object, str | None]:
     nome = (voz_cfg.stt_backend or "groq").lower()
 
     if nome == "whisper_cpp":
-        inst = WhisperCppSTT(
-            exe=voz_cfg.stt_whisper_cpp_exe,
-            modelo=voz_cfg.stt_whisper_cpp_modelo,
+        inst = WhisperCppServerSTT(
+            url=voz_cfg.stt_whisper_cpp_url,
             idioma=voz_cfg.stt_idioma,
         )
         if inst.disponivel():
             return inst, None
         aviso = (
-            f"EVA_STT_BACKEND=whisper_cpp mas não achei o binário/modelo "
-            f"(exe={voz_cfg.stt_whisper_cpp_exe!r}, "
-            f"modelo={voz_cfg.stt_whisper_cpp_modelo!r}). Caindo para "
-            f"Groq -- confira EVA_STT_WHISPER_CPP_EXE e "
-            f"EVA_STT_WHISPER_CPP_MODELO no .env."
+            f"EVA_STT_BACKEND=whisper_cpp mas EVA_STT_WHISPER_CPP_URL não "
+            f"está definida. Caindo para Groq -- confira essa variável no "
+            f".env e se o servidor whisper.cpp (./server -m ...) está "
+            f"rodando."
         )
         return GroqSTT(
             api_key=voz_cfg.stt_chave, modelo=voz_cfg.stt_modelo,

@@ -173,6 +173,10 @@ def buscar(consulta: str) -> dict:
     vez de um traceback de conexão recusada sem contexto.
     """
     base_url = os.environ.get("EVA_SEARXNG_URL", "http://127.0.0.1:8080")
+    consulta = (consulta or "").strip()
+    print(f"[busca] consulta recebida: {consulta[:120]!r}")
+    if not consulta or len(consulta) < 2:
+        return {"erro": "consulta_vazia", "consulta": consulta}
 
     try:
         import urllib.error
@@ -196,13 +200,15 @@ def buscar(consulta: str) -> dict:
         # contexto sem ganho (o Context Builder já filtra chave começando
         # com "_", mas aqui é melhor nem gerar o excesso).
         primeiro = resultados[0]
+        resumo = primeiro.get("content") or primeiro.get("title") or None
+        print(f"[busca] resultado: resumo={(resumo or '')[:150]!r}")
         relacionados = [
             r.get("title", "") for r in resultados[1:4] if r.get("title")
         ]
 
         return {
             "consulta": consulta,
-            "resumo": primeiro.get("content") or primeiro.get("title") or None,
+            "resumo": resumo,
             "fonte": primeiro.get("url") or None,
             "relacionados": relacionados,
         }
@@ -229,4 +235,15 @@ def carregar_ferramentas():
         import sys
         print(f"[ferramentas] minecraft_tools não carregou ({e}) -- "
               f"ferramentas de Minecraft indisponíveis nesta sessão", file=sys.stderr)
+
+    try:
+        from . import robot_tools  # noqa: F401 -- mesmo padrão de minecraft_tools acima
+    except Exception as e:
+        # Robô é opcional pelo mesmo motivo: sem eva_command_server.py
+        # acessível, as ferramentas robo_* simplesmente não existem, e o
+        # resto do projeto continua normal.
+        import sys
+        print(f"[ferramentas] robot_tools não carregou ({e}) -- "
+              f"ferramentas de robô indisponíveis nesta sessão", file=sys.stderr)
+
     return registro

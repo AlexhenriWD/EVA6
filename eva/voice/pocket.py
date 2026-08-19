@@ -67,18 +67,35 @@ except ImportError:
 VOZ_PADRAO = "alba"
 FRAME_DISCORD = 3840  # 20ms em 48kHz estéreo s16le -- igual ao bridge.js
 
+# ATUALIZADO (pocket-tts v2.0.0+, abril/2026): o Kyutai lançou versões
+# DESTILADAS de 6 camadas pra francês, italiano, alemão, espanhol e
+# português -- "portuguese", não "portuguese_24l". Os "_24l" são os
+# modelos PREVIEW, 24 camadas, sem destilação, mantidos só pra quem
+# quiser comparar bugs entre as duas versões. Rodando em CPU, "_24l" tem
+# RTF visivelmente pior que a versão destilada (que fica na faixa de
+# "mais rápido que tempo real", igual o inglês) -- é a suspeita nº 1
+# para o áudio picotado que fez o streaming ser revertido em
+# bridge_client.py. Se `pip show pocket-tts` mostrar versão anterior a
+# 2.0.0, rode `pip install --upgrade pocket-tts` antes de usar "portuguese".
 IDIOMAS = {
     "english", "english_2026-01", "english_2026-04",
+    "portuguese", "italian", "german", "spanish",
     "french_24l", "german_24l", "portuguese_24l",
     "italian_24l", "spanish_24l",
 }
 
 # Mapeia código curto para o nome do modelo, para quem configura via
-# EVA_TTS_IDIOMA=pt não precisar saber do sufixo _24l
+# EVA_TTS_IDIOMA=pt não precisar saber do sufixo. "pt" agora vai pro
+# modelo destilado (rápido); quem quiser o preview de 24 camadas de
+# propósito (ex.: comparar qualidade) pode setar EVA_TTS_IDIOMA=
+# portuguese_24l diretamente -- não removido, só deixou de ser o padrão.
+# francês não tem versão destilada ainda (ver release notes do Kyutai:
+# "distillation do francês foi mais dolorosa que o esperado por
+# qualidade de dado"), então continua apontando pro _24l.
 ATALHOS = {
-    "pt": "portuguese_24l", "pt-br": "portuguese_24l",
-    "en": "english", "fr": "french_24l", "de": "german_24l",
-    "it": "italian_24l", "es": "spanish_24l",
+    "pt": "portuguese", "pt-br": "portuguese",
+    "en": "english", "fr": "french_24l", "de": "german",
+    "it": "italian", "es": "spanish",
 }
 
 
@@ -97,10 +114,11 @@ class PocketTTSEngine:
 
     def __init__(
         self,
-        idioma: str = "portuguese_24l",
+        idioma: str = "portuguese",
         voz: Optional[Union[str, Path]] = None,
         temp: float = 0.7,
         device: Optional[str] = None,
+        quantizar: Optional[bool] = None,
     ):
         if not POCKET_TTS_DISPONIVEL:
             raise ErroPocketTTS(
@@ -116,6 +134,15 @@ class PocketTTSEngine:
         self.voz = voz or os.environ.get("EVA_TTS_VOZ") or VOZ_PADRAO
         self.temp = temp
         self.device_pedido = device or os.environ.get("POCKET_TTS_DEVICE") or None
+        # Quantização int8 (docs/quantization.md do pocket-tts): ~30% de
+        # ganho medido pelo Kyutai, principalmente relevante nos modelos
+        # "_24l" de 24 camadas. Não ligado por padrão nos modelos
+        # destilados (6 camadas) -- ali o ganho é menor e ainda não
+        # validamos qualidade de voz com quantização + clonagem no seu
+        # hardware. EVA_TTS_QUANTIZE=1 liga explicitamente.
+        if quantizar is None:
+            quantizar = os.environ.get("EVA_TTS_QUANTIZE", "0") == "1"
+        self.quantizar = quantizar
 
         self.model = None
         self.voice_state = None
@@ -141,9 +168,12 @@ class PocketTTSEngine:
         return "cpu"
 
     def _carregar_sync(self) -> None:
-        print(f"[pocket-tts] carregando ({self.idioma})... pode demorar na 1ª vez", flush=True)
+        print(f"[pocket-tts] carregando ({self.idioma}"
+              f"{', quantize=int8' if self.quantizar else ''})... "
+              f"pode demorar na 1ª vez", flush=True)
         t0 = time.time()
-        self.model = TTSModel.load_model(language=self.idioma, temp=self.temp)
+        self.model = TTSModel.load_model(
+            language=self.idioma, temp=self.temp, quantize=self.quantizar)
 
         alvo = self._resolver_device()
         if alvo != "cpu":

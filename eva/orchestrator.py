@@ -37,6 +37,7 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
 from .config import EVAConfig, carregar_config
@@ -44,7 +45,7 @@ from .context import ContextBuilder
 from .decision import DecisorPorLLM, DecisorPorRegras, Plano, clientes_decisao
 from .identity import Pessoa, promover
 from .llm import ClienteLLM, ErroLLM, STOP_CONVERSA
-from .memory.extractor import extrair_por_llm, extrair_por_regras
+from .memory.extractor import extrair_por_llm, extrair_por_regras, extrair_personalidade_propria
 from .memory.store import BancoMemoria, USUARIO_HISTORIA
 from .state import GerenciadorEstado
 from .tools.builtin import carregar_ferramentas
@@ -200,11 +201,20 @@ class EVA:
         # 2. quem é a pessoa
         identidade = self._identidade(usuario)
 
-        # 3. buscar memória
-        memorias = self._buscar_memorias(plano, usuario, mensagem)
-
-        # 4. executar ferramentas
-        resultados = self._executar_ferramentas(plano)
+        # 3. buscar memória + 4. executar ferramentas -- independentes
+        # entre si (nenhuma usa o resultado da outra, as duas só dependem
+        # de `plano`/`usuario`/`mensagem`), então rodam em paralelo em vez
+        # de sequencial. O ganho real aparece quando plano.ferramentas
+        # inclui busca web: o SearXNG pode levar 1-3s (ou até os 10s de
+        # timeout da ferramenta, se o SearXNG estiver frio), e antes esse
+        # tempo se somava DEPOIS do tempo de busca de memória. Agora os
+        # dois correm ao mesmo tempo, e o turno espera só o mais lento dos
+        # dois, não a soma dos dois.
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futuro_memorias = pool.submit(self._buscar_memorias, plano, usuario, mensagem)
+            futuro_ferramentas = pool.submit(self._executar_ferramentas, plano)
+            memorias = futuro_memorias.result()
+            resultados = futuro_ferramentas.result()
 
         # 5. montar contexto
         ctx = self.builder.montar(
@@ -420,13 +430,30 @@ class EVA:
                 "procedural": self.cfg.memoria.max_procedimentos,
                 "personalidade": self.cfg.memoria.max_personalidade,
             }
-            for tipo, limite in limites.items():
-                achadas = self.memoria.buscar(
-                    plano.consulta_memoria, usuario=usuario, tipo=tipo,
-                    limite=limite, score_minimo=self.cfg.memoria.score_minimo,
-                )
-                if achadas:
-                    saida[tipo] = achadas
+            # Achado real ao investigar delay: as 4 chamadas abaixo usam o
+            # MESMO texto (plano.consulta_memoria), e cada uma disparava
+            # sua PRÓPRIA requisição de embedding pro LM Studio -- 4
+            # chamadas de rede por turno só pra gerar o mesmo vetor de
+            # novo. Calcula uma vez aqui e reusa nas 4 (ver
+            # BancoMemoria.calcular_embedding_consulta/buscar). Rodam em
+            # paralelo também: são independentes entre si (só o filtro de
+            # tipo muda), o SQLite já serializa a parte de banco pelo lock
+            # de BancoMemoria, então o ganho real é não empilhar a parte
+            # de CPU/rede de cada uma atrás da outra.
+            vetor_plano = self.memoria.calcular_embedding_consulta(plano.consulta_memoria)
+            with ThreadPoolExecutor(max_workers=len(limites)) as pool:
+                futuros = {
+                    tipo: pool.submit(
+                        self.memoria.buscar, plano.consulta_memoria, usuario=usuario,
+                        tipo=tipo, limite=limite, score_minimo=self.cfg.memoria.score_minimo,
+                        vetor_consulta=vetor_plano,
+                    )
+                    for tipo, limite in limites.items()
+                }
+                for tipo, futuro in futuros.items():
+                    achadas = futuro.result()
+                    if achadas:
+                        saida[tipo] = achadas
 
         # Fatos-núcleo entram SEMPRE, mesmo quando o plano dispensa memória.
         # A busca por palavra-chave falha justamente onde o fato mais importa,
@@ -447,27 +474,80 @@ class EVA:
         # este passo a busca de história nunca rodaria exatamente na pergunta
         # que deveria usá-la.
         if mensagem.strip():
-            historia = self.memoria.buscar(
-                mensagem, usuario=USUARIO_HISTORIA, tipo="semantica",
-                limite=self.cfg.memoria.max_historia,
-                score_minimo=self.cfg.memoria.score_minimo,
-            )
+            # Mesmo raciocínio do bloco acima: história e regras abaixo
+            # usam o MESMO texto (`mensagem`) em dois `buscar` separados --
+            # calcula o embedding uma vez e reusa nos dois, em paralelo.
+            vetor_mensagem = self.memoria.calcular_embedding_consulta(mensagem)
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                futuro_historia = pool.submit(
+                    self.memoria.buscar, mensagem, usuario=USUARIO_HISTORIA,
+                    tipo="semantica", limite=self.cfg.memoria.max_historia,
+                    score_minimo=self.cfg.memoria.score_minimo,
+                    vetor_consulta=vetor_mensagem,
+                )
+                # Regras gerais de comportamento dela mesma -- mesmo
+                # raciocínio da história acima (independente de
+                # precisa_memoria), mas tipo "procedural" em vez de
+                # "semantica": são "como agir" e não "fato", então entram
+                # no MESMO balde que já existe pra "como agir com essa
+                # pessoa" (ver ctx["preferencias"] em context.py) em vez de
+                # um rótulo novo -- mistura o "como agir com fulano" (por
+                # pessoa) com o "como eu costumo agir" (geral dela), mas os
+                # dois já são frases de orientação de comportamento; não há
+                # ambiguidade real de leitura para o modelo. Existe pra
+                # tirar "regra" específica demais da PERSONA
+                # estático (que fica cada vez mais longo e sem filtro de
+                # relevância) e mover pra algo buscado só quando bate com o
+                # assunto -- ver seed_capacidades_eva.py.
+                futuro_regras = pool.submit(
+                    self.memoria.buscar, mensagem, usuario=USUARIO_HISTORIA,
+                    tipo="procedural", limite=self.cfg.memoria.max_regras_propria,
+                    score_minimo=self.cfg.memoria.score_minimo,
+                    vetor_consulta=vetor_mensagem,
+                )
+                historia = futuro_historia.result()
+                regras = futuro_regras.result()
+
             if historia:
                 existentes = {m.id for m in saida.get("semantica", [])}
                 extras = [m for m in historia if m.id not in existentes]
                 if extras:
                     saida["semantica"] = saida.get("semantica", []) + extras
+
+            if regras:
+                existentes = {m.id for m in saida.get("procedural", [])}
+                extras = [m for m in regras if m.id not in existentes]
+                if extras:
+                    saida["procedural"] = saida.get("procedural", []) + extras
         return saida
 
     def _executar_ferramentas(self, plano: Plano) -> dict:
         if not plano.precisa_ferramenta:
             return {}
-        saida = {}
-        for f in plano.ferramentas:
-            nome = f.get("nome")
-            if not nome:
-                continue
-            saida[nome] = self.ferramentas.executar(nome, **(f.get("args") or {}))
+        chamadas = [
+            (f.get("nome"), f.get("args") or {})
+            for f in plano.ferramentas if f.get("nome")
+        ]
+        if not chamadas:
+            return {}
+        if len(chamadas) == 1:
+            nome, args = chamadas[0]
+            return {nome: self.ferramentas.executar(nome, **args)}
+
+        # Mais de uma ferramenta no mesmo plano: rodam em paralelo. Eram
+        # sequenciais antes (um for simples), e cada ferramenta é uma
+        # chamada própria (ex.: busca web no SearXNG pode levar 1-3s+),
+        # então dois planos com ferramenta dupla pagavam a SOMA dos dois
+        # tempos por padrão -- nenhuma ferramenta depende do resultado de
+        # outra dentro do mesmo turno, não há motivo para isso ser serial.
+        saida: dict = {}
+        with ThreadPoolExecutor(max_workers=len(chamadas)) as pool:
+            futuros = {
+                pool.submit(self.ferramentas.executar, nome, **args): nome
+                for nome, args in chamadas
+            }
+            for futuro, nome in futuros.items():
+                saida[nome] = futuro.result()
         return saida
 
     def _pos_processar(self, mensagem: str, resposta: str, plano: Plano,
@@ -522,6 +602,17 @@ class EVA:
         if (self.cfg.memoria.consolidar_com_llm and intervalo > 0
                 and turnos_novo % intervalo == 0):
             self._disparar_consolidacao(usuario)
+
+        # Auto-reflexão: a EVA "olhando pra trás" pro que ela mesma acabou
+        # de dizer, tentando notar traço específico que apareceu nessa
+        # troca. Mesmo gatilho por contagem de turnos que a consolidação
+        # acima (intervalo próprio, EVA_AUTORREFLEXAO_INTERVALO) -- não
+        # tem por que rodar em todo turno, e reflexão sobre um só turno
+        # tende a supergeneralizar de uma amostra pequena demais.
+        intervalo_reflexao = self.cfg.memoria.autorreflexao_a_cada_turnos
+        if (self.cfg.memoria.autorreflexao_ativa and intervalo_reflexao > 0
+                and resposta and turnos_novo % intervalo_reflexao == 0):
+            self._disparar_autorreflexao(usuario)
 
         # estado interno
         #
@@ -723,6 +814,55 @@ class EVA:
         except Exception as e:
             if self.cfg.debug:
                 print(f"[consolidacao] erro para {usuario}: {e}")
+
+    def _disparar_autorreflexao(self, usuario: str) -> None:
+        """Mesmo padrão dual sync/async de _disparar_extracao_llm --
+        thread solta no caminho síncrono, task no caminho async.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        if loop is not None:
+            loop.create_task(self._autorrefletir_async(usuario))
+        else:
+            threading.Thread(
+                target=self._autorrefletir, args=(usuario,), daemon=True
+            ).start()
+
+    async def _autorrefletir_async(self, usuario: str) -> None:
+        await asyncio.to_thread(self._autorrefletir, usuario)
+
+    def _autorrefletir(self, usuario: str) -> None:
+        """O trabalho de verdade: pega o histórico recente, pede pro
+        extrator (llm_extrator -- mesmo cliente da extração de fatos,
+        aponta pro que EVA_MEMORIA_LLM_MODEL/EVA_DECISION_MODEL configurar,
+        tipicamente o modelo pequeno/decisor, ex. minicpm-v-4.6) uma
+        observação sobre a PRÓPRIA EVA, e grava como história/lore dela --
+        mesmo usuário reservado e mesmo tipo que seed_historia_eva.py, só
+        com fonte='auto_reflexao' e confiança mais baixa (ver
+        extrair_personalidade_propria em memory/extractor.py) pra ficar
+        auditável e distinguível do que foi escrito à mão.
+
+        Roda fora do caminho principal, mesma política de _extrair_e_salvar:
+        exceção aqui nunca derruba a conversa, só fica no log.
+        """
+        try:
+            historico = self.memoria.historico(usuario=usuario, limite=8)
+            observacoes = extrair_personalidade_propria(historico, self.llm_extrator)
+            for obs in observacoes:
+                id_ = self.memoria.adicionar(
+                    tipo=obs["tipo"], conteudo=obs["conteudo"],
+                    usuario=USUARIO_HISTORIA, fonte=obs["fonte"],
+                    confianca=obs["confianca"],
+                )
+                if id_:
+                    print(f"[autorreflexao] nova observação: {obs['conteudo']}")
+            if not observacoes and self.cfg.debug:
+                print(f"[autorreflexao] nada específico neste lote (usuario={usuario})")
+        except Exception as e:
+            print(f"[autorreflexao] erro: {e}")
 
     def fechar(self) -> None:
         self.estado.salvar()

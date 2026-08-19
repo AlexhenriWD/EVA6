@@ -102,11 +102,33 @@ class ClienteLLM:
             "stop": STOP_PADRAO if parar is None else parar,
             "stream": False,
         }
+        self._aplicar_penalidades(payload)
         dados = self._post("/chat/completions", payload)
         try:
             return dados["choices"][0]["message"]["content"].strip()
         except (KeyError, IndexError) as e:
             raise ErroLLM(f"resposta em formato inesperado: {str(dados)[:200]}") from e
+
+    def _aplicar_penalidades(self, payload: dict) -> None:
+        """Adiciona repeat_penalty/frequency_penalty/presence_penalty ao
+        payload SE a config tiver esses campos -- nem toda config tem
+        (ex: _ConfigExtrator em orchestrator.py, usado pela extração de
+        fatos/auto-reflexão, não define nenhum dos três -- getattr com
+        default None e checagem evita adicionar o campo nesse caso, sem
+        quebrar nada). Só usado por completar()/completar_stream() --
+        completar_com_ferramenta() (decisor/extração, JSON determinístico
+        com temperatura 0) fica de fora de propósito: penalizar repetição
+        ali pode atrapalhar sintaxe JSON legítima.
+        """
+        rp = getattr(self.cfg, "repeat_penalty", None)
+        if rp is not None:
+            payload["repeat_penalty"] = rp
+        fp = getattr(self.cfg, "frequency_penalty", None)
+        if fp is not None:
+            payload["frequency_penalty"] = fp
+        pp = getattr(self.cfg, "presence_penalty", None)
+        if pp is not None:
+            payload["presence_penalty"] = pp
 
     def completar_com_ferramenta(
         self,
@@ -188,6 +210,7 @@ class ClienteLLM:
             "stop": STOP_PADRAO if parar is None else parar,
             "stream": True,
         }
+        self._aplicar_penalidades(payload)
         url = self.cfg.base_url.rstrip("/") + "/chat/completions"
         req = urllib.request.Request(
             url,

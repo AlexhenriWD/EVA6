@@ -47,6 +47,7 @@ from __future__ import annotations
 import asyncio
 import json
 import queue
+import random
 import time
 from dataclasses import dataclass, field
 
@@ -57,6 +58,7 @@ except ImportError:  # pragma: no cover
 
 from ..config import EVAConfig, carregar_config
 from ..orchestrator import EVA
+from ..tools import robot_tools
 from ..voice.audio import (
     ErroAudio,
     alinhar_frames,
@@ -76,6 +78,13 @@ class EstadoGuild:
     # Instante em que a fala terminou. Usado para ignorar o eco por um
     # tempinho depois -- o Discord continua entregando pacotes atrasados.
     fim_da_fala: float = 0.0
+    # Instante em que o STT terminou de transcrever a fala atual -- ponto
+    # de partida pra medir "tempo até o primeiro som" (ver `falar` e
+    # `_falar_stream`). Fica no estado da guild, não como parâmetro
+    # passado adiante por 3-4 funções, porque só existe um turno de voz
+    # em andamento por guild de cada vez (`est.processando` já garante
+    # isso).
+    t_stt_fim: float = 0.0
     processando: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     # --- multicanal: agregação quando mais de uma pessoa fala por perto ---
@@ -104,15 +113,32 @@ class ClienteBridge:
             self.tts = criar_tts(
                 backend=self.cfg.voz.tts_backend or None,
                 idioma=self.cfg.voz.tts_idioma,
+                quantizar=self.cfg.voz.tts_quantize,
             )
+            print(f"[tts] backend ativo: {self.tts.nome} "
+                  f"(EVA_TTS_BACKEND={self.cfg.voz.tts_backend!r})")
         except ErroTTS as e:
             self.erro_tts = str(e)
+            # ACHADO REAL: antes disto, um ErroTTS aqui (chave da Cartesia
+            # faltando, EVA_TTS_CARTESIA_VOICE errado, etc.) ficava só
+            # guardado em self.erro_tts, sem UM print sequer -- só
+            # aparecia se alguém abrisse o dashboard e olhasse
+            # diagnostico(). É o motivo mais provável de "troquei
+            # EVA_TTS_BACKEND e não vejo diferença nenhuma": o backend
+            # pedido falhou ao criar, self.tts virou None, e a EVA fica
+            # muda em silêncio -- sem erro nenhum no console apontando
+            # o motivo. Mesmo padrão do EVA_DECISION_GROQ com chave em
+            # branco que já apareceu neste projeto.
+            print(f"[tts] ERRO ao carregar backend {self.cfg.voz.tts_backend!r}: {e}")
+            print(f"[tts] EVA vai ficar SEM VOZ até isso ser corrigido "
+                  f"(dashboard mostra o mesmo erro em '/', seção Voz).")
 
         self.ws = None
         self.guilds: dict[str, EstadoGuild] = {}
         from ..consciousness import Consciencia
         self.consciencias: dict[str, Consciencia] = {}
         self._tarefas_consciencia: dict[str, asyncio.Task] = {}
+        self._ultima_curiosidade: dict[str, float] = {}
 
         # Visão: uma instância só (há uma tela, a do PC rodando a EVA --
         # não uma por guild como Consciencia, que é por canal porque cada
@@ -133,12 +159,30 @@ class ClienteBridge:
                     f"Rode: pip install mss pillow numpy"
                 )
         self._tarefa_visao: asyncio.Task | None = None
+        self._tarefa_corpo: asyncio.Task | None = None
         self._dashboard = None  # criado em rodar(), só se cfg.dashboard.ativa
         self._guilds_com_call: set[str] = set()
 
         # O bridge manda o cabeçalho JSON e logo depois o quadro binário.
         # Guardamos o cabeçalho para saber de quem é o áudio que vem a seguir.
         self._audio_pendente: dict | None = None
+        # PROTEGE O SENTIDO CONTRÁRIO: cabeçalho JSON (play/play_start/
+        # play_chunk) + quadro binário que o BRIDGE.JS espera receber em
+        # sequência imediata (pendingAudioFor, do lado dele, também não é
+        # fila -- é UMA variável, sobrescrita pelo cabeçalho mais recente).
+        # self.ws é uma conexão só, compartilhada entre falar() (fala
+        # espontânea, chamada pelo laço de consciência) e _falar_stream()
+        # (resposta em streaming) -- sem lock, um `await` no meio dos dois
+        # sends (cabeçalho, then payload) dá brecha pro event loop trocar
+        # de tarefa e a OUTRA tarefa mandar o cabeçalho dela no meio,
+        # sobrescrevendo pendingAudioFor antes do primeiro payload sair.
+        # O binário chega depois pro cabeçalho ERRADO -- Node toca no guild
+        # errado, ou o parsing sai torto, dependendo do timing exato. Não é
+        # o bug confirmado desta rodada (esse foi a GPU/ROCm), mas é risco
+        # real sempre que consciência e resposta normal puderem coincidir
+        # no tempo, então corrigido de qualquer forma -- ver falar() e
+        # _falar_stream() abaixo, agora sempre dentro deste lock.
+        self._envio_audio_lock = asyncio.Lock()
         # Silêncio a ignorar após a EVA falar, em segundos
         self.janela_eco = 0.6
         # Multicanal: se ALGUÉM MAIS falou dentro desse tempo, a fala atual
@@ -180,14 +224,25 @@ class ClienteBridge:
         tentativa se as duas falharem, para quem chama continuar
         tratando do jeito que já tratava (a assinatura de erro não
         muda, só passa a acontecer depois de 2 tentativas em vez de 1).
+
+        ACHADO REAL: o log do servidor do LM Studio não mostra ISTO --
+        Groq e whisper.cpp nunca passam pela porta do LM Studio, então
+        aquele log só começa a contar a partir de quando o texto já
+        existe. O print abaixo fecha a outra metade: sem ele, "1 a 3
+        segundos entre eu falar e a EVA responder" ficava sem forma de
+        separar quanto é transcrição e quanto é o resto do pipeline.
         """
         ultimo_erro: Exception | None = None
+        _t0 = time.time()
         for tentativa in range(2):
             try:
-                return await asyncio.to_thread(
+                t = await asyncio.to_thread(
                     self.stt.transcrever_bytes, audio, nome,
                     self.cfg.voz.stt_vocabulario,
                 )
+                print(f"[tempo] stt ({self.cfg.voz.stt_backend}): "
+                      f"{int((time.time() - _t0) * 1000)}ms")
+                return t
             except Exception as e:
                 ultimo_erro = e
                 if tentativa == 0:
@@ -233,6 +288,42 @@ class ClienteBridge:
             if self.cfg.debug:
                 print(f"[lacuna] impulso registrado: {resumo[:80]}")
 
+    def _tentar_curiosidade(self, guild_id: str, c) -> None:
+        """Dispara pesquisa por conta própria quando não há fio nem evento
+        pendurado -- é a versão PROATIVA do que hoje só existe REATIVO
+        (possivel_lacuna, depois de uma mensagem do usuário). Não decide
+        falar agora: só alimenta a fila pro(s) PRÓXIMO(s) tick(s), com força
+        de "pesquisa" (0.60) em vez do "vazio" (0.35) de sempre.
+        """
+        agora = time.time()
+        if agora - self._ultima_curiosidade.get(guild_id, 0.0) < self.cfg.consciencia.cooldown_curiosidade:
+            return
+        if any(not f.usado for f in c.fios):
+            return
+
+        topico = self._topico_de_curiosidade(c.ultimo_falante or self.cfg.usuario)
+        if not topico:
+            return
+
+        self._ultima_curiosidade[guild_id] = agora
+        asyncio.create_task(self._pesquisar_e_registrar(guild_id, topico))
+        if self.cfg.debug:
+            print(f"[curiosidade] pesquisando sozinha: {topico[:80]!r}")
+
+    def _topico_de_curiosidade(self, usuario: str) -> str | None:
+        """Assunto pra puxar sozinha, tirado de memória episódica recente --
+        retomar algo que a pessoa mencionou é mais crível que pesquisar
+        tópico genérico do nada (mesma filosofia de 'fio', virando busca).
+        """
+        try:
+            recentes = self.eva.memoria.listar(usuario=usuario, tipo="episodica", limite=8)
+        except Exception:
+            return None
+        if not recentes:
+            return None
+        escolhida = random.choice(recentes)
+        return f"novidades sobre: {escolhida.conteudo[:120]}"
+
     def _tts_tocando(self, guild_id: str) -> bool:
         return self.estado(guild_id).falando
 
@@ -248,6 +339,10 @@ class ClienteBridge:
         num setup pessoal) continuam compartilhando a mesma captura.
         """
         self._guilds_com_call.add(str(guild_id))
+        # Corpo físico (robot_tools._ciclo_iniciativa) só age sozinho
+        # quando tem gente numa call -- mesmo _guilds_com_call de sempre,
+        # só que sinalizado pra outra thread via threading.Event.
+        robot_tools.definir_em_call(bool(self._guilds_com_call))
         if self.visao is None or self.visao.ativo:
             return
         self.visao.ligar()
@@ -259,6 +354,7 @@ class ClienteBridge:
         individualmente, senão duas calls simultâneas desligariam a visão
         uma da outra."""
         self._guilds_com_call.discard(str(guild_id))
+        robot_tools.definir_em_call(bool(self._guilds_com_call))
         if self.visao is None or self._guilds_com_call:
             return
         self.visao.desligar()
@@ -291,6 +387,25 @@ class ClienteBridge:
                 # voz, texto ou consciência, que são o núcleo da conversa.
                 print(f"[visao] erro no laço: {e}")
 
+    async def _laco_corpo(self) -> None:
+        """Drena eventos corporais (transição de segurança, recusa de
+        comando -- ver robot_tools.drenar_eventos_corpo) e empurra pra
+        Consciencia de toda guild com call ativa, mesmo padrão de
+        _laco_visao. Roda sempre, mesmo sem robô configurado -- drenar
+        uma fila vazia é barato, e evita mais um "só liga se" espalhado.
+        """
+        while True:
+            await asyncio.sleep(2.0)
+            try:
+                eventos = robot_tools.drenar_eventos_corpo()
+            except Exception as e:
+                print(f"[corpo] erro ao drenar eventos: {e}")
+                continue
+            for evento in eventos:
+                print(f"[corpo] evento: {evento}")
+                for gid in list(self._guilds_com_call):
+                    self.consciencia(gid).evento_corporal(evento)
+
     async def _laco_consciencia(self, guild_id: str) -> None:
         """Bate no portão de tempos em tempos. Não decide nada -- só pergunta."""
         c = self.consciencia(guild_id)
@@ -303,6 +418,10 @@ class ClienteBridge:
                 v = c.tick(self.eva.estado.estado)
                 if self.cfg.debug and not v.passou:
                     print(f"[consciencia] {v}")
+
+                if v.impulso is not None and v.impulso.tipo == "vazio":
+                    self._tentar_curiosidade(guild_id, c)
+
                 if not v.passou:
                     continue
 
@@ -364,19 +483,29 @@ class ClienteBridge:
 
         est.falando = True
         print(f"[voz] falando {duracao_segundos(pcm):.1f}s")
-        # O cabeçalho JSON avisa o bridge que o próximo quadro é áudio
-        await self._enviar({"type": "play", "guild_id": str(guild_id)})
-        await self.ws.send(pcm)
+        # O cabeçalho JSON avisa o bridge que o próximo quadro é áudio --
+        # dentro do lock (ver __init__): sem isso, uma fala espontânea e
+        # esta poderiam intercalar cabeçalho/payload uma da outra.
+        async with self._envio_audio_lock:
+            await self._enviar({"type": "play", "guild_id": str(guild_id)})
+            await self.ws.send(pcm)
+
+        # "Tempo até o primeiro som": do fim da transcrição até o áudio
+        # sair pelo WebSocket. Só faz sentido se este `falar` veio de uma
+        # resposta a algo que a pessoa disse AGORA -- guarda contra
+        # imprimir um número gigante e sem sentido quando `falar` é
+        # chamado por fala espontânea (falar_sozinha), que não tem STT
+        # nenhum acontecendo antes.
+        if est.t_stt_fim and (time.time() - est.t_stt_fim) < 30:
+            print(f"[tempo] até o primeiro som (bloqueante): "
+                  f"{int((time.time() - est.t_stt_fim) * 1000)}ms")
 
     async def _falar_stream(self, guild_id: str, mensagem: str, usuario: str,
                             contexto_visual: str | None,
                             modo_multicanal: bool = False):
-        """SEM CHAMADOR ATUALMENTE -- _responder_a voltou a usar falar()
-        (não-streaming), por pedido explícito depois de teste real com
-        áudio saindo fragmentado/incompreensível. Mantido aqui sem
-        remover -- se algum dia a causa raiz do problema de streaming for
-        encontrada e corrigida, isso volta a ser útil sem reescrever do
-        zero. Não chama isso de lugar nenhum por enquanto.
+        """Chamado por `_responder_a_stream` quando EVA_VOZ_STREAMING=1
+        (padrão -- ver config.py e o histórico na docstring de
+        `_responder_a_stream`).
 
         Substitui responder_async()+falar() no turno de voz: o LLM gera
         frase a frase, cada frase é sintetizada e mandada pro bridge assim
@@ -410,9 +539,13 @@ class ClienteBridge:
 
         async def _iniciar_reproducao(dados: bytes) -> None:
             est.falando = True
-            await self._enviar({"type": "play_start", "guild_id": str(guild_id)})
-            await self._enviar({"type": "play_chunk", "guild_id": str(guild_id)})
-            await self.ws.send(dados)
+            async with self._envio_audio_lock:
+                await self._enviar({"type": "play_start", "guild_id": str(guild_id)})
+                await self._enviar({"type": "play_chunk", "guild_id": str(guild_id)})
+                await self.ws.send(dados)
+            if est.t_stt_fim and (time.time() - est.t_stt_fim) < 30:
+                print(f"[tempo] até o primeiro som (streaming): "
+                      f"{int((time.time() - est.t_stt_fim) * 1000)}ms")
 
         while True:
             tipo, dado = await asyncio.to_thread(fila.get)
@@ -425,8 +558,9 @@ class ClienteBridge:
                     pre_buffer.clear()
                     iniciou = True
                     continue
-                await self._enviar({"type": "play_chunk", "guild_id": str(guild_id)})
-                await self.ws.send(dado)
+                async with self._envio_audio_lock:
+                    await self._enviar({"type": "play_chunk", "guild_id": str(guild_id)})
+                    await self.ws.send(dado)
             elif tipo == "fim":
                 resultado = dado
                 break
@@ -541,12 +675,16 @@ class ClienteBridge:
         # estivesse em andamento -- inviabilizaria agregação de verdade,
         # porque a decisão "tem mais gente falando" depende de conseguir
         # processar as duas em paralelo.
+        _t_audio_chegou = time.time()
         wav = pcm_para_wav(pcm)
         try:
             t = await self._transcrever(wav)
         except Exception as e:
             print(f"[stt] {e}")
             return
+        print(f"[tempo] áudio recebido -> transcrição pronta: "
+              f"{int((time.time() - _t_audio_chegou) * 1000)}ms")
+        est.t_stt_fim = time.time()
 
         if parece_ruido(t):
             return
@@ -585,15 +723,81 @@ class ClienteBridge:
         """Gera e fala a resposta de um turno -- caminho compartilhado
         pelo modo de uma pessoa só e pelo modo multicanal agregado.
 
-        NÃO usa mais streaming (gerar_frase_stream_sync / play_start +
-        play_chunk) -- revertido a pedido explícito, depois de teste real
-        mostrar áudio saindo fragmentado/incompreensível com streaming
-        ligado. Delay maior (espera a resposta inteira, depois sintetiza
-        inteira, só então toca) é preferível a voz ilegível. `falar()`
-        (síntese completa via gerar_para_discord -- split por sentença,
-        normalização única, mensagem "play" só, sem fragmentar) é o mesmo
-        caminho que a fala espontânea (falar_sozinha) sempre usou e nunca
-        teve esse problema.
+        Escolhe entre as duas estratégias abaixo via `EVA_VOZ_STREAMING`
+        (config.py) -- ver docstrings de cada uma para o histórico.
+        """
+        if self.cfg.voz.voz_streaming:
+            await self._responder_a_stream(guild_id, mensagem, usuario, modo_multicanal)
+        else:
+            await self._responder_a_bloqueante(guild_id, mensagem, usuario, modo_multicanal)
+
+    async def _responder_a_stream(self, guild_id: str, mensagem: str, usuario: str,
+                                  modo_multicanal: bool = False) -> None:
+        """Caminho em streaming: fala já na primeira frase pronta, via
+        `_falar_stream` (play_start/play_chunk/play_end).
+
+        DESLIGADO POR PADRÃO (EVA_VOZ_STREAMING=0) -- SEGUNDA tentativa,
+        SEGUNDA reversão. Histórico:
+
+        1ª tentativa: áudio saiu fragmentado. Suspeita: `portuguese_24l`
+        (TTS antigo, 24 camadas sem destilação) rodando com RTF perto do
+        limite de tempo real em CPU -- `gerar_frase_stream_sync` não
+        produzia áudio mais rápido do que o bridge.js consumia, a fila
+        esvaziava, e o preenchimento de silêncio soava fragmentado.
+
+        2ª tentativa (depois de trocar pro modelo destilado + forçar
+        POCKET_TTS_DEVICE=cpu -- havia GPU AMD entrando por auto-detecção
+        via ROCm, kernel de atenção que o próprio PyTorch marca como
+        experimental): áudio CONTINUOU ruim. Ou seja, a causa não era só
+        velocidade de síntese. Suspeita agora é o mecanismo de PLAYBACK:
+        bridge.js monta o áudio com um timer manual de 20ms (setInterval)
+        puxando de um buffer preenchido conforme os pedaços chegam --
+        muito mais frágil que o caminho bloqueante, que entrega o clipe
+        inteiro pronto pro @discordjs/voice de uma vez, sem nenhum timer
+        nosso competindo com o event loop (que também está fazendo I/O de
+        rede) pra bater 20ms certinho.
+
+        Não removido do código -- só não roda por padrão. Se um dia valer
+        revisitar (ex: mudar a estratégia de playback em si, não só a
+        síntese), o caminho já está aqui, testado duas vezes, com o motivo
+        de cada reversão documentado -- não precisa reconstruir do zero
+        nem repetir os mesmos dois experimentos.
+        """
+        est = self.estado(guild_id)
+        async with est.processando:
+            contexto_visual = await self._contexto_visual_para(mensagem)
+            r = await self._falar_stream(
+                guild_id, mensagem, usuario, contexto_visual,
+                modo_multicanal=modo_multicanal)
+
+            if r is None or r.erro:
+                if r and r.erro:
+                    print(f"[eva] {r.erro}")
+                return
+            if not r.resposta:
+                return
+
+            print(f"[eva] {r.resposta}")
+            self.consciencia(guild_id).ela_falou()
+
+            # Lacuna de conhecimento: a mensagem tocou em algo que pode
+            # estar desatualizado no que a EVA sabe. Não bloqueia nada --
+            # dispara como task solta; se terminar, vira impulso de
+            # iniciativa; se não terminar a tempo ou não achar nada, não
+            # acontece nada (sem aviso, sem erro visível).
+            if r.plano.possivel_lacuna:
+                asyncio.create_task(
+                    self._pesquisar_e_registrar(guild_id, r.plano.possivel_lacuna))
+
+    async def _responder_a_bloqueante(self, guild_id: str, mensagem: str, usuario: str,
+                                      modo_multicanal: bool = False) -> None:
+        """Caminho original, preservado como fallback via EVA_VOZ_STREAMING=0.
+
+        Espera a resposta inteira do LLM, depois sintetiza tudo de uma vez
+        (`falar()`/`gerar_para_discord` -- split por sentença, normalização
+        única, mensagem "play" só, sem fragmentar), só então toca. Mais
+        devagar, mas é o caminho que `falar_sozinha` (fala espontânea)
+        sempre usou e nunca teve problema de fragmentação.
         """
         est = self.estado(guild_id)
         async with est.processando:
@@ -613,11 +817,6 @@ class ClienteBridge:
             await self.falar(guild_id, r.resposta)
             self.consciencia(guild_id).ela_falou()
 
-            # Lacuna de conhecimento: a mensagem tocou em algo que pode
-            # estar desatualizado no que a EVA sabe. Não bloqueia nada --
-            # dispara como task solta; se terminar, vira impulso de
-            # iniciativa; se não terminar a tempo ou não achar nada, não
-            # acontece nada (sem aviso, sem erro visível).
             if r.plano.possivel_lacuna:
                 asyncio.create_task(
                     self._pesquisar_e_registrar(guild_id, r.plano.possivel_lacuna))
@@ -881,6 +1080,8 @@ class ClienteBridge:
             self._dashboard = ServidorDashboard(self)
             self._dashboard.iniciar()
 
+        self._tarefa_corpo = asyncio.create_task(self._laco_corpo())
+
         tentativa = 0
         while True:
             try:
@@ -911,6 +1112,34 @@ class ClienteBridge:
             finally:
                 self.ws = None
 
+    def trocar_tts(self, backend: str) -> dict:
+        """Troca o backend de TTS EM RUNTIME, sem reiniciar o processo.
+
+        Ao contrário de `visao.ativa`/`usar_embeddings` (que só são lidos
+        UMA VEZ na inicialização -- ver docstring de dashboard.py), dar
+        suporte a troca ao vivo aqui é simples: `self.tts` é só uma
+        referência que `falar`/`_falar_stream` leem a cada chamada, então
+        trocar essa referência JÁ é a mudança -- não precisa recriar
+        ClienteBridge nem nada em volta.
+
+        Levanta ErroTTS com a mensagem exata de `criar_tts` se o backend
+        pedido falhar (chave faltando, pacote não instalado, etc.) --
+        quem chama (dashboard) mostra isso direto pra você, em vez de você
+        precisar ir atrás de log de console. `self.tts` só é sobrescrito
+        em caso de SUCESSO -- uma troca que falha não derruba o backend
+        que já estava funcionando.
+        """
+        novo = criar_tts(
+            backend=backend,
+            idioma=self.cfg.voz.tts_idioma,
+            quantizar=self.cfg.voz.tts_quantize,
+        )
+        self.tts = novo
+        self.erro_tts = None
+        self.cfg.voz.tts_backend = backend
+        print(f"[tts] backend trocado em runtime para: {novo.nome}")
+        return {"backend": novo.nome}
+
     def diagnostico(self) -> dict:
         d = self.eva.diagnostico()
         d.update({
@@ -927,6 +1156,8 @@ class ClienteBridge:
             self._cancelar_laco_consciencia(gid)
         if self._tarefa_visao and not self._tarefa_visao.done():
             self._tarefa_visao.cancel()
+        if self._tarefa_corpo and not self._tarefa_corpo.done():
+            self._tarefa_corpo.cancel()
         if self.visao:
             self.visao.fechar()
         if self._dashboard:
