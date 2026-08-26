@@ -167,6 +167,22 @@ class GroqSTT:
 from pathlib import Path
 
 
+def _duracao_wav(dados: bytes) -> float | None:
+    """Duração em segundos de um WAV em memória, ou None se não der pra
+    saber com segurança."""
+    import io
+    import wave
+
+    try:
+        with wave.open(io.BytesIO(dados), "rb") as w:
+            taxa = w.getframerate()
+            if not taxa:
+                return None
+            return w.getnframes() / float(taxa)
+    except Exception:
+        return None
+
+
 class WhisperCppServerSTT:
     """STT local via SERVIDOR persistente do whisper.cpp (examples/server
     do próprio repositório), não mais via `subprocess.run()` por chamada.
@@ -236,6 +252,52 @@ class WhisperCppServerSTT:
         campos = {"response_format": "json", "temperature": "0"}
         if self.idioma:
             campos["language"] = self.idioma
+
+        # audio_ctx proporcional à duração do clipe.
+        #
+        # O encoder do Whisper processa uma janela FIXA de 30s (contexto
+        # de áudio 1500) independentemente do tamanho da fala -- é o
+        # grosso do custo de inferência, e numa call ele é gasto quase
+        # todo em preenchimento. Reduzir esse contexto faz o encoder
+        # avaliar proporcionalmente mais rápido.
+        #
+        # A fórmula é a empírica da comunidade -- (duração/30)*1500 + 128
+        # -- arredondada pra múltiplo de 64 (o kernel prefere) e com piso
+        # em 1024.
+        #
+        # O piso era 768 e SUBIU depois de aparecer em call real: um
+        # clipe de 7.8s voltou com a frase inteira duplicada ("Eu não sei
+        # como te responder disso... / Eu não sei como te responder
+        # disso..."). É o sintoma exato de contexto curto demais -- o
+        # decoder foi TREINADO em janelas de 30s e repete os últimos
+        # tokens quando o encoder entrega menos do que ele espera.
+        #
+        # Esse defeito NÃO é pego por `parece_ruido()`: não é alucinação
+        # conhecida nem texto curto, é uma frase legítima repetida. Ela
+        # chega ao LLM como se a pessoa tivesse falado duas vezes.
+        #
+        # 1024 mantém boa parte do ganho (encoder processa ~20s em vez de
+        # 30) com bem mais margem. Se a duplicação voltar, o próximo passo
+        # é 1280 -- e se voltar em 1280 também, o certo é remover o campo:
+        # encoder mais rápido não vale transcrição errada.
+        #
+        # Campo desconhecido é ignorado por builds que não suportam, então
+        # mandar sempre é seguro; o ganho é que aparece sozinho quando o
+        # build suportar.
+        #
+        # A duração sai do CABEÇALHO, não de uma divisão por constante: o
+        # que chega aqui é 48kHz estéreo (pcm_para_wav usa os padrões do
+        # Discord), mas `transcrever_arquivo` aceita qualquer WAV de
+        # qualquer lugar, e errar o formato aqui vira audio_ctx errado --
+        # que é justamente o parâmetro capaz de fazer o decoder entrar em
+        # loop. Formato desconhecido = não manda o campo e segue no
+        # comportamento padrão.
+        segundos = _duracao_wav(audio)
+        if segundos:
+            alvo = int((segundos / 30.0) * 1500) + 128
+            alvo = max(1024, min(1500, (alvo // 64) * 64))
+            if alvo < 1500:
+                campos["audio_ctx"] = str(alvo)
 
         corpo, content_type = _montar_multipart(campos, (nome, audio))
         req = urllib.request.Request(

@@ -44,6 +44,7 @@ consequência mensurável.
 
 from __future__ import annotations
 
+import json
 import re
 import time
 from collections import deque
@@ -53,22 +54,50 @@ from dataclasses import dataclass, field
 # conteúdo é específico. Retomar algo que a pessoa disse vale mais que
 # comentar que a tela mudou, que vale mais que falar por falar.
 FORCA_PADRAO = {
-    "fio": 0.70,
-    "visual": 0.65,
-    "corporal": 0.65,  # mesmo peso de visual -- notar o próprio corpo é
-                       # tão específico quanto notar a tela. Só emitido
-                       # em transição de segurança/recusa, nunca por
-                       # movimento rotineiro -- ver robot_tools.py.
-    "pesquisa": 0.60,
-    "vazio": 0.35,
+    # Ordem calibrada com a preferência declarada do Alex (24/08/2026),
+    # que estava QUASE INVERTIDA em relação aos valores antigos: "fio"
+    # era o mais forte (0.70) e o mais indesejado; "vazio" era o segundo
+    # mais desejado e o mais fraco (0.35) -- fraco a ponto de nunca passar
+    # do limiar, o que se via em todo log como "impulso fraco (vazio)".
+    "pesquisa": 0.72,      # 1ª preferência: trazer algo novo do mundo
+    "visual_robo": 0.68,   # câmera do robô -- ver nota abaixo
+    "corporal": 0.65,      # segurança do robô: urgência real, não gosto.
+                           # Não entra na ordem de preferência de propósito.
+    "jogo": 0.66,          # Minecraft: dano relevante, morte, conexão.
+                           # Fala de jogador no chat do jogo vem com força
+                           # explícita bem maior (FORCA_CHAT_JOGO = 0.80 em
+                           # minecraft_tools) -- é uma pessoa se dirigindo
+                           # a ela, não um incidente do mundo.
+    "vazio": 0.62,         # 2ª preferência: puxar conversa no silêncio.
+                           # Viável agora, mas ainda depende de silêncio
+                           # longo + curiosidade alta pra ser escolhido.
+    "visual": 0.58,        # 3ª: tela do PC
+    "iniciativa": 0.55,
+    "fio": 0.50,           # 4ª: retomar assunto pendente
 }
+
+# visual_robo > visual de propósito. Quando ela está operando o robô, o
+# que a câmera dele mostra É o assunto -- é a única coisa que só ela está
+# vendo, e comentar aquilo é a diferença entre operar um robô e narrar uma
+# captura de tela. A tela do PC, por contraste, a pessoa também está vendo:
+# comentar é redundante com mais frequência.
+#
+# Não há checagem de "robô conectado" aqui, e não precisa: sem conexão não
+# chega quadro, sem quadro o SistemaVisualRobo não emite evento. A força
+# alta só existe quando há robô de fato.
 
 # Quanto tempo cada tipo continua valendo depois de criado.
 TTL_PADRAO = {
     "fio": 900.0,      # 15 min -- fio é durável, o assunto não azeda rápido
     "visual": 60.0,    # a tela já mudou de novo
+    "visual_robo": 45.0,  # cena do robô muda mais rápido que tela: ele se
+                          # move, e comentar o que já saiu do quadro é pior
+                          # que ficar quieto
     "corporal": 90.0,  # estado físico muda rápido -- comentar "acabei de
                        # tomar um susto" 3min depois já ficou esquisito
+    "jogo": 75.0,      # responder a algo do jogo 2min depois já perdeu
+                       # o sentido -- ela já se moveu, o mob já sumiu
+    "iniciativa": 400.0,
     "pesquisa": 180.0,
     "vazio": 60.0,
 }
@@ -272,6 +301,196 @@ class PortaoFala:
 # --------------------------------------------------------- consciência
 
 
+# Tipos cujo conteúdo é gerado (resumo de busca, fala de preenchimento)
+# e portanto pode ser vazio de substância. Os outros descrevem um evento
+# concreto que aconteceu -- a tela mudou, o robô recusou um comando -- e
+# não precisam ser validados: o fato já é a substância.
+TIPOS_VALIDADOS = {"pesquisa", "iniciativa"}
+
+# "vazio" ficou DE FORA, e isso é correção de um erro de desenho, não
+# afrouxamento: o conteúdo dele é o marcador "puxar assunto", não a fala.
+# O texto real só nasce depois, no modelo de conversa. Validar substância
+# de um placeholder não mede nada -- e no simulador isso disparava uma
+# chamada ao Groq A CADA TICK (5s), estourando o rate limit de 8000 TPM
+# em minutos. Se um dia o "vazio" passar a carregar texto de verdade, ele
+# volta pra cá.
+
+# Sinal barato de concretude: nome próprio, número, data, sigla. Um
+# impulso de pesquisa sem NENHUM deles é quase sempre generalidade vazia
+# ("preparar-se para os desafios do futuro exige visão de longo prazo" --
+# caso real de log, 23/08/2026, que virou fala).
+def _tem_concreto(texto: str) -> bool:
+    """Número, sigla ou nome próprio -- sinal barato de que há algo real.
+
+    Cuidado que custou um falso-negativo no teste: maiúscula de INÍCIO DE
+    FRASE não é nome próprio. "Preparar-se para os desafios do futuro
+    exige visão de longo prazo" (lixo real de log) passava como concreto
+    só por causa do "P" inicial. Por isso a busca por nome próprio ignora
+    a primeira palavra de cada frase.
+    """
+    if re.search(r"\b\d+\b", texto):          # número
+        return True
+    if re.search(r"\b[A-Z]{2,}\b", texto):     # sigla
+        return True
+    for frase in re.split(r"[.!?]\s+|^", texto):
+        palavras = frase.split()
+        for palavra in palavras[1:]:           # pula a primeira
+            if re.match(r"^[A-ZÁÂÃÉÊÍÓÔÕÚÇ][a-záâãéêíóôõúç]{2,}", palavra):
+                return True
+    return False
+
+# Abertura de generalidade. Não é lista de palavra proibida: é o formato
+# "afirmação universal sem sujeito" que sai de resumo ruim.
+_GENERICO = re.compile(
+    r"\b(exige|requer|é fundamental|é importante|é essencial|"
+    r"pode ajudar|costuma ser|em geral|de modo geral)\b", re.I)
+
+
+class PortaoSubstancia:
+    """Segundo portão: o primeiro decide QUANDO falar, este decide SE há
+    o que dizer.
+
+    Por que existe: o PortaoFala só olha tempo, estado e força -- nada
+    disso enxerga o CONTEÚDO. Um resumo alucinado do que a pessoa disse
+    virava busca, virava impulso com força de pesquisa, passava no portão
+    e saía pela boca dela. O portão estava certo e a fala era lixo, porque
+    ninguém tinha perguntado se havia algo real ali.
+
+    Duas camadas, nessa ordem, e a ordem importa: regra primeiro porque é
+    grátis e pega o caso óbvio; LLM só no que sobrou.
+
+    O LLM aqui é o GROQ, não o modelo local, e isso é decisão de
+    arquitetura, não conveniência: validar substância é chamada curta e
+    sem estado, e o servidor local (8082) já disputa GPU com a visão e com
+    o modelo de conversa -- medido em call real, visão sozinha leva 6s e
+    30s quando concorre. Mandar isso pra fora da GPU custa latência de
+    rede e não custa nada do orçamento que aperta.
+    """
+
+    _PROMPT = (
+        "Você valida se um comentário tem conteúdo real antes de uma IA "
+        "dizê-lo em voz alta numa conversa.\n\n"
+        "REJEITE se for: generalidade sem sujeito, conselho motivacional, "
+        "paráfrase do que a pessoa acabou de dizer, ou afirmação vaga que "
+        "serviria pra qualquer assunto.\n"
+        "ACEITE se trouxer: fato específico, dado, nome, evento concreto, "
+        "ou observação particular sobre algo que está acontecendo.\n\n"
+        "Última fala da pessoa: {ultima}\n"
+        "Comentário a validar: {conteudo}\n\n"
+        "Responda APENAS com um JSON: {{\"aceita\": true|false, "
+        "\"motivo\": \"até 8 palavras\"}}"
+    )
+
+    # Quanto tempo um veredito continua valendo pro MESMO texto. Sem
+    # isso, um impulso que fica na fila é revalidado a cada tick -- mesmo
+    # texto, mesma resposta, uma chamada de rede cada vez.
+    TTL_CACHE = 120.0
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self._principal = None
+        self._reserva = None
+        self._tentou_montar = False
+        self._cache: dict[str, tuple[float, bool, str]] = {}
+
+    def _clientes(self):
+        # Montagem preguiçosa: sem Groq configurado o portão nunca chama
+        # LLM, e não faz sentido construir cliente no __init__ por isso.
+        if not self._tentou_montar:
+            self._tentou_montar = True
+            try:
+                from .decision import clientes_decisao
+                self._principal, self._reserva = clientes_decisao(
+                    self.cfg.decisao)
+            except Exception as e:  # noqa: BLE001
+                print(f"[substancia] sem validador LLM: {e}")
+        return self._principal, self._reserva
+
+    def validar(self, impulso, ultima_fala: str = "") -> tuple[bool, str]:
+        """(aceita, motivo). Nunca levanta: falha vira aceite.
+
+        Falhar pra ACEITE e não pra rejeição é escolha deliberada. Este
+        portão existe pra cortar lixo, não pra virar mais um jeito da EVA
+        emudecer: se o Groq cair, o comportamento volta a ser exatamente o
+        de antes deste portão existir, e não 'ela parou de falar sozinha'.
+        """
+        if impulso is None:
+            return False, "sem impulso"
+        if impulso.tipo == "vazio":
+            # Marcador, não fala: o texto real nasce depois no modelo.
+            return True, "vazio: texto ainda não existe"
+        if impulso.tipo not in TIPOS_VALIDADOS:
+            return True, f"{impulso.tipo} descreve evento concreto"
+
+        texto = (impulso.conteudo or "").strip()
+        if len(texto) < 12:
+            return False, "conteúdo curto demais"
+
+        agora = time.time()
+        em_cache = self._cache.get(texto)
+        if em_cache and agora - em_cache[0] < self.TTL_CACHE:
+            return em_cache[1], em_cache[2]
+        # limpeza preguiçosa -- o dict nunca passa de algumas dezenas
+        if len(self._cache) > 64:
+            self._cache = {k: v for k, v in self._cache.items()
+                           if agora - v[0] < self.TTL_CACHE}
+
+        # --- camada 1: regra, grátis ---
+        # A regra só REJEITA sozinha quando há sinal POSITIVO de vazio
+        # (fórmula de generalidade). Ausência de nome próprio/número não
+        # basta: "saiu uma técnica nova de impressão 3D em titânio" é
+        # concreto e não casa com nenhum dos padrões. Falso-negativo aqui
+        # é pior que falso-positivo, porque a camada 2 ainda filtra --
+        # rejeitar na camada 1 é definitivo.
+        if _GENERICO.search(texto) and not _tem_concreto(texto):
+            return self._lembrar(texto, False, "generalidade sem sujeito")
+        if ultima_fala and self._e_eco(texto, ultima_fala):
+            return self._lembrar(texto, False, "eco do que a pessoa disse")
+
+        # --- camada 2: LLM (Groq), só no que sobrou ---
+        principal, reserva = self._clientes()
+        if principal is None:
+            return True, "sem validador -- passou pela regra"
+        try:
+            from .decision import completar_com_reserva
+            bruto = completar_com_reserva(
+                principal, reserva,
+                self._PROMPT.format(ultima=ultima_fala or "(nada ainda)",
+                                    conteudo=texto))
+            dados = json.loads(_extrair_json(bruto))
+            if not dados.get("aceita", True):
+                return self._lembrar(
+                    texto, False, str(dados.get("motivo", "rejeitado"))[:60])
+            return self._lembrar(texto, True, "validado")
+        except Exception as e:  # noqa: BLE001
+            print(f"[substancia] validador falhou, aceitando: {e}")
+            return True, "validador indisponível"
+
+    def _lembrar(self, texto: str, ok: bool, motivo: str) -> tuple[bool, str]:
+        """Guarda o veredito e devolve. Só resultados DEFINITIVOS entram --
+        falha de rede não vira cache, senão um Groq fora do ar por 3s
+        deixaria tudo liberado pelos 120s seguintes."""
+        self._cache[texto] = (time.time(), ok, motivo)
+        return ok, motivo
+
+    @staticmethod
+    def _e_eco(texto: str, ultima: str) -> bool:
+        a = {p for p in texto.lower().split() if len(p) > 3}
+        b = {p for p in ultima.lower().split() if len(p) > 3}
+        if not a or not b:
+            return False
+        return len(a & b) / len(a) > 0.65
+
+
+def _extrair_json(bruto: str) -> str:
+    """Groq às vezes embrulha em ```json -- mesmo tratamento do decisor."""
+    t = (bruto or "").strip()
+    if "```" in t:
+        t = re.sub(r"```(?:json)?", "", t).strip()
+    i, f = t.find("{"), t.rfind("}")
+    return t[i:f + 1] if i >= 0 and f > i else t
+
+
 class Consciencia:
     """Uma instância por canal de voz.
 
@@ -285,6 +504,9 @@ class Consciencia:
         self.cfg = cfg
         self.canal = canal
         self.portao = PortaoFala(cfg.consciencia)
+        # cfg inteiro (nao cfg.consciencia): o portao de substancia precisa
+        # de cfg.decisao pra montar o cliente Groq.
+        self.substancia = PortaoSubstancia(cfg)
 
         self.fila: deque[Impulso] = deque(maxlen=12)
         # user_id -> nome. Sem isso o impulso sai como "retomar o que
@@ -297,6 +519,12 @@ class Consciencia:
         self.ultima_fala_alguem = agora
         self.ultima_fala_dela = agora
         self.ultimo_falante: str | None = None
+        # texto da ultima fala da pessoa -- so pro teste de eco do
+        # PortaoSubstancia. Nao entra em prompt nenhum.
+        self._ultima_fala_texto: str = ""
+        # Ver a trava em tick(): segura a proxima tentativa depois de um
+        # impulso barrado por falta de substancia.
+        self._bloqueado_ate: float = 0.0
         self.falas_sem_resposta = 0
         self.ocupada = False
 
@@ -308,11 +536,33 @@ class Consciencia:
         if nome:
             self.nomes[str(usuario)] = nome
 
+    def audio_detectado(self) -> None:
+        """Reseta só o relógio de silêncio, assim que chega áudio
+        não-silencioso -- ANTES da transcrição terminar.
+
+        BUG REAL encontrado em log de produção: `ultima_fala_alguem` só
+        era atualizado aqui, dentro de `alguem_falou()`, que só roda
+        DEPOIS do STT terminar (~1-2s de `await`, ponto onde o laço de
+        `tick()` roda por baixo, mesmo event loop). Nesse intervalo, o
+        portão via um silêncio já defasado -- se a pausa ANTES da pessoa
+        recomeçar a falar já tivesse passado do limiar, um impulso de
+        proatividade podia ser aprovado bem no meio dela começando a
+        falar de novo, pulando na frente da resposta de verdade (que só
+        chega depois, quando o STT termina). Log real: "eva espontânea"
+        divagando sobre um assunto velho, e a resposta certa pro que a
+        pessoa disse chegando SÓ DEPOIS, logo em seguida.
+
+        Só mexe no relógio -- fila de impulsos e fios continuam sendo
+        limpos/coletados em alguem_falou(), quando já se sabe que era
+        fala de verdade (não ruído) e o texto já existe."""
+        self.ultima_fala_alguem = time.time()
+
     def alguem_falou(self, usuario: str, mensagem: str = "", plano=None,
                      nome: str | None = None) -> None:
         """Registra fala humana. Zera a escalada e colhe fios."""
         self.ultima_fala_alguem = time.time()
         self.ultimo_falante = usuario
+        self._ultima_fala_texto = mensagem or ""
         self.registrar_nome(usuario, nome)
         self.falas_sem_resposta = 0
 
@@ -334,8 +584,18 @@ class Consciencia:
         self.fila.append(impulso)
 
     def evento_visual(self, descricao: str) -> None:
-        """Gancho da fase 3. A visão chama aqui quando algo muda de verdade."""
+        """Tela do PC. A visão chama aqui quando algo muda de verdade."""
         self.adicionar(criar_impulso("visual", descricao))
+
+    def evento_visual_robo(self, descricao: str) -> None:
+        """Câmera do robô -- tipo SEPARADO de `visual`, não é detalhe.
+
+        Antes os dois laços (_laco_visao e _laco_visao_robo) chamavam
+        `evento_visual`, então os dois viravam o mesmo impulso com a mesma
+        força e a EVA não tinha como preferir um. Sem tipo próprio não há
+        como dar peso maior ao que ela vê pelo robô -- ver FORCA_PADRAO.
+        """
+        self.adicionar(criar_impulso("visual_robo", descricao))
 
     def evento_corporal(self, descricao: str) -> None:
         """Transição de segurança do corpo físico (entrou/saiu de
@@ -344,6 +604,18 @@ class Consciencia:
         isso é robot_tools._detectar_transicao_seguranca/_descrever_recusa,
         não aqui -- este método só empacota o que já chegou filtrado."""
         self.adicionar(criar_impulso("corporal", descricao))
+
+    def evento_jogo(self, descricao: str, forca: float | None = None) -> None:
+        """Algo que aconteceu no Minecraft e vale comentar: jogador falou
+        no chat do jogo, dano relevante, morte, entrar/sair do servidor.
+        Quem filtra é minecraft_tools (_ao_chat/_ao_evento) -- este método
+        só empacota o que já chegou filtrado, mesmo contrato de
+        evento_corporal. `forca=None` usa o padrão do tipo."""
+        self.adicionar(criar_impulso("jogo", descricao, forca=forca))
+
+    def sugestao_assunto(self, texto: str) -> None:
+        """Adiciona assunto real sugerido a partir da memória da pessoa."""
+        self.adicionar(criar_impulso("iniciativa", texto))
 
     def pesquisa_pronta(self, resumo: str) -> None:
         self.adicionar(criar_impulso("pesquisa", resumo))
@@ -370,6 +642,9 @@ class Consciencia:
         if agora is None:
             agora = time.time()
 
+        if agora < self._bloqueado_ate:
+            return Veredito(False, "aguardando depois de impulso rejeitado")
+
         self._limpar(agora)
         impulso = self._melhor(agora)
 
@@ -388,6 +663,21 @@ class Consciencia:
         self.ultimo_veredito = v
 
         if v.passou and v.impulso is not None:
+            # Segundo portao: passou no "quando", falta o "o que".
+            ok, motivo = self.substancia.validar(v.impulso, self._ultima_fala_texto)
+            if not ok:
+                # Consome mesmo rejeitando: impulso sem substancia nao
+                # melhora esperando na fila, e deixa-lo la faria o mesmo
+                # lixo ser reavaliado a cada tick ate expirar.
+                self._consumir(v.impulso)
+                # Trava curta depois de rejeitar. `_do_vazio` FABRICA um
+                # impulso novo a cada tick (ele nunca esteve na fila, entao
+                # `_consumir` nao tem o que remover) -- sem esta trava, o
+                # ciclo "fabrica -> passa no portao -> rejeita" se repetia
+                # a cada 5s indefinidamente. Visto no simulador.
+                self._bloqueado_ate = agora + self.cfg.consciencia.cooldown_fala
+                return Veredito(False, f"sem substancia: {motivo}",
+                                v.limiar, v.forca, v.impulso, avaliado=True)
             self._consumir(v.impulso)
         return v
 
@@ -422,9 +712,16 @@ class Consciencia:
                 return criar_impulso(
                     "fio", f"retomar {alvo}: {fio.assunto}", origem=fio.usuario,
                 )
+        # forca_vazio (config) SOBRESCREVE FORCA_PADRAO["vazio"]. Isso já
+        # custou uma calibragem: mexer só na tabela não muda nada aqui, e
+        # o simulador mostrou "silêncio absoluto -> 0 falas" mesmo com a
+        # tabela em 0.62. Quem manda é o config -- então o default dele
+        # subiu junto (config.py, EVA_INICIATIVA_VAZIO_FORCA), e a tabela
+        # fica como piso pra quem não define a variável.
         return criar_impulso(
             "vazio", "puxar assunto",
-            forca=self.cfg.consciencia.forca_vazio,
+            forca=max(self.cfg.consciencia.forca_vazio,
+                      FORCA_PADRAO["vazio"]),
         )
 
     def _consumir(self, impulso: Impulso) -> None:

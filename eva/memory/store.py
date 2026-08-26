@@ -28,6 +28,22 @@ levanta TypeError em vez de vazar memoria em silencio.
 O estado interno NAO e escopado: energia, curiosidade e estresse sao dela,
 nao da conversa. Quem cuida disso e o GerenciadorEstado.
 
+SESSAO DE CONVERSA
+------------------
+`historico()` devolve SO os turnos da sessao corrente. Isso nao e detalhe
+de organizacao -- e correcao de um bug real e caro de achar: o historico
+entra no prompt com papel "assistant", entao qualquer tique que a EVA
+produza numa sessao vira exemplo few-shot nas seguintes. Um modelo de RP
+gerou uma abertura fixa ("Ei! / Bem... Acho que..."), ela foi gravada, e o
+modelo SEGUINTE -- outro modelo, ja trocado -- passou a copiar a abertura
+literalmente do proprio historico, atravessando reinicio e troca de
+checkpoint. Nenhum erro, nenhum log: so a EVA falando errado pra sempre.
+
+Escopo por sessao corta o laco. Uma sessao ruim morre com a call em vez de
+contaminar todas as proximas. `ultimo_turno_em` continua GLOBAL de
+proposito -- ele mede silencio real no relogio (consciousness.py depende
+disso), e zerar a cada call faria a EVA achar que acabou de falar.
+
 CONCORRENCIA
 ------------
 A conexao usa check_same_thread=False porque as integracoes chamam de
@@ -44,6 +60,7 @@ import re
 import sqlite3
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -93,6 +110,8 @@ SCHEMA_INDICES = """
 CREATE INDEX IF NOT EXISTS idx_tipo   ON memorias(usuario, tipo, ativo);
 CREATE INDEX IF NOT EXISTS idx_criado ON memorias(criado_em DESC);
 CREATE INDEX IF NOT EXISTS idx_conv   ON conversas(usuario, id DESC);
+CREATE INDEX IF NOT EXISTS idx_conv_sessao
+    ON conversas(usuario, sessao, id DESC);
 
 -- Indice de busca. content='memorias' faz do FTS um indice externo: o texto
 -- fica so na tabela principal, evitando duplicacao. O filtro por usuario
@@ -226,6 +245,10 @@ class BancoMemoria:
         self.caminho.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self.embeddings = embeddings
+        # Uma sessao ja nasce aqui: processo que sobe e conversa pela CLI
+        # (sem call, sem `nova_sessao()`) nao pode cair no caso "sessao
+        # None", que voltaria a enxergar o historico inteiro do banco.
+        self._sessao = self._novo_id_sessao()
         self.con = sqlite3.connect(str(self.caminho), check_same_thread=False)
         self.con.row_factory = sqlite3.Row
         # WAL deixa leitura e escrita concorrerem sem bloquear uma a outra.
@@ -269,6 +292,16 @@ class BancoMemoria:
         # consolidacao.py preencher sob demanda, nao aqui na migracao).
         # consolidado_em: quando a memoria foi absorvida por um resumo
         # semantico; NULL enquanto nunca consolidada. Ver consolidacao.py.
+        # sessao: NULL nas linhas gravadas antes do escopo por sessao
+        # existir. Elas ficam no banco (dado e do usuario, nao se apaga por
+        # migracao) mas nunca mais entram em `historico()` -- que e
+        # exatamente o efeito desejado, porque e ali que mora o historico
+        # contaminado que motivou essa mudanca.
+        colunas_conv = {r["name"] for r in
+                        self.con.execute("PRAGMA table_info(conversas)")}
+        if colunas_conv and "sessao" not in colunas_conv:
+            self.con.execute("ALTER TABLE conversas ADD COLUMN sessao TEXT")
+
         colunas_mem = {r["name"] for r in
                        self.con.execute("PRAGMA table_info(memorias)")}
         if colunas_mem and "embedding" not in colunas_mem:
@@ -682,25 +715,127 @@ class BancoMemoria:
 
     # ---------- historico de conversa ----------
 
+    @staticmethod
+    def _novo_id_sessao() -> str:
+        """Id opaco. Nao carrega semantica de propósito: nada deve poder
+        deduzir "a sessao anterior" a partir dele e tentar juntar as duas."""
+        return uuid.uuid4().hex
+
+    @property
+    def sessao(self) -> str:
+        """Sessao corrente -- o escopo que `historico()` enxerga."""
+        return self._sessao
+
+    def nova_sessao(self) -> str:
+        """Abre uma sessao nova e devolve o id.
+
+        Chamado quando uma conversa comeca de fato (entrar numa call). A
+        partir daqui `historico()` enxerga zero turnos, entao a EVA comeca
+        sem nenhum exemplo do proprio comportamento anterior no prompt.
+
+        O que NAO muda: memorias (semantica/episodica/procedural) sao
+        outra tabela e continuam atravessando sessoes. E essa a divisao
+        certa -- ela deve lembrar que voce usa Arch Linux, nao decorar
+        como ela mesma abriu a frase ontem.
+        """
+        with self._lock:
+            self._sessao = self._novo_id_sessao()
+        return self._sessao
+
     def registrar_turno(self, papel: str, conteudo: str, *, usuario: str,
                         sessao: str | None = None) -> None:
         with self._lock:
             self.con.execute(
                 "INSERT INTO conversas (usuario, papel, conteudo, criado_em, sessao) "
                 "VALUES (?,?,?,?,?)",
-                (usuario, papel, conteudo, time.time(), sessao),
+                (usuario, papel, conteudo, time.time(), sessao or self._sessao),
             )
             self.con.commit()
 
-    def historico(self, *, usuario: str, limite: int = 12) -> list[dict]:
+    def historico(self, *, usuario: str, limite: int = 12,
+                  sessao: str | None = None) -> list[dict]:
+        """Ultimos turnos da sessao corrente (ou de `sessao`, se pedida).
+
+        O filtro por sessao e o ponto todo desta funcao -- ver o bloco
+        SESSAO DE CONVERSA no topo do arquivo. Turnos de sessoes passadas
+        e turnos antigos com sessao NULL ficam de fora sempre.
+        """
+        alvo = sessao or self._sessao
         with self._lock:
             linhas = list(self.con.execute(
                 "SELECT papel, conteudo, criado_em FROM conversas "
-                "WHERE usuario=? ORDER BY id DESC LIMIT ?",
-                (usuario, limite),
+                "WHERE usuario=? AND sessao=? ORDER BY id DESC LIMIT ?",
+                (usuario, alvo, limite),
             ))
         return [{"role": r["papel"], "content": r["conteudo"], "em": r["criado_em"]}
                 for r in reversed(linhas)]
+
+    def corrigir_ultimo_turno(self, papel: str, conteudo: str, *,
+                              usuario: str, sessao: str | None = None) -> bool:
+        """Reescreve o conteudo do ultimo turno de `papel` na sessao.
+
+        Existe por causa da INTERRUPCAO por voz: `_pos_processar` grava o
+        turno "assistant" no momento em que o LLM termina de gerar, ANTES
+        de virar audio. Se a pessoa corta a EVA no meio, o que ficou no
+        historico e o texto inteiro -- uma fala que nunca aconteceu. Na
+        proxima montagem de prompt esse texto volta como exemplo do
+        proprio comportamento dela, que e exatamente o mecanismo de
+        few-shot acidental ja documentado no bloco SESSAO DE CONVERSA.
+        Aqui a gente troca pelo trecho que realmente saiu no audio.
+
+        Devolve True se alguma linha foi alterada.
+        """
+        alvo = sessao or self._sessao
+        with self._lock:
+            cur = self.con.execute(
+                "UPDATE conversas SET conteudo=? WHERE id = ("
+                "  SELECT id FROM conversas WHERE usuario=? AND sessao=? AND papel=?"
+                "  ORDER BY id DESC LIMIT 1)",
+                (conteudo, usuario, alvo, papel),
+            )
+            self.con.commit()
+            return cur.rowcount > 0
+
+    def remover_ultimo_turno(self, papel: str, *, usuario: str,
+                             sessao: str | None = None) -> bool:
+        """Apaga o ultimo turno de `papel` na sessao corrente.
+
+        Usado quando uma resposta e DESCARTADA antes de ser falada (a
+        pessoa emendou outra fala enquanto a EVA ainda estava gerando, e
+        os dois turnos viram um so). Sem isso o historico guardaria uma
+        resposta que ninguem ouviu, e o par pergunta/resposta ficaria
+        duplicado quando o turno juntado for gravado.
+        """
+        alvo = sessao or self._sessao
+        with self._lock:
+            cur = self.con.execute(
+                "DELETE FROM conversas WHERE id = ("
+                "  SELECT id FROM conversas WHERE usuario=? AND sessao=? AND papel=?"
+                "  ORDER BY id DESC LIMIT 1)",
+                (usuario, alvo, papel),
+            )
+            self.con.commit()
+            return cur.rowcount > 0
+
+    def limpar_historico(self, *, usuario: str, apenas_orfaos: bool = True) -> int:
+        """Apaga turnos de conversa. Devolve quantas linhas sairam.
+
+        `apenas_orfaos=True` (padrao) remove so o que ficou sem sessao --
+        o historico gravado antes deste escopo existir, que e justamente o
+        material contaminado. Com False, apaga tudo do usuario.
+
+        Memorias nao sao tocadas em nenhum dos dois casos.
+        """
+        with self._lock:
+            if apenas_orfaos:
+                cur = self.con.execute(
+                    "DELETE FROM conversas WHERE usuario=? AND sessao IS NULL",
+                    (usuario,))
+            else:
+                cur = self.con.execute(
+                    "DELETE FROM conversas WHERE usuario=?", (usuario,))
+            self.con.commit()
+            return cur.rowcount
 
     def ultimo_turno_em(self, *, usuario: str | None = None) -> float | None:
         sql = "SELECT MAX(criado_em) m FROM conversas"

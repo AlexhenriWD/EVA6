@@ -6,7 +6,9 @@ A separação existe porque a stack de voz do discord.py é problemática --
 o discord.js com @discordjs/voice é o caminho maduro.
 
 Uso:
-    python -m eva.integrations.discord           # sobe os dois
+    python -m eva.integrations.discord           # sobe tudo (bridge, whisper,
+                                                   # llama-server de conversa/
+                                                   # decisão-visão/embeddings)
     python -m eva.integrations.discord --so-python   # bridge já rodando
     python -m eva.integrations.discord --diagnostico
 """
@@ -41,6 +43,122 @@ AMARELO = "\033[33m"
 VERDE = "\033[32m"
 FIM = "\033[0m"
 
+# ---------------------------------------------------------------- log
+
+_ANSI = __import__("re").compile(r"\x1b\[[0-9;]*m")
+
+
+class _Tee:
+    """Duplica tudo que sai no console para um arquivo.
+
+    Ponto único de propósito: TODO log deste sistema passa por `print()`
+    -- inclusive o do bridge.js, do whisper-server e dos três
+    llama-servers, que os supervisores leem do subprocesso e reimprimem
+    com prefixo. Envolvendo `sys.stdout` uma vez, o arquivo recebe o
+    mesmo fluxo intercalado que você vê no terminal, na mesma ordem.
+    Fazer isso supervisor por supervisor daria cinco arquivos separados
+    e nenhum deles teria a ordem relativa entre os processos -- que é
+    justamente o que permitiu descobrir que o whisper estava rodando em
+    cima do prefill do llama.
+
+    Duas diferenças em relação ao console:
+
+    - cada linha do arquivo ganha carimbo de tempo. Os llama-servers já
+      carimbam os deles, mas os `print()` do Python não, e sem isso não
+      dá pra medir a distância entre "[call] fulano: ..." e o
+      "[tempo] até o primeiro som" que veio depois.
+    - códigos de cor ANSI são removidos, senão viram lixo tipo `←[33m`
+      no meio do texto.
+
+    `isatty()` delega pro stdout original justamente pra `_cor()`
+    continuar colorindo o console -- envolver o stdout não deveria
+    mudar como ele se parece pra quem está olhando.
+    """
+
+    def __init__(self, original, arquivo):
+        self._original = original
+        self._arquivo = arquivo
+        self._inicio_de_linha = True
+
+    def write(self, texto: str) -> int:
+        self._original.write(texto)
+        try:
+            limpo = _ANSI.sub("", texto)
+            for parte in limpo.splitlines(keepends=True):
+                if self._inicio_de_linha and parte.strip():
+                    self._arquivo.write(_agora_hms() + " ")
+                self._arquivo.write(parte)
+                self._inicio_de_linha = parte.endswith("\n")
+        except Exception:
+            # Arquivo cheio, disco removido, permissão -- perder o log é
+            # ruim, derrubar a EVA no meio de uma call por causa dele é
+            # pior. Console continua funcionando de qualquer jeito.
+            pass
+        return len(texto)
+
+    def flush(self) -> None:
+        self._original.flush()
+        try:
+            self._arquivo.flush()
+        except Exception:
+            pass
+
+    def isatty(self) -> bool:
+        return self._original.isatty()
+
+    def __getattr__(self, nome):
+        return getattr(self._original, nome)
+
+
+def _agora_hms() -> str:
+    import datetime
+    return datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+
+
+def iniciar_log_em_arquivo(manter: int = 20):
+    """Abre o arquivo de log desta execução e redireciona stdout/stderr.
+
+    Sempre ligado -- não é opção. O terminal do Windows tem buffer de
+    rolagem limitado e corta o começo das sessões longas, que é
+    exatamente a parte que interessa quando alguma coisa demorou. Um
+    arquivo por execução, nomeado pela hora de início.
+
+    EVA_LOG_DIR muda o destino. `manter` apaga os mais antigos pra pasta
+    não crescer sem fim -- 20 execuções cobrem semanas de
+    desenvolvimento e não chegam a alguns MB.
+
+    Devolve o Path do arquivo, ou None se não deu pra criar (o que NÃO
+    é fatal: a EVA sobe do mesmo jeito, só sem log em arquivo).
+    """
+    import datetime
+
+    try:
+        destino = Path(os.environ.get("EVA_LOG_DIR", "")
+                       or (Path.cwd() / "logs"))
+        destino.mkdir(parents=True, exist_ok=True)
+
+        antigos = sorted(destino.glob("eva-*.log"))
+        for velho in antigos[:-manter] if manter > 0 else []:
+            try:
+                velho.unlink()
+            except OSError:
+                pass
+
+        carimbo = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        caminho = destino / f"eva-{carimbo}.log"
+        # line buffering: se a EVA travar ou você matar com Ctrl+C, o que
+        # já foi impresso está no disco. Com buffer cheio, justamente o
+        # fim -- a parte que explica o travamento -- se perderia.
+        arquivo = open(caminho, "w", encoding="utf-8", buffering=1,
+                       errors="replace")
+    except Exception as e:
+        print(f"[log] não consegui criar o arquivo de log: {e}")
+        return None
+
+    sys.stdout = _Tee(sys.stdout, arquivo)
+    sys.stderr = _Tee(sys.stderr, arquivo)
+    return caminho
+
 
 def _cor(t: str, c: str) -> str:
     return f"{c}{t}{FIM}" if sys.stdout.isatty() else t
@@ -62,8 +180,8 @@ def achar_bridge() -> Path | None:
 
 def _host_porta_de_url(url: str) -> tuple[str, int]:
     """Extrai host e porta de uma URL tipo http://127.0.0.1:8090 -- usado
-    tanto pra montar a flag --port do whisper-server quanto pro ping de
-    prontidão em _whisper_server_respondendo.
+    tanto pra montar a flag --port do processo quanto pro ping de
+    prontidão (_whisper_server_respondendo / _llama_server_respondendo).
     """
     from urllib.parse import urlparse
     p = urlparse(url)
@@ -83,6 +201,24 @@ def _whisper_server_respondendo(url: str, timeout: float = 1.5) -> bool:
     import urllib.request
     try:
         urllib.request.urlopen(url, timeout=timeout)
+        return True
+    except urllib.error.HTTPError:
+        return True
+    except Exception:
+        return False
+
+
+def _llama_server_respondendo(url: str, timeout: float = 1.5) -> bool:
+    """Mesmo padrão de _whisper_server_respondendo, mas contra /health do
+    llama-server -- as URLs de config apontam pro endpoint /v1 (formato
+    OpenAI), então tira o /v1 e bate em /health, que é o endpoint de
+    prontidão que o llama.cpp expõe.
+    """
+    import urllib.error
+    import urllib.request
+    base = url.rsplit("/v1", 1)[0].rstrip("/")
+    try:
+        urllib.request.urlopen(f"{base}/health", timeout=timeout)
         return True
     except urllib.error.HTTPError:
         return True
@@ -160,8 +296,9 @@ class SupervisorWhisper:
 
     async def repassar_saida(self) -> None:
         """Mostra o log do whisper-server com prefixo -- mesmo padrão do
-        Supervisor.repassar_saida abaixo, pra distinguir dos outros dois
-        processos (Python principal e bridge.js) no mesmo console.
+        Supervisor.repassar_saida abaixo, pra distinguir dos outros
+        processos (Python principal, bridge.js, llama-servers) no mesmo
+        console.
         """
         if not self.proc or not self.proc.stdout:
             return
@@ -178,6 +315,89 @@ class SupervisorWhisper:
         if not self.proc:
             return
         print("[whisper] encerrando servidor...")
+        try:
+            self.proc.terminate()
+            self.proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+        self.proc = None
+
+
+class SupervisorLlama:
+    """Sobe um llama-server como subprocesso -- mesmo padrão de
+    SupervisorWhisper. Reutilizável pra qualquer modelo (conversa,
+    decisão/visão, embeddings): só muda exe/modelo/url/flags/mmproj.
+
+    `nome` dá um prefixo de log diferente pra cada instância -- sem isso,
+    as três (conversa/decisão/embeddings) ficariam indistinguíveis no
+    console, todas dizendo "[llama]".
+
+    Só sobe se: (1) o `server_exe` correspondente está configurado, e
+    (2) nada já está respondendo na URL -- mesma dupla de condições do
+    SupervisorWhisper, mesmo motivo (não subir em cima de um servidor que
+    você já deixou rodando manualmente pra testar outro modelo/flags).
+    """
+
+    def __init__(self, exe: str, modelo: str, url: str, flags: list[str] | None = None,
+                 mmproj: str = "", nome: str = "llama"):
+        self.exe = exe
+        self.modelo = modelo
+        self.url = url
+        self.flags = flags or []
+        self.mmproj = mmproj
+        self.nome = nome
+        self.proc: subprocess.Popen | None = None
+
+    def iniciar(self) -> None:
+        host, porta = _host_porta_de_url(self.url)
+        cmd = [self.exe, "-m", self.modelo, "--host", host, "--port", str(porta), *self.flags]
+        if self.mmproj:
+            cmd += ["--mmproj", self.mmproj]
+
+        print(f"[{self.nome}] iniciando llama-server em {host}:{porta}...")
+        self.proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+        )
+
+    async def esperar_pronto(self, timeout: float = 120.0) -> bool:
+        """Timeout maior que o do whisper (60s): um 12B em Q4 subindo pra
+        VRAM pode levar mais que o modelo de STT. Mesma lógica de polling
+        em vez de sleep fixo -- ver SupervisorWhisper.esperar_pronto.
+        """
+        loop = asyncio.get_running_loop()
+        inicio = loop.time()
+        while loop.time() - inicio < timeout:
+            if self.proc and self.proc.poll() is not None:
+                print(f"[{self.nome}] processo encerrou cedo (código {self.proc.poll()}) "
+                      f"-- confira o log [{self.nome}] acima")
+                return False
+            if await loop.run_in_executor(None, _llama_server_respondendo, self.url):
+                return True
+            await asyncio.sleep(0.5)
+        return False
+
+    async def repassar_saida(self) -> None:
+        if not self.proc or not self.proc.stdout:
+            return
+        loop = asyncio.get_running_loop()
+        while True:
+            linha = await loop.run_in_executor(None, self.proc.stdout.readline)
+            if not linha:
+                break
+            print(f"[{self.nome}] {linha.rstrip()}")
+        codigo = self.proc.poll()
+        print(f"[{self.nome}] processo encerrou (código {codigo})")
+
+    def parar(self) -> None:
+        if not self.proc:
+            return
+        print(f"[{self.nome}] encerrando servidor...")
         try:
             self.proc.terminate()
             self.proc.wait(timeout=5)
@@ -255,7 +475,7 @@ def diagnostico() -> bool:
         print(f"  websockets:  {_cor('FALTA', AMARELO)} — pip install websockets")
         ok = False
 
-    # modelo
+    # modelo de conversa
     from ..orchestrator import EVA
     eva = EVA(cfg)
     conectado = eva.llm.disponivel()
@@ -264,6 +484,17 @@ def diagnostico() -> bool:
     eva.fechar()
     if not conectado:
         ok = False
+
+    # modelo de decisão/visão -- mesmo servidor atende os dois papéis
+    print(f"  decisão/visão: "
+          f"{'respondendo' if _llama_server_respondendo(cfg.decisao.base_url) else _cor('NÃO RESPONDE', AMARELO)} "
+          f"({cfg.decisao.base_url})")
+
+    # embeddings
+    if cfg.memoria.usar_embeddings:
+        print(f"  embeddings:  "
+              f"{'respondendo' if _llama_server_respondendo(cfg.memoria.embeddings_base_url) else _cor('NÃO RESPONDE', AMARELO)} "
+              f"({cfg.memoria.embeddings_base_url})")
 
     print()
     print(_cor("  tudo pronto" if ok else "  faltam itens acima", VERDE if ok else AMARELO))
@@ -335,6 +566,47 @@ async def executar(so_python: bool, porta: int) -> None:
     cfg = carregar_config()
     cliente = ClienteBridge(cfg, url=f"ws://localhost:{porta}")
 
+    # Os três llama-server sobem AGORA (chamada não-bloqueante, só cria o
+    # subprocesso) e só são ESPERADOS lá embaixo, depois de bridge.js e
+    # whisper -- assim os processos carregam em paralelo de verdade
+    # (cada um é um subprocesso do SO, continua carregando enquanto este
+    # coroutine espera outra coisa), em vez de empilhar o tempo de espera
+    # de cada um em sequência. O de conversa sobe primeiro por ser o
+    # maior (12B) -- quem mais se beneficia da folga extra pra carregar.
+    supervisor_llama = None
+    if cfg.llm.server_exe and not _llama_server_respondendo(cfg.llm.base_url):
+        supervisor_llama = SupervisorLlama(
+            exe=cfg.llm.server_exe, modelo=cfg.llm.server_modelo,
+            url=cfg.llm.base_url, flags=cfg.llm.server_flags,
+            nome="llama",
+        )
+        supervisor_llama.iniciar()
+
+    # Decisão/visão -- mesmo servidor atende os dois papéis (--mmproj
+    # habilita a parte de visão). DecisionConfig.base_url e
+    # VisaoConfig.base_url devem apontar pra mesma URL.
+    supervisor_decisao = None
+    if cfg.decisao.server_exe and not _llama_server_respondendo(cfg.decisao.base_url):
+        supervisor_decisao = SupervisorLlama(
+            exe=cfg.decisao.server_exe, modelo=cfg.decisao.server_modelo,
+            url=cfg.decisao.base_url, flags=cfg.decisao.server_flags,
+            mmproj=cfg.decisao.server_mmproj,
+            nome="decisao",
+        )
+        supervisor_decisao.iniciar()
+
+    # Embeddings -- modelo minúsculo (nomic-embed, ~84MB), mas isolado do
+    # resto pra tirar a última dependência do LM Studio.
+    supervisor_embeddings = None
+    if (cfg.memoria.usar_embeddings and cfg.memoria.embeddings_server_exe
+            and not _llama_server_respondendo(cfg.memoria.embeddings_base_url)):
+        supervisor_embeddings = SupervisorLlama(
+            exe=cfg.memoria.embeddings_server_exe, modelo=cfg.memoria.embeddings_server_modelo,
+            url=cfg.memoria.embeddings_base_url, flags=cfg.memoria.embeddings_server_flags,
+            nome="embeddings",
+        )
+        supervisor_embeddings.iniciar()
+
     supervisor = None
     if not so_python:
         bridge = achar_bridge()
@@ -370,11 +642,29 @@ async def executar(so_python: bool, porta: int) -> None:
             print("[whisper] AVISO: servidor não respondeu a tempo -- STT vai cair "
                   "pra Groq (ver criar_stt em stt.py) até você conferir o log acima.")
 
+    # Só agora espera os llama-server ficarem prontos -- por causa da
+    # ordem acima, eles já vêm carregando há um tempo (o de bridge.js +
+    # o de whisper), então a espera efetiva aqui costuma ser bem menor
+    # que os timeouts individuais.
+    for sup in (supervisor_llama, supervisor_decisao, supervisor_embeddings):
+        if sup is None:
+            continue
+        pronto = await sup.esperar_pronto()
+        if not pronto:
+            print(f"[{sup.nome}] AVISO: servidor não respondeu a tempo -- "
+                  f"confira o log [{sup.nome}] acima antes de usar a EVA.")
+
     tarefas = [asyncio.create_task(cliente.rodar())]
     if supervisor:
         tarefas.append(asyncio.create_task(supervisor.repassar_saida()))
     if supervisor_whisper:
         tarefas.append(asyncio.create_task(supervisor_whisper.repassar_saida()))
+    if supervisor_llama:
+        tarefas.append(asyncio.create_task(supervisor_llama.repassar_saida()))
+    if supervisor_decisao:
+        tarefas.append(asyncio.create_task(supervisor_decisao.repassar_saida()))
+    if supervisor_embeddings:
+        tarefas.append(asyncio.create_task(supervisor_embeddings.repassar_saida()))
 
     try:
         await asyncio.gather(*tarefas)
@@ -387,6 +677,12 @@ async def executar(so_python: bool, porta: int) -> None:
             supervisor.parar()
         if supervisor_whisper:
             supervisor_whisper.parar()
+        if supervisor_llama:
+            supervisor_llama.parar()
+        if supervisor_decisao:
+            supervisor_decisao.parar()
+        if supervisor_embeddings:
+            supervisor_embeddings.parar()
         cliente.fechar()
 
 
@@ -401,6 +697,13 @@ def main(argv=None) -> int:
 
     if args.diagnostico:
         return 0 if diagnostico() else 1
+
+    # Antes de qualquer coisa imprimir: a linha de erro mais útil de
+    # todas costuma ser a primeira (modelo que não carregou, porta em
+    # uso, .env faltando), e ela sai antes dos supervisores subirem.
+    caminho_log = iniciar_log_em_arquivo()
+    if caminho_log:
+        print(f"[log] gravando esta execução em {caminho_log}")
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
@@ -420,6 +723,17 @@ def main(argv=None) -> int:
         print("\nencerrando...")
     finally:
         loop.close()
+        # O `finally` também roda quando a saída é abrupta (Ctrl+C no meio
+        # de uma call, que é como a maioria das sessões termina aqui) --
+        # sem este flush, as últimas linhas ficariam no buffer e sumiriam,
+        # e são justamente as que dizem por que você saiu.
+        try:
+            sys.stdout.flush()
+            sys.stderr.flush()
+        except Exception:
+            pass
+        if caminho_log:
+            print(f"[log] execução salva em {caminho_log}")
     return 0
 
 

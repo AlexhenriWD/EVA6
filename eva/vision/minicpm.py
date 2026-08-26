@@ -130,3 +130,17 @@ PROMPT_CENA = (
     "e o que está acontecendo em termos gerais. Não descreva quadro por "
     "quadro, descreva a cena como um todo. Máximo 20 palavras."
 )
+
+# Câmera do ROBÔ, não a tela -- pessoa física e espaço físico, não app/jogo.
+# Um quadro só (não rajada): a cabeça acabou de se mover pra uma posição
+# nova e parada, não faz sentido comparar contra o instante anterior à
+# virada. Pede pessoas EXPLICITAMENTE porque é o dado que mais importa
+# pra ela decidir como agir -- sem pedir, o modelo tende a descrever
+# móveis/paredes e deixar gente de fora ou mencionar de passagem.
+PROMPT_CENA_ROBO = (
+    "Esta imagem é da câmera de um robô físico, agora. Descreva em UMA "
+    "frase curta e direta o que tem à frente: se tem PESSOA(S) visível(is) "
+    "diga quantas e o que estão fazendo; senão diga o que ocupa o espaço "
+    "(parede, móvel, corredor, porta, obstáculo) e se o caminho à frente "
+    "parece livre ou bloqueado. Máximo 25 palavras."
+)

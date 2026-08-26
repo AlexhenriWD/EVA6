@@ -105,9 +105,21 @@ class ClienteLLM:
         self._aplicar_penalidades(payload)
         dados = self._post("/chat/completions", payload)
         try:
-            return dados["choices"][0]["message"]["content"].strip()
+            escolha = dados["choices"][0]
+            texto = escolha["message"]["content"].strip()
         except (KeyError, IndexError) as e:
             raise ErroLLM(f"resposta em formato inesperado: {str(dados)[:200]}") from e
+
+        # Bateu no teto de tokens: o texto termina no meio de uma palavra
+        # ("Então, basic", "argumentação pesada do" -- call real de
+        # 24/08/2026). Isso vai direto pro TTS e sai como fala truncada.
+        # Cortar na última frase fechada não remove conteúdo que ela
+        # "queria" dizer: esse conteúdo não existe, foi interrompido pelo
+        # teto. Entre um fim abrupto e um fim limpo, o limpo é o único
+        # que soa como alguém terminando de falar.
+        if escolha.get("finish_reason") == "length":
+            texto = _cortar_na_ultima_frase(texto)
+        return texto
 
     def _aplicar_penalidades(self, payload: dict) -> None:
         """Adiciona repeat_penalty/frequency_penalty/presence_penalty ao
@@ -129,6 +141,27 @@ class ClienteLLM:
         pp = getattr(self.cfg, "presence_penalty", None)
         if pp is not None:
             payload["presence_penalty"] = pp
+        # top_k/min_p ficavam de fora do payload inteiramente -- sem eles
+        # explícitos aqui, o comportamento depende do default interno do
+        # llama-server, que pode não bater com o que o modelo carregado
+        # (Angelic_Eclipse/Helcyon, ambos Mistral Nemo 12B) espera. Mesmo
+        # getattr+checagem dos três acima, por consistência.
+        tk = getattr(self.cfg, "top_k", None)
+        if tk is not None:
+            payload["top_k"] = tk
+        mp = getattr(self.cfg, "min_p", None)
+        if mp is not None:
+            payload["min_p"] = mp
+        # Sem isso, repeat_penalty usa a janela default do llama-server
+        # (tipicamente 64 tokens) -- curta demais pra alcançar a resposta
+        # do turno anterior quando tem system prompt + bloco volátil +
+        # histórico no meio. Achado real: frase de fechamento quase
+        # idêntica repetida em dois turnos seguidos mesmo com
+        # repeat_penalty já ativo -- a penalidade nunca via a repetição
+        # porque estava fora da janela.
+        rln = getattr(self.cfg, "repeat_last_n", None)
+        if rln is not None:
+            payload["repeat_last_n"] = rln
 
     def completar_com_ferramenta(
         self,
@@ -170,10 +203,15 @@ class ClienteLLM:
             "max_tokens": max_tokens or self.cfg.max_tokens,
             "stop": STOP_PADRAO if parar is None else parar,
             "tools": [ferramenta],
-            "tool_choice": {
-                "type": "function",
-                "function": {"name": ferramenta["function"]["name"]},
-            },
+            # A build do llama-server em uso só aceita tool_choice como
+            # STRING ("auto"/"none"/"required") -- o objeto aninhado
+            # padrão OpenAI ({"type": "function", "function": {...}}) fazia
+            # o parser do servidor rejeitar o campo e cair no default
+            # silenciosamente (ver "Wrong type supplied for parameter
+            # 'tool_choice'... using default value" no log). Como só existe
+            # UMA ferramenta no payload por chamada (ver docstring acima),
+            # "required" já força exatamente essa, sem precisar nomear.
+            "tool_choice": "required",
             "stream": False,
         }
         dados = self._post("/chat/completions", payload)
@@ -221,6 +259,13 @@ class ClienteLLM:
                 "User-Agent": USER_AGENT,
             },
         )
+        # Segura só o RABO incompleto -- o texto depois do último .!?… ainda
+        # aberto. Tudo que já fechou sai na hora, então o primeiro áudio não
+        # atrasa. Só no fim se decide o que fazer com o rabo: se a geração
+        # parou por "length" (bateu no teto de tokens), ele é um pedaço de
+        # palavra e vai fora; se parou normalmente, é fala legítima e sai.
+        pendente = ""
+        motivo_fim = None
         try:
             with urllib.request.urlopen(req, timeout=self.cfg.timeout) as r:
                 for linha in r:
@@ -232,13 +277,23 @@ class ClienteLLM:
                         break
                     try:
                         d = json.loads(corpo)
-                        delta = d["choices"][0].get("delta", {}).get("content")
-                        if delta:
-                            yield delta
+                        escolha = d["choices"][0]
+                        motivo_fim = escolha.get("finish_reason") or motivo_fim
+                        delta = escolha.get("delta", {}).get("content")
+                        if not delta:
+                            continue
+                        pendente += delta
+                        corte = max(pendente.rfind(c) for c in ".!?…")
+                        if corte >= 0:
+                            yield pendente[:corte + 1]
+                            pendente = pendente[corte + 1:]
                     except (json.JSONDecodeError, KeyError, IndexError):
                         continue
         except urllib.error.URLError as e:
             raise ErroLLM(f"falha no streaming: {e.reason}") from e
+
+        if pendente.strip() and motivo_fim != "length":
+            yield pendente
 
     def disponivel(self) -> bool:
         """Testa se o servidor responde. Usado no diagnóstico."""
@@ -269,3 +324,17 @@ class ClienteLLM:
             return [m.get("id", "?") for m in d.get("data", [])]
         except Exception:
             return []
+
+
+def _cortar_na_ultima_frase(texto: str) -> str:
+    """Devolve o texto até o último fim de frase (.!?…) fechado.
+
+    Se não houver NENHUM fechamento -- resposta inteira é uma frase só,
+    cortada no meio -- devolve o texto como está: um fragmento longo ainda
+    é melhor que string vazia, e silêncio total seria pior que fala
+    truncada.
+    """
+    corte = max(texto.rfind(c) for c in ".!?…")
+    if corte <= 0:
+        return texto
+    return texto[:corte + 1].rstrip()

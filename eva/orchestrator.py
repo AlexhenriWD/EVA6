@@ -35,6 +35,7 @@ o cursor do SQLite.
 from __future__ import annotations
 
 import asyncio
+import difflib
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -49,6 +50,7 @@ from .memory.extractor import extrair_por_llm, extrair_por_regras, extrair_perso
 from .memory.store import BancoMemoria, USUARIO_HISTORIA
 from .state import GerenciadorEstado
 from .tools.builtin import carregar_ferramentas
+from .tools import minecraft_tools
 
 
 @dataclass
@@ -197,6 +199,8 @@ class EVA:
 
         # 1. decidir
         plano = self.decisor.decidir(mensagem, historico)
+        contexto_jogo = (minecraft_tools.snapshot_atual()
+                 if plano.precisa_jogo else None)
 
         # 2. quem é a pessoa
         identidade = self._identidade(usuario)
@@ -226,7 +230,9 @@ class EVA:
             identidade=identidade,
             modo_voz=modo_voz,
             contexto_visual=contexto_visual,
+            contexto_jogo=contexto_jogo,
             modo_multicanal=modo_multicanal,
+            mensagem=mensagem,
         )
         mensagens = ctx.para_chat(mensagem)
 
@@ -260,7 +266,7 @@ class EVA:
             ferramentas=resultados,
             memorias_novas=novas,
             contexto=ctx.bruto,
-            system=ctx.system,
+            system=ctx.prompt_completo(),
             ms=int((time.time() - inicio) * 1000),
             erro=erro,
         )
@@ -302,6 +308,8 @@ class EVA:
         historico = self.memoria.historico(
             usuario=usuario, limite=self.cfg.memoria.janela_historico)
         plano = self.decisor.decidir(mensagem, historico)
+        contexto_jogo = (minecraft_tools.snapshot_atual()
+                 if plano.precisa_jogo else None)
         identidade = self._identidade(usuario)
         memorias = self._buscar_memorias(plano, usuario, mensagem)
         resultados = self._executar_ferramentas(plano)
@@ -309,11 +317,12 @@ class EVA:
             plano=plano, memorias=memorias, resultados_ferramentas=resultados,
             estado=self.estado.estado, historico=historico, identidade=identidade,
             modo_voz=modo_voz, contexto_visual=contexto_visual,
+            contexto_jogo=contexto_jogo, mensagem=mensagem,
         )
         teto = self.cfg.llm.max_tokens_voz if modo_voz else self.cfg.llm.max_tokens
         return {
             "usuario": usuario,
-            "system": ctx.system,
+            "system": ctx.prompt_completo(),
             "mensagens": ctx.para_chat(mensagem),
             "plano": plano.to_dict(),
             "memorias_usadas": {k: [m.conteudo for m in v]
@@ -352,14 +361,22 @@ class EVA:
             identidade=self._identidade(usuario),
             modo_voz=modo_voz, iniciativa=ideia,
         )
-        mensagens = [{"role": "system", "content": ctx.system}] + ctx.mensagens
+        mensagens = ctx._mensagens_com_cauda()
 
-        teto = self.cfg.llm.max_tokens_voz if modo_voz else self.cfg.llm.max_tokens
+        # Teto próprio, bem menor que o de resposta -- ver
+        # LLMConfig.max_tokens_espontanea pro número medido que motivou
+        # a separação. Puxar assunto é convite, não exposição.
+        teto = (self.cfg.llm.max_tokens_espontanea if modo_voz
+                else self.cfg.llm.max_tokens)
         try:
             resposta = self.llm.completar(mensagens, max_tokens=teto, parar=STOP_CONVERSA)
             erro = None
         except ErroLLM as e:
             resposta, erro = "", str(e)
+
+        if resposta and self._fala_espontanea_repetida(resposta, historico):
+            print("[eva espontânea] fala repetida descartada")
+            resposta = ""
 
         # Só o lado dela entra no histórico -- não houve turno de usuário.
         # E `guardar_memoria=False` no plano evita o outro erro: extrair
@@ -368,8 +385,23 @@ class EVA:
             self.memoria.registrar_turno("assistant", resposta, usuario=usuario)
 
         return Resultado(resposta=resposta, plano=plano, usuario=usuario,
-                         contexto=ctx.bruto, system=ctx.system,
+                         contexto=ctx.bruto, system=ctx.prompt_completo(),
                          ms=int((time.time() - inicio) * 1000), erro=erro)
+
+    @staticmethod
+    def _fala_espontanea_repetida(resposta: str, historico: list[dict]) -> bool:
+        atual = " ".join(resposta.lower().split())
+        if len(atual) < 80:
+            return False
+        for turno in reversed(historico):
+            if turno.get("role") != "assistant":
+                continue
+            anterior = " ".join((turno.get("content") or "").lower().split())
+            if len(anterior) < 80:
+                continue
+            if difflib.SequenceMatcher(None, atual, anterior).ratio() >= 0.82:
+                return True
+        return False
 
     async def falar_sozinha_async(self, ideia: str, **kwargs) -> Resultado:
         return await asyncio.to_thread(lambda: self.falar_sozinha(ideia, **kwargs))
@@ -398,7 +430,7 @@ class EVA:
                 resposta=resposta, plano=plano, usuario=usuario,
                 memorias_usadas={k: [m.conteudo for m in v] for k, v in memorias.items() if v},
                 ferramentas=resultados, memorias_novas=novas, contexto=ctx.bruto,
-                system=ctx.system,
+                system=ctx.prompt_completo(),
                 ms=int((time.time() - inicio) * 1000), erro=erro,
             )
 
@@ -737,7 +769,41 @@ class EVA:
             ).start()
 
     async def _extrair_e_salvar_async(self, usuario: str) -> None:
+        await self._esperar_ocioso()
         await asyncio.to_thread(self._extrair_e_salvar, usuario)
+
+    async def _esperar_ocioso(self, teto: float = 30.0) -> None:
+        """Segura uma tarefa de fundo até a EVA não estar mais no meio de
+        um turno.
+
+        MEDIDO (log de call, 26/08): a extração de memória roda no
+        servidor de decisão, que divide GPU com o conversacional. Rodando
+        junto com a resposta, o decisor caiu de 65-74 tok/s pra 10.70
+        tok/s -- 6x mais lento -- e essa lentidão foi paga pela pessoa
+        que estava esperando a EVA responder. No mesmo log, quatro dessas
+        extrações terminaram em "nada extraído neste turno": custo real,
+        resultado nenhum.
+
+        Extração é assíncrona por natureza -- ninguém está esperando por
+        ela. Rodar 3s depois não muda nada; rodar em cima do turno muda
+        tudo.
+
+        `ocupado_agora` é injetado por quem integra (ver bridge_client).
+        Sem ele -- CLI, testes -- o comportamento é o de antes: roda já.
+        O teto existe porque um callback que nunca solta (bug ou call
+        muito longa) não deve congelar a extração pra sempre.
+        """
+        checar = getattr(self, "ocupado_agora", None)
+        if checar is None:
+            return
+        limite = time.time() + teto
+        try:
+            while checar() and time.time() < limite:
+                await asyncio.sleep(0.5)
+        except Exception:
+            # Callback quebrado não pode derrubar a extração -- só perde
+            # a espera, que é otimização, não requisito.
+            return
 
     def _extrair_e_salvar(self, usuario: str) -> None:
         """O trabalho de verdade: busca histórico recente, pede fatos ao

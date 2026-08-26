@@ -43,6 +43,20 @@ class ClienteRobo:
         # request.
         self._lock = asyncio.Lock()
 
+        # Reconexão automática em BACKGROUND (heartbeat, checagem de
+        # segurança periódica -- ninguém está esperando o resultado na
+        # hora) para depois de algumas falhas seguidas, em vez de
+        # martelar pra sempre contra um servidor genuinamente fora do
+        # ar. Isso é só pra reduzir ruído de log quando o robô fica
+        # desligado por um tempo -- com o botão "Conectar agora" no
+        # dashboard (robot_tools.conectar_dashboard) e qualquer comando
+        # de verdade (voz/decisão) sempre tentando de novo (ver _enviar,
+        # parâmetro `background`), a reconexão nunca fica de fato presa:
+        # só o retry silencioso em segundo plano é que desiste.
+        self._falhas_conexao_consecutivas = 0
+        self._max_falhas_antes_de_desistir_em_background = 5
+        self._desistiu_reconexao_background = False
+
     async def conectar(self, timeout: float = 3.0) -> bool:
         """Timeout curto e explícito: sem isso, um robô desligado/
         inacessível na rede faz `open_connection` ficar pendurado por
@@ -54,11 +68,29 @@ class ClienteRobo:
             self.reader, self.writer = await asyncio.wait_for(
                 asyncio.open_connection(self.host, self.port), timeout=timeout)
             self.conectado = True
+            self._falhas_conexao_consecutivas = 0
+            self._desistiu_reconexao_background = False
             print(f"[robo] conectado em {self.host}:{self.port} (fonte={self.fonte})")
             return True
         except (OSError, ConnectionError, asyncio.TimeoutError) as e:
             self.conectado = False
-            print(f"[robo] sem conexão com {self.host}:{self.port} ({e})")
+            self._falhas_conexao_consecutivas += 1
+            # Só imprime até desistir em background -- depois disso,
+            # continua contando a falha (silenciosamente) mas não repete
+            # a mesma linha pra sempre. Uma tentativa manual (botão do
+            # dashboard, ou qualquer comando real que ignore o flag de
+            # desistência) sempre volta a imprimir, porque reseta o
+            # contador em caso de sucesso e é a via que "quebra" o
+            # silêncio de propósito.
+            if not self._desistiu_reconexao_background:
+                print(f"[robo] sem conexão com {self.host}:{self.port} ({e})")
+            if self._falhas_conexao_consecutivas >= self._max_falhas_antes_de_desistir_em_background \
+                    and not self._desistiu_reconexao_background:
+                self._desistiu_reconexao_background = True
+                print(f"[robo] desistindo de tentar reconectar sozinho em segundo plano "
+                      f"após {self._falhas_conexao_consecutivas} falhas seguidas -- "
+                      f"use o botão 'Conectar agora' no dashboard, ou peça pra ela usar o corpo, "
+                      f"quando o robô estiver acessível de novo.")
             return False
 
     async def desconectar(self) -> None:
@@ -71,14 +103,32 @@ class ClienteRobo:
         self.conectado = False
 
     async def _enviar(self, cmd: str, params: dict | None = None, *,
-                       ttl_ms: int = 300, timeout: float = 5.0) -> dict:
+                       ttl_ms: int = 300, timeout: float = 5.0,
+                       background: bool = False) -> dict:
         """Manda um CommandEnvelope e espera UMA linha de resposta.
         Nunca levanta exceção -- erro de conexão/timeout vira
         {"ok": False, "erro": ...}, mesma regra de toda ferramenta do
-        projeto (ver registry.py)."""
-        if not self.conectado and not await self.conectar():
-            return {"ok": False, "erro": "robo_desconectado",
-                     "detalhe": "eva_command_server não está acessível"}
+        projeto (ver registry.py).
+
+        `background=True` é só pra chamadas automáticas onde ninguém
+        está esperando o resultado na hora (heartbeat, checagem de
+        segurança periódica) -- essas respeitam
+        `_desistiu_reconexao_background` e não tentam `conectar()` de
+        novo depois de várias falhas seguidas (ver conectar()), pra não
+        martelar sozinhas contra um servidor genuinamente fora do ar.
+        `background=False` (default, usado por toda ação real: drive,
+        head, stop, estop, reset_estop, e get_state quando chamado por
+        ferramenta de verdade ou pelo dashboard) SEMPRE tenta conectar,
+        ignorando esse flag -- com o botão 'Conectar agora' existindo,
+        não faz sentido nenhum comando de verdade desistir sem tentar só
+        porque o retry silencioso em segundo plano já tinha desistido."""
+        if not self.conectado:
+            if background and self._desistiu_reconexao_background:
+                return {"ok": False, "erro": "robo_desconectado",
+                        "detalhe": "eva_command_server não está acessível"}
+            if not await self.conectar():
+                return {"ok": False, "erro": "robo_desconectado",
+                         "detalhe": "eva_command_server não está acessível"}
 
         self._seq += 1
         envelope = {
@@ -115,8 +165,8 @@ class ClienteRobo:
 
     # ------------------------------------------------------------ ações
 
-    async def estado(self) -> dict:
-        return await self._enviar("get_state")
+    async def estado(self, *, background: bool = False) -> dict:
+        return await self._enviar("get_state", background=background)
 
     async def mover(self, vx: float = 0.0, vy: float = 0.0, vz: float = 0.0,
                      speed_scale: float | None = None, ttl_ms: int = 500) -> dict:
@@ -138,7 +188,7 @@ class ClienteRobo:
         return await self._enviar("stop")
 
     async def heartbeat(self) -> dict:
-        return await self._enviar("heartbeat")
+        return await self._enviar("heartbeat", background=True)
 
     async def estop(self, motivo: str = "eva solicitou parada de emergência") -> dict:
         return await self._enviar("estop", {"motivo": motivo})
@@ -187,7 +237,11 @@ async def _loop_comandos(cliente: ClienteRobo) -> None:
 
 
 async def _main() -> None:
-    cliente = ClienteRobo()
+    import os
+
+    host = os.environ.get("EVA_ROBOT_HOST", "127.0.0.1")
+    port = int(os.environ.get("EVA_ROBOT_PORT", "5000"))
+    cliente = ClienteRobo(host=host, port=port)
     await _loop_comandos(cliente)
     await cliente.desconectar()
 

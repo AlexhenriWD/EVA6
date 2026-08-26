@@ -204,10 +204,16 @@ def _comando(eva: EVA, linha: str) -> bool:
   /prompt       mostra o system prompt EXATO enviado na última resposta
   /memoria      o que a EVA sabe sobre você
   /historia     fatos sobre a própria EVA (identidade/lore, seed_historia_eva.py)
+  /lembrar_historia X   adiciona um fato sobre a própria EVA (identidade/lore)
   /estado       mundo interno (energia, curiosidade...)
   /lembrar X    guarda um fato sobre você
   /esquecer X   remove memórias sobre VOCÊ que casem com X
   /esquecer_historia X   remove fatos da EVA (identidade/lore) que casem com X
+  /esquecer_id N   remove UM fato específico pelo id exato (visto em /memoria
+                    ou /historia) -- caminho seguro quando /esquecer_historia
+                    arriscaria pegar mais do que o pretendido (ver nota no
+                    código: score_minimo=0.0 + limite=50 pode casar TODOS os
+                    fatos de um escopo pequeno, não só os relevantes)
   /limpar       apaga o histórico da conversa (memórias ficam)
   /sair
 """)
@@ -257,6 +263,18 @@ def _comando(eva: EVA, linha: str) -> bool:
         else:
             eva.lembrar(arg)
             print(f"guardado: {arg}")
+    elif cmd == "/lembrar_historia":
+        if not arg:
+            print("uso: /lembrar_historia <fato>")
+        else:
+            eva.lembrar(arg, usuario=USUARIO_HISTORIA)
+            print(f"guardado na história da EVA: {arg}")
+    elif cmd == "/esquecer_id":
+        if not arg or not arg.strip().lstrip("-").isdigit():
+            print("uso: /esquecer_id <id numérico> (veja o id em /memoria ou /historia)")
+        else:
+            eva.memoria.esquecer(int(arg.strip()))
+            print(f"fato {arg.strip()} desativado")
     elif cmd == "/esquecer":
         if not arg:
             print("uso: /esquecer <termo>")

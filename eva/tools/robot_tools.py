@@ -45,14 +45,20 @@ import os
 import queue
 import re
 import threading
+from typing import Callable
 
 from ..integrations.robot_client import ClienteRobo
+from ..integrations.robot_video_client import ClienteVideoRobo
 from .registry import registro
 
 _cliente: ClienteRobo | None = None
+_cliente_video: ClienteVideoRobo | None = None
 _loop: asyncio.AbstractEventLoop | None = None
 _thread: threading.Thread | None = None
 _pronto = threading.Event()
+# Protege só a CRIAÇÃO da thread (não o resto de _iniciar_thread_robo) --
+# ver docstring da função pra o bug real que isso fecha.
+_lock_inicio = threading.Lock()
 
 # ===========================================================================
 # PONTE PRA CONSCIÊNCIA -- ver bridge_client.py (_ligar_visao_se_precisar/
@@ -70,6 +76,7 @@ _pronto = threading.Event()
 
 _em_call = threading.Event()
 _eventos_corpo: "queue.Queue[str]" = queue.Queue()
+_consciencia_callback: Callable[[str], None] | None = None
 
 # Última leitura de safety vista por _detectar_transicao_seguranca -- só
 # emite impulso na TRANSIÇÃO (ex: virou emergency_stop AGORA), não a cada
@@ -78,32 +85,59 @@ _ultimo_estado_seguranca: dict | None = None
 
 HEARTBEAT_INTERVALO_S = float(os.environ.get("EVA_ROBOT_HEARTBEAT_S", "0.5"))
 BATERIA_MINIMA_SEGURA_V = float(os.environ.get("EVA_ROBOT_BATERIA_MINIMA", "6.6"))
+# A cada quantos ticks de heartbeat o estado completo é buscado só pra
+# checar transição de segurança (ver _ciclo_heartbeat). Com o default de
+# HEARTBEAT_INTERVALO_S, isso fica em poucos segundos -- bem abaixo dos
+# 300s de antes (quando essa checagem só vivia em _ciclo_iniciativa),
+# sem virar um estado() a cada 0.5-1s.
+CHECAGEM_SEGURANCA_A_CADA_N_TICKS = int(os.environ.get("EVA_ROBOT_CHECAGEM_SEGURANCA_TICKS", "4"))
 
 
 def _iniciar_thread_robo() -> None:
     """Sobe a thread com o event loop dedicado, uma vez só, preguiçoso --
-    só na primeira chamada de ferramenta de robô de verdade."""
+    só na primeira chamada de ferramenta de robô de verdade.
+
+    BUG REAL corrigido aqui: com duas ferramentas robo_* do mesmo plano
+    rodando em paralelo (ver orchestrator._executar_ferramentas), a
+    segunda chamada via `if _thread is not None: return` sempre vencia a
+    corrida ANTES de `_pronto.wait()` -- ela via a thread já criada pela
+    primeira (só a criação, não a conexão) e retornava na hora, sem
+    esperar nada. `_chamar()` então via `_cliente`/`_loop` ainda None e
+    falhava com "thread de conexão não iniciou a tempo", mesmo com a
+    outra ferramenta do mesmo turno conectando com sucesso um instante
+    depois. Agora o lock protege só a CRIAÇÃO (uma vez só, como antes) e
+    `_pronto.wait()` roda pra QUALQUER chamador, criador ou não -- quem
+    chega depois espera a mesma inicialização em vez de desistir cedo.
+    """
     global _thread
-    if _thread is not None:
-        return
+    with _lock_inicio:
+        if _thread is None:
+            def rodar_loop():
+                global _cliente, _cliente_video, _loop
+                _loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(_loop)
+                host = os.environ.get("EVA_ROBOT_HOST", "127.0.0.1")
+                porta = int(os.environ.get("EVA_ROBOT_PORT", "5000"))
+                porta_video = int(os.environ.get("EVA_ROBOT_VIDEO_PORT", "8000"))
+                _cliente = ClienteRobo(host=host, port=porta, fonte="eva")
+                _cliente_video = ClienteVideoRobo(host=host, port=porta_video)
+                _pronto.set()
+                # Sempre agendados, independente do valor inicial de
+                # _iniciativa_ativa -- controle de liga/desliga é checado a
+                # cada ciclo (ver definir_iniciativa), não só na
+                # inicialização.
+                _loop.create_task(_ciclo_heartbeat())
+                _loop.create_task(_ciclo_iniciativa())
+                _loop.create_task(_cliente_video.rodar())
+                _loop.run_forever()
 
-    def rodar_loop():
-        global _cliente, _loop
-        _loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(_loop)
-        host = os.environ.get("EVA_ROBOT_HOST", "127.0.0.1")
-        porta = int(os.environ.get("EVA_ROBOT_PORT", "5000"))
-        _cliente = ClienteRobo(host=host, port=porta, fonte="eva")
-        _pronto.set()
-        # Sempre agendados, independente do valor inicial de
-        # _iniciativa_ativa -- controle de liga/desliga é checado a cada
-        # ciclo (ver definir_iniciativa), não só na inicialização.
-        _loop.create_task(_ciclo_heartbeat())
-        _loop.create_task(_ciclo_iniciativa())
-        _loop.run_forever()
+            _thread = threading.Thread(target=rodar_loop, daemon=True, name="eva-robot")
+            _thread.start()
 
-    _thread = threading.Thread(target=rodar_loop, daemon=True, name="eva-robot")
-    _thread.start()
+    # Fora do lock de propósito: se ficasse dentro, um segundo chamador
+    # ficaria preso esperando o lock (que só solta depois do rodar_loop
+    # arrancar) em vez de simplesmente esperar _pronto -- funcionalmente
+    # parecido, mas prende o lock por mais tempo que o necessário à toa.
     _pronto.wait(timeout=5)
 
 
@@ -209,14 +243,17 @@ def robo_estado() -> dict:
 
 @registro.adicionar(
     "robo_mover",
-    "Move o robô continuamente na direção dada por um curto período (o "
-    "servidor tem um teto de tempo por comando, não fica andando pra "
-    "sempre). vx=frente(+)/trás(-), vy=lateral direita(+)/esquerda(-), "
+    "Move o robô na direção dada. Anda por cerca de 1 segundo e PARA "
+    "SOZINHA -- se quiser continuar andando, chame de novo. "
+    "vx=frente(+)/trás(-), vy=lateral direita(+)/esquerda(-), "
     "vz=giro horário(+)/anti-horário(-), todos de -1.0 a 1.0 -- use "
     "valores pequenos (0.2-0.4) a menos que tenha certeza do caminho. O "
-    "servidor recusa o comando se detectar obstáculo, bateria crítica ou "
-    "emergency stop ativo -- se vier erro, NÃO insista no mesmo comando, "
-    "chame robo_estado pra entender o motivo antes de tentar de novo.",
+    "resultado já vem com distancia_obstaculo_cm (leitura atual do "
+    "sensor) -- confira antes de chamar de novo, principalmente se o "
+    "valor estiver baixo. O servidor recusa o comando se detectar "
+    "obstáculo, bateria crítica ou emergency stop ativo -- se vier erro, "
+    "NÃO insista no mesmo comando, chame robo_estado pra entender o "
+    "motivo antes de tentar de novo.",
     {"vx": "-1.0 a 1.0 (frente/trás)", "vy": "-1.0 a 1.0 (lateral)",
      "vz": "-1.0 a 1.0 (giro)"},
 )
@@ -226,17 +263,61 @@ def robo_mover(vx: float = 0.0, vy: float = 0.0, vz: float = 0.0) -> dict:
     return _talvez_emitir_recusa(_desembrulhar(_chamar(_fn)))
 
 
+def _ver_agora(prompt: str | None = None) -> dict:
+    """Captura o quadro mais recente da câmera do robô e pede pro modelo
+    de visão descrever. Usado por robo_ver e por robo_olhar (depois de
+    mover a cabeça). Nunca levanta exceção -- erro de captura ou de
+    visão vira {"erro": ...}, mesma convenção do resto do projeto."""
+    from ..vision.minicpm import ErroVisao, PROMPT_CENA_ROBO
+    _iniciar_thread_robo()
+    quadro = obter_quadro_camera()
+    if quadro is None:
+        return {"erro": "sem_video",
+                "detalhe": "ainda sem quadro da câmera -- conexão de vídeo pode não ter estabelecido ainda"}
+    try:
+        descricao = _cliente_visao_robo().analisar([quadro], prompt or PROMPT_CENA_ROBO)
+        return {"descricao_cena": descricao}
+    except ErroVisao as e:
+        return {"erro": "visao_falhou", "detalhe": str(e)[:200]}
+    except Exception as e:
+        return {"erro": "visao_falhou", "detalhe": str(e)[:200]}
+
+
+@registro.adicionar(
+    "robo_ver",
+    "Olha pela câmera do robô AGORA e descreve o que vê -- inclui "
+    "pessoas, se houver. Use quando quiser saber o que tem à frente sem "
+    "mover a cabeça nem o corpo. Se quiser olhar pra outra direção "
+    "primeiro, use robo_olhar (que já descreve sozinho depois de mover, "
+    "não precisa chamar os dois).",
+)
+def robo_ver() -> dict:
+    return _ver_agora()
+
+
 @registro.adicionar(
     "robo_olhar",
-    "Move a cabeça do robô (base/yaw e ombro/pitch), em graus. Use pra "
-    "olhar em volta sem deslocar o corpo -- prefira isso a robo_mover "
-    "quando o objetivo é só ver algo, não chegar em algum lugar.",
+    "Move a cabeça do robô (base/yaw e ombro/pitch), em graus, E já "
+    "descreve o que a câmera vê na posição nova -- inclui pessoas, se "
+    "houver. Use pra olhar em volta sem deslocar o corpo -- prefira "
+    "isso a robo_mover quando o objetivo é só ver algo, não chegar em "
+    "algum lugar. Demora um pouco mais que outros comandos (o movimento "
+    "em si é rápido, mas descrever a cena leva alguns segundos) -- é "
+    "esperado.",
     {"yaw": "graus, 0-180, opcional", "pitch": "graus, 0-180, opcional"},
 )
 def robo_olhar(yaw: int | None = None, pitch: int | None = None) -> dict:
     async def _fn(cliente: ClienteRobo):
         return await cliente.olhar(yaw=yaw, pitch=pitch)
-    return _talvez_emitir_recusa(_desembrulhar(_chamar(_fn)))
+    resultado = _talvez_emitir_recusa(_desembrulhar(_chamar(_fn)))
+    if isinstance(resultado, dict) and not resultado.get("erro"):
+        # Erro de visão aqui não vira erro do robo_olhar -- o movimento
+        # em si já teve sucesso; câmera/modelo de visão fora do ar não
+        # deveria fazer parecer que a cabeça não se moveu.
+        visao = _ver_agora()
+        if visao.get("descricao_cena"):
+            resultado["descricao_cena"] = visao["descricao_cena"]
+    return resultado
 
 
 @registro.adicionar(
@@ -256,6 +337,30 @@ def robo_parar() -> dict:
 # heartbeat regular aciona emergency stop sozinho (por bom motivo -- se
 # ninguém está de fato supervisionando, parar é o padrão seguro).
 # ===========================================================================
+
+# Depois de tantas falhas seguidas, para de logar cada tick. O robô
+# desligado é o caso NORMAL (EVA roda sem ele o tempo todo), e com
+# HEARTBEAT_INTERVALO_S de 0.5-1s isso rendia uma linha por segundo pra
+# sempre -- 349 linhas numa call de teste, afogando [visao], [eva] e
+# [consciencia] no terminal. Antes de silenciar, ainda imprime as
+# primeiras: essas SIM importam, é quando a queda acabou de acontecer.
+FALHAS_ATE_SILENCIAR = int(os.environ.get("EVA_ROBOT_HEARTBEAT_FALHAS_LOG", "5"))
+
+# Já silenciado, ainda solta uma linha esporádica -- sem isso não dá pra
+# distinguir "robô fora do ar" de "o ciclo de heartbeat morreu", e essa
+# distinção é justamente o que o DIAGNÓSTICO acima precisava enxergar.
+FALHAS_LEMBRETE_A_CADA = int(os.environ.get("EVA_ROBOT_HEARTBEAT_LEMBRETE", "300"))
+
+
+def _deve_logar_falha(n: int) -> bool:
+    """Primeiras N falhas sempre; depois só de FALHAS_LEMBRETE_A_CADA em
+    FALHAS_LEMBRETE_A_CADA. A contagem consecutiva continua subindo e
+    aparecendo na linha, então o diagnóstico não perde informação -- só
+    para de repetir a mesma linha centenas de vezes."""
+    if n <= FALHAS_ATE_SILENCIAR:
+        return True
+    return n % FALHAS_LEMBRETE_A_CADA == 0
+
 
 async def _ciclo_heartbeat() -> None:
     """Roda pra sempre em segundo plano, independente do que estiver
@@ -279,6 +384,22 @@ async def _ciclo_heartbeat() -> None:
     `_cliente.conectado` diz -- é `cliente.heartbeat()` (via `_enviar`)
     quem decide se precisa reconectar primeiro, não este loop.
 
+    CORRIGIDO (segundo achado, ligado à revisão de segurança do
+    safety.py): _detectar_transicao_seguranca() antes só rodava dentro
+    de _ciclo_iniciativa, no cadence de INICIATIVA_INTERVALO_S (padrão
+    300s) -- e só quando havia call ativa E iniciativa ligada. Com o
+    fix em safety.py que agora aciona emergency_stop de verdade a partir
+    do monitoramento contínuo (não só no instante de um comando `drive`),
+    uma transição de segurança pode acontecer a qualquer momento, mesmo
+    sem ela ter tentado se mover -- e o comentário sobre isso ("acabei de
+    entrar em emergency stop") podia demorar até 5min pra sair, porque
+    dependia do próximo tick lento de iniciativa. Este loop já roda a
+    cada HEARTBEAT_INTERVALO_S (0.5-1s) incondicionalmente, então é o
+    lugar certo pra essa checagem -- não a cada heartbeat (isso trocaria
+    "sinal de vida leve" por "polling pesado" de estado completo), mas a
+    cada CHECAGEM_SEGURANCA_A_CADA_N_TICKS ticks, o que já derruba o
+    atraso de 300s pra poucos segundos sem sobrecarregar a conexão.
+
     DIAGNÓSTICO (achado em uso real, ainda não totalmente explicado):
     apareceu pelo menos uma vez watchdog timeout de 16.2s durante uma
     pausa de confirmação do testar_robo.py, mesmo com este ciclo
@@ -294,19 +415,50 @@ async def _ciclo_heartbeat() -> None:
     disparar de novo, o terminal do PC vai mostrar ONDE parou, em vez
     de só o resultado final (o timeout no Pi)."""
     falhas_consecutivas = 0
+    ticks = 0
     while True:
         await asyncio.sleep(HEARTBEAT_INTERVALO_S)
+        ticks += 1
         if _cliente is not None:
             try:
                 r = await _cliente.heartbeat()
                 if r.get("ok"):
+                    if falhas_consecutivas >= FALHAS_ATE_SILENCIAR:
+                        # Só avisa da volta se ele tinha sumido de fato --
+                        # senão um soluço de rede de 1 tick viraria duas
+                        # linhas de log em vez de zero.
+                        print(f"[heartbeat-robo] robô respondeu de novo "
+                              f"(depois de {falhas_consecutivas} falhas)")
                     falhas_consecutivas = 0
                 else:
                     falhas_consecutivas += 1
-                    print(f"[heartbeat-robo] falhou (consecutiva #{falhas_consecutivas}): {r}")
+                    if _deve_logar_falha(falhas_consecutivas):
+                        print(f"[heartbeat-robo] falhou "
+                              f"(consecutiva #{falhas_consecutivas}): {r}")
             except Exception as e:
                 falhas_consecutivas += 1
-                print(f"[heartbeat-robo] exceção (consecutiva #{falhas_consecutivas}): {e}")
+                if _deve_logar_falha(falhas_consecutivas):
+                    print(f"[heartbeat-robo] exceção "
+                          f"(consecutiva #{falhas_consecutivas}): {e}")
+
+            # Checagem de segurança em separado do heartbeat em si --
+            # heartbeat continua leve e roda todo tick; isto aqui só
+            # busca o estado completo a cada N ticks (ver constante),
+            # exatamente pra notar transição de segurança rápido sem
+            # virar polling pesado a cada 0.5-1s.
+            if ticks % CHECAGEM_SEGURANCA_A_CADA_N_TICKS == 0:
+                try:
+                    resposta_estado = await _cliente.estado(background=True)
+                    if resposta_estado.get("ok"):
+                        _detectar_transicao_seguranca(
+                            resposta_estado.get("estado", {}).get("safety") or {}
+                        )
+                except Exception as e:
+                    # Mesmo critério do heartbeat: com o robô fora do ar
+                    # esta checagem falha junto, e logar as duas por tick
+                    # dobrava o ruído.
+                    if _deve_logar_falha(falhas_consecutivas or 1):
+                        print(f"[heartbeat-robo] checagem de segurança falhou: {e}")
 
 
 # ===========================================================================
@@ -333,19 +485,30 @@ INICIATIVA_INTERVALO_S = int(os.environ.get("EVA_ROBOT_INICIATIVA_INTERVALO", "3
 DURACAO_MAX_MOVIMENTO_S = float(os.environ.get("EVA_ROBOT_INICIATIVA_DURACAO_MAX", "1.5"))
 VELOCIDADE_MAX_INICIATIVA = float(os.environ.get("EVA_ROBOT_INICIATIVA_VELOCIDADE_MAX", "0.4"))
 
-PROMPT_INICIATIVA = """Você está com um corpo físico agora -- um robô com rodas, câmera e cabeça móvel -- sozinha, sem ninguém pedindo nada. Você pode escolher se mexer um pouco (olhar em volta ou andar um pouco), ou simplesmente não fazer nada -- as duas são respostas válidas, não precisa preencher o tempo com ação sem motivo real.
+PROMPT_INICIATIVA = """Você está com um corpo físico agora -- um robô com rodas, câmera e cabeça móvel -- sozinha, sem ninguém pedindo nada. Você pode escolher se mexer um pouco (olhar em volta ou andar um pouco), comentar algo sobre o que percebeu, as duas coisas, ou nenhuma.
 
 Estado atual do robô (real, agora):
 {estado}
 
-Decida: você quer se mexer agora, por conta própria? Se sim, o quê -- olhar em volta (ação "olhar", com yaw/pitch em graus) ou andar um pouco numa direção (ação "mover", com vx/vy/vz pequenos, tipo 0.3)? Se não, tudo bem também -- responda que não.
+Decida: quer se mexer, por conta própria? Se sim, o quê -- olhar (ação "olhar", yaw/pitch em graus) ou andar um pouco (ação "mover", vx/vy/vz pequenos, tipo 0.3)? Independente disso, tem algo que valeria comentar em voz alta agora (bateria, algo notado, o próprio movimento)? Se não tiver nada que valha a pena, "comentario" fica null -- não precisa preencher.
 
 Responda APENAS um JSON, sem mais nada:
-{{"agir": true, "acao": "olhar", "yaw": 60, "pitch": 100}}
+{{"agir": true, "acao": "olhar", "yaw": 60, "pitch": 100, "comentario": null}}
 ou
-{{"agir": true, "acao": "mover", "vx": 0.3, "vy": 0.0, "vz": 0.0}}
+{{"agir": true, "acao": "mover", "vx": 0.3, "vy": 0.0, "vz": 0.0, "comentario": "vou dar uma olhada aí"}}
 ou
-{{"agir": false}}"""
+{{"agir": false, "comentario": "a bateria está ficando baixa, vale avisar"}}
+ou
+{{"agir": false, "comentario": null}}"""
+
+
+def definir_consciencia_callback(callback: Callable[[str], None] | None) -> None:
+    """Registra o destino dos comentários do ciclo de iniciativa.
+
+    Sem uma call ativa o callback fica nulo e o comentário é descartado.
+    """
+    global _consciencia_callback
+    _consciencia_callback = callback
 
 
 def definir_iniciativa(ativo: bool) -> None:
@@ -391,6 +554,29 @@ def drenar_eventos_corpo() -> list[str]:
         except queue.Empty:
             break
     return eventos
+
+
+def conectar_dashboard() -> dict:
+    """Força a conexão com o robô a partir do painel -- botão 'conectar
+    agora', pra não depender só do warm-up automático ao entrar numa call
+    (bridge_client._ligar_robo_consciencia_se_precisar) nem da primeira
+    ferramenta robo_* ser chamada de verdade em conversa.
+
+    Diferente de parar_dashboard/estop_dashboard/reset_estop_dashboard
+    (que usam _chamar, e portanto já supõem uma thread capaz de
+    responder), este é o único caso que chama _iniciar_thread_robo()
+    diretamente -- é a própria ação de subir a conexão, não uma ação que
+    depende dela já estar de pé. _iniciar_thread_robo() já é idempotente
+    (só cria a thread uma vez, protegida por _lock_inicio -- ver
+    docstring dela) e espera até 5s por _pronto antes de devolver, então
+    clicar de novo com o robô já conectado é seguro e rápido (retorna na
+    hora, sem reconectar à toa)."""
+    _iniciar_thread_robo()
+    conectado = _cliente is not None and _cliente.conectado
+    if not conectado:
+        return {"ok": False, "erro": "robo_desconectado",
+                "detalhe": "thread subiu mas conexão não se estabeleceu a tempo"}
+    return {"ok": True, "conectado": True}
 
 
 def status_dashboard() -> dict:
@@ -466,6 +652,29 @@ def reset_estop_dashboard() -> dict:
     return _desembrulhar(_chamar(_fn, timeout=3.0))
 
 
+def obter_quadro_camera() -> bytes | None:
+    """Último quadro JPEG da câmera do robô, se houver conexão de vídeo
+    ativa -- usado por vision/visao_robo.py (SistemaVisualRobo), que não
+    precisa conhecer ClienteVideoRobo por dentro, só pedir o quadro
+    atual. None se a conexão de vídeo ainda não subiu ou ainda não
+    chegou quadro nenhum."""
+    return _cliente_video.ultimo_frame if _cliente_video is not None else None
+
+
+def _cliente_visao_robo():
+    """Cliente de visão pro robô -- reusa a MESMA config de cfg.visao
+    (mesmo servidor/modelo que já atende a visão de tela, ver visao.py);
+    só o prompt muda (PROMPT_CENA_ROBO em vez de PROMPT_CENA). Resolvido
+    a partir da config carregada do zero, mesmo motivo de
+    _clientes_llm_decisao(): este módulo não tem instância viva de EVA
+    por perto."""
+    from ..config import carregar_config
+    from ..vision.minicpm import ClienteVisao
+    cfg = carregar_config().visao
+    return ClienteVisao(base_url=cfg.base_url, modelo=cfg.modelo,
+                         api_key=cfg.api_key, timeout=cfg.timeout)
+
+
 def _clientes_llm_decisao():
     """Monta o par (cliente principal, cliente reserva) pra decisão
     pequena e estruturada -- mesma fábrica que orchestrator.py usa via
@@ -495,17 +704,21 @@ def _detectar_transicao_seguranca(seg: dict) -> None:
     """Compara a leitura de safety deste tick com a do tick anterior e
     emite evento corporal só na TRANSIÇÃO (virou X agora), nunca a cada
     tick que já está em X -- senão "ainda em emergency stop" repetiria a
-    cada INICIATIVA_INTERVALO_S e viraria ruído.
+    cada tick e viraria ruído.
 
-    LIMITAÇÃO CONHECIDA (v1, de propósito -- ver conversa com Alex):
-    isso só roda dentro de _ciclo_iniciativa, ou seja, no cadence de
-    INICIATIVA_INTERVALO_S (padrão 5min) e só quando há call ativa. Uma
-    transição de segurança que aconteça SEM nenhum comando EVA envolvido
-    (ex: bateria caindo sozinha enquanto ela não tenta nada) pode demorar
-    até 5min pra virar impulso. Recusa de comando (_talvez_emitir_recusa)
-    já é instantânea porque não depende deste polling -- é a via mais
-    comum de qualquer forma, já que quase toda transição de segurança
-    real acontece EM RESPOSTA a uma tentativa de mover."""
+    CORRIGIDO (era v1, de propósito, agora fechado): antes só rodava
+    dentro de _ciclo_iniciativa (cadence de INICIATIVA_INTERVALO_S,
+    padrão 5min) e só quando havia call ativa -- uma transição de
+    segurança sem nenhum comando EVA envolvido podia demorar até 5min
+    pra virar impulso. Agora roda também dentro de _ciclo_heartbeat (a
+    cada CHECAGEM_SEGURANCA_A_CADA_N_TICKS ticks de heartbeat, tipo
+    poucos segundos), incondicional -- não depende mais de iniciativa
+    ligada nem de call ativa. Recusa de comando (_talvez_emitir_recusa)
+    continua sendo a via mais comum e instantânea de qualquer forma, já
+    que quase toda transição de segurança real acontece EM RESPOSTA a
+    uma tentativa de mover -- isto aqui cobre o resto: transição
+    espontânea (bateria caindo sozinha, obstáculo aparecendo) sem
+    nenhuma tentativa de mover envolvida."""
     global _ultimo_estado_seguranca
 
     bateria = (seg.get("last_sensor_data") or {}).get("battery_v")
@@ -565,6 +778,13 @@ async def _ciclo_iniciativa() -> None:
 
             # Nota a transição de segurança MESMO que o tick decida não
             # agir logo depois -- ver docstring de _detectar_transicao_seguranca.
+            # Chamada aqui TAMBÉM (além de agora rodar dentro de
+            # _ciclo_heartbeat, bem mais frequente) não duplica comentário:
+            # a função compara contra o último estado global visto de
+            # QUALQUER lugar, então na prática o heartbeat já vai ter
+            # pego a transição antes deste tick lento chegar -- isto aqui
+            # só continua existindo como rede de segurança caso o
+            # heartbeat esteja falhando por algum motivo nesse momento.
             _detectar_transicao_seguranca(estado.get("safety") or {})
 
             ok, motivo = _seguro_para_iniciativa(estado)
@@ -580,39 +800,44 @@ async def _ciclo_iniciativa() -> None:
             if not m:
                 continue
             decisao = json.loads(m.group(0))
-            if not decisao.get("agir"):
-                continue  # "decidiu não fazer nada" não gera log de propósito -- é o resultado esperado na maior parte do tempo
+            if decisao.get("agir"):
+                acao = decisao.get("acao")
+                if acao == "olhar":
+                    yaw = decisao.get("yaw")
+                    pitch = decisao.get("pitch")
+                    resultado = await _cliente.olhar(yaw=yaw, pitch=pitch)
+                    if resultado.get("ok"):
+                        print(f"[iniciativa-robo] olhou por conta própria: yaw={yaw} pitch={pitch}")
+                    else:
+                        print(f"[iniciativa-robo] olhar recusado: {resultado.get('erro')}")
 
-            acao = decisao.get("acao")
-            if acao == "olhar":
-                yaw = decisao.get("yaw")
-                pitch = decisao.get("pitch")
-                resultado = await _cliente.olhar(yaw=yaw, pitch=pitch)
-                if resultado.get("ok"):
-                    print(f"[iniciativa-robo] olhou por conta própria: yaw={yaw} pitch={pitch}")
-                else:
-                    print(f"[iniciativa-robo] olhar recusado: {resultado.get('erro')}")
+                elif acao == "mover":
+                    vx = max(-VELOCIDADE_MAX_INICIATIVA, min(VELOCIDADE_MAX_INICIATIVA,
+                              float(decisao.get("vx", 0.0))))
+                    vy = max(-VELOCIDADE_MAX_INICIATIVA, min(VELOCIDADE_MAX_INICIATIVA,
+                              float(decisao.get("vy", 0.0))))
+                    vz = max(-VELOCIDADE_MAX_INICIATIVA, min(VELOCIDADE_MAX_INICIATIVA,
+                              float(decisao.get("vz", 0.0))))
+                    resultado = await _cliente.mover(
+                        vx=vx, vy=vy, vz=vz,
+                        ttl_ms=int(DURACAO_MAX_MOVIMENTO_S * 1000),
+                    )
+                    if resultado.get("ok"):
+                        print(f"[iniciativa-robo] moveu por conta própria: vx={vx} vy={vy} vz={vz}")
+                        # Duração decidida AQUI, não pelo modelo -- ver
+                        # docstring da seção. Depois de parar, o próximo
+                        # ciclo relê o estado real antes de decidir de novo.
+                        await asyncio.sleep(DURACAO_MAX_MOVIMENTO_S)
+                        await _cliente.parar()
+                    else:
+                        print(f"[iniciativa-robo] movimento recusado pelo servidor: {resultado.get('erro')}")
 
-            elif acao == "mover":
-                vx = max(-VELOCIDADE_MAX_INICIATIVA, min(VELOCIDADE_MAX_INICIATIVA,
-                          float(decisao.get("vx", 0.0))))
-                vy = max(-VELOCIDADE_MAX_INICIATIVA, min(VELOCIDADE_MAX_INICIATIVA,
-                          float(decisao.get("vy", 0.0))))
-                vz = max(-VELOCIDADE_MAX_INICIATIVA, min(VELOCIDADE_MAX_INICIATIVA,
-                          float(decisao.get("vz", 0.0))))
-                resultado = await _cliente.mover(
-                    vx=vx, vy=vy, vz=vz,
-                    ttl_ms=int(DURACAO_MAX_MOVIMENTO_S * 1000),
-                )
-                if resultado.get("ok"):
-                    print(f"[iniciativa-robo] moveu por conta própria: vx={vx} vy={vy} vz={vz}")
-                    # Duração decidida AQUI, não pelo modelo -- ver
-                    # docstring da seção. Depois de parar, o próximo
-                    # ciclo relê o estado real antes de decidir de novo.
-                    await asyncio.sleep(DURACAO_MAX_MOVIMENTO_S)
-                    await _cliente.parar()
-                else:
-                    print(f"[iniciativa-robo] movimento recusado pelo servidor: {resultado.get('erro')}")
+            comentario = decisao.get("comentario")
+            if comentario and _consciencia_callback:
+                try:
+                    _consciencia_callback(str(comentario))
+                except Exception as e:
+                    print(f"[iniciativa-robo] callback de comentário falhou: {e}")
             # ação desconhecida ou ausente: ignora silenciosamente, mesmo
             # espírito de "agir=false" não gerar ruído.
         except Exception as e:

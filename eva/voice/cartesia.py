@@ -19,19 +19,9 @@ DOIS CAMINHOS, mesma dupla que o Pocket TTS expõe:
 
   gerar_para_discord()       bloqueante -- um request só. Usado pelo
                               caminho padrão (EVA_VOZ_STREAMING=0).
-  gerar_frase_stream_sync()  streaming real via Server-Sent Events -- a
-                              Cartesia manda pedaço de áudio conforme
-                              gera. Não usa o contexto de WebSocket com
-                              push incremental de texto
-                              (client.tts.websocket_connect()/ctx.push()):
-                              aquilo existe pra quando o texto ainda está
-                              sendo gerado por um LLM e você quer mandar
-                              fragmento por fragmento; aqui a frase já
-                              chega inteira e fechada (extrair_frases_
-                              fechadas, audio_utils.py), então SSE
-                              simples já dá o streaming real que
-                              precisamos, sem gerenciar conexão
-                              persistente nem contexto.
+    gerar_frase_stream_sync()  streaming real via WebSocket persistente -- a
+                                                            conexão sobe uma vez por call e cada frase
+                                                            cria apenas um contexto novo dentro dela.
 
 ACHADO REAL (erro em produção): "'TtsClientWithWebsocket' object has no
 attribute 'generate'". O SDK oficial da Cartesia se declara oficialmente
@@ -199,6 +189,7 @@ class CartesiaTTSEngine:
         # uma vez em _validar_sync, não a cada frase.
         self._metodo_geracao: Callable | None = None
         self._metodo_sse: Callable | None = None
+        self._ws = None
 
     # ------------------------------------------------------- inicialização
 
@@ -240,6 +231,49 @@ class CartesiaTTSEngine:
         com mensagem clara em vez de um erro confuso na primeira fala.
         """
         self._validar_sync()
+
+    def _abrir_websocket(self):
+        """Abre ou reutiliza a conexão WebSocket persistente da call."""
+        if self._ws is not None and not getattr(self._ws, "closed", False):
+            return self._ws
+        websocket_connect = getattr(self._cliente.tts, "websocket_connect", None)
+        if websocket_connect is None:
+            # CONFIRMADO contra a doc oficial atual (docs.cartesia.ai/get-started/
+            # realtime-text-to-speech-quickstart): websocket_connect() + .context()
+            # é o método certo e atual, não um nome trocado entre versões -- o
+            # suporte a WebSocket é um EXTRA opcional do pacote ('cartesia[websockets]',
+            # não só 'cartesia'). Se foi instalado sem o extra, o cliente sobe normal
+            # (gerar_para_discord/client.tts.generate() continua funcionando) mas este
+            # método fica ausente. Ver também: pip show cartesia.
+            raise ErroCartesiaTTS(
+                "esta versão do SDK Cartesia não oferece websocket_connect() -- "
+                "o suporte a WebSocket é um extra opcional do pacote, não vem por "
+                "padrão. Rode: pip install -U \"cartesia[websockets]\""
+            )
+        # BUG REAL (confirmado inspecionando o SDK 4.0.1 direto): websocket_connect()
+        # devolve um TTSResourceConnectionManager -- só o GERENCIADOR do context
+        # manager, sem .context() nele mesmo. A conexão de verdade (TTSResourceConnection,
+        # que TEM .context()/.close()) é o que .enter() devolve. A versão anterior
+        # guardava o manager em self._ws e descartava esse retorno -- por isso o erro
+        # em produção era literalmente "'TTSResourceConnectionManager' object has no
+        # attribute 'context'". .enter() é o alias público documentado pelo próprio
+        # SDK pra usar fora de um bloco `with` (nosso caso: conexão persistente pela
+        # call inteira, fechada explicitamente em fechar()).
+        self._ws = websocket_connect().enter()
+        return self._ws
+
+    def fechar(self) -> None:
+        """Fecha a conexão persistente da Cartesia, se existir."""
+        if self._ws is not None:
+            try:
+                self._ws.close()
+            except Exception:
+                pass
+            self._ws = None
+
+    def _iterar_contexto(self, ctx):
+        receive = getattr(ctx, "receive", None)
+        return receive() if receive is not None else ctx
 
     def _voz(self) -> dict:
         return {"mode": "id", "id": self.voice_id}
@@ -287,48 +321,34 @@ class CartesiaTTSEngine:
     def gerar_frase_stream_sync(
         self, texto: str, chunk_bytes: int = FRAME_DISCORD * 6, lote_ms: int = 120,
     ) -> Iterator[bytes]:
-        """Streaming REAL via client.tts.sse() -- os pedaços que chegam
-        aqui já são a Cartesia gerando e mandando aos poucos, não um
-        artifício nosso de cortar um clipe pronto em fatias. Generator
-        SÍNCRONO e bloqueante de propósito, mesma assinatura de
-        pocket.py:gerar_frase_stream_sync -- dá pra trocar o backend em
-        bridge_client.py sem mudar uma linha lá, só o EVA_TTS_BACKEND
-        no .env.
+        """Streaming via WebSocket persistente.
 
+        `gerar_frase_stream_sync()`  streaming real via WebSocket persistente --
+        a Cartesia manda pedaços conforme gera. Cada frase usa um contexto novo
+        dentro da conexão, que é reutilizada durante a call.
         Acumula ~120ms antes de devolver pedaço, mesmo motivo do Pocket
         (evita fatiar tão fino que vire muita mensagem WebSocket pro
         bridge.js) -- aqui não é sobre artefato de resample (a Cartesia
         já manda amostra pronta), é só sobre granularidade de mensagem.
         """
-        texto = texto.strip()
-        if not texto:
-            return
-        self._validar_sync()
 
-        if self._metodo_sse is None:
-            try:
-                self._metodo_sse = _resolver_metodo(
-                    self._cliente.tts, _CANDIDATOS_SSE, "streaming SSE (gerar_frase_stream_sync)")
-            except ErroCartesiaTTS as e:
-                # Streaming é OPCIONAL: se esta versão do SDK não tem
-                # nenhum dos candidatos conhecidos, avisa uma vez e
-                # deixa o chamador (_sintetizar_e_enfileirar em
-                # bridge_client.py) cair pro gerar_frase_sync bloqueante
-                # sozinho -- não faz sentido derrubar o backend inteiro
-                # só porque o caminho de streaming especificamente mudou
-                # de nome de novo.
-                print(f"[cartesia-tts] {e}")
-                raise
-
-        buffer = bytearray()
         try:
-            eventos = self._metodo_sse(
+            ws = self._abrir_websocket()
+            ctx = ws.context(
                 model_id=self.model_id,
-                transcript=texto,
                 voice=self._voz(),
                 language=self.idioma,
                 output_format=self._formato_saida(),
             )
+            ctx.push(texto)
+            ctx.no_more_inputs()
+            eventos = self._iterar_contexto(ctx)
+        except Exception as e:
+            self.fechar()
+            raise ErroCartesiaTTS(f"Cartesia (websocket): {e}") from e
+
+        buffer = bytearray()
+        try:
             for evento in eventos:
                 pcm16_mono = _extrair_audio_do_evento(evento)
                 if not pcm16_mono:
@@ -340,7 +360,8 @@ class CartesiaTTSEngine:
                     yield bytes(buffer[:chunk_bytes])
                     del buffer[:chunk_bytes]
         except Exception as e:
-            raise ErroCartesiaTTS(f"Cartesia (streaming): {e}") from e
+            self.fechar()
+            raise ErroCartesiaTTS(f"Cartesia (websocket, no meio): {e}") from e
 
         if buffer:
             resto = len(buffer) % FRAME_DISCORD

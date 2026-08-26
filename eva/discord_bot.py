@@ -30,14 +30,6 @@ try:
 except ImportError:
     AgentMode = None
 
-try:
-    from minecraft.minecraft_server_manager import MinecraftServerManager
-    _MC_MANAGER_AVAILABLE = True
-except ImportError:
-    MinecraftServerManager = None
-    _MC_MANAGER_AVAILABLE = False
-    print("⚠️ MinecraftServerManager não disponível")
-    
 class EvaDiscordBot:
     """Encapsula toda a lógica do Discord Bot."""
 
@@ -70,20 +62,6 @@ class EvaDiscordBot:
         self.proactive_system     = proactive_system
         self.minecraft_integration = minecraft_integration
         self.minecraft_bridge     = None
-         # 🎮 Server Manager (inicia/para o Node.js)
-        self._mc_server_manager = None
-        if minecraft_integration is not None and _MC_MANAGER_AVAILABLE:
-            node_dir = os.getenv("MC_NODE_DIR", "minecraft")
-            self._mc_server_manager = MinecraftServerManager(
-                mc_integration=minecraft_integration,
-                node_dir=node_dir,
-                rpc_port=int(os.getenv("RPC_PORT", "8765")),
-                auto_restart=os.getenv("MC_AUTO_RESTART", "true").lower() == "true",
-                max_restarts=int(os.getenv("MC_MAX_RESTARTS", "5")),
-            )
-            self._mc_server_manager.on_node_up   = self._notify_mc_node_up
-            self._mc_server_manager.on_node_down = self._notify_mc_node_down
-            print(f"✅ MinecraftServerManager pronto | node_dir={node_dir}")
         self.consciousness        = consciousness   # EVAConsciousness
 
         if self.voice_system:
@@ -128,96 +106,6 @@ class EvaDiscordBot:
     # EVENTS
     # ════════════════════════════════════════════════════════════
 
-
-    # ── MINECRAFT SERVER CALLBACKS (métodos da classe) ───────────────────
-
-    async def _notify_mc_node_up(self, msg: str):
-        channel_id = self._get_mc_notify_channel()
-        if channel_id:
-            ch = self.bot.get_channel(channel_id)
-            if ch:
-                await ch.send(f"🟢 **Minecraft** | {msg}")
-        self._set_minecraft_context_active(True)
-
-    async def _notify_mc_node_down(self, msg: str):
-        channel_id = self._get_mc_notify_channel()
-        if channel_id:
-            ch = self.bot.get_channel(channel_id)
-            if ch:
-                await ch.send(f"🔴 **Minecraft** | {msg}")
-        self._set_minecraft_context_active(False)
-
-    def _get_mc_notify_channel(self):
-        raw   = os.getenv("MC_DISCORD_CHANNEL_ID", "")
-        clean = raw.split("#")[0].strip()
-        return int(clean) if clean.isdigit() else None
-
-    def _set_minecraft_context_active(self, active: bool):
-        try:
-            # Atualizar capability no identity_system (defensivo — suporta .core ou direto)
-            id_sys = getattr(self.eva_brain, "identity_system", None)
-            if id_sys:
-                if hasattr(id_sys, "core") and hasattr(id_sys.core, "set_capability"):
-                    id_sys.core.set_capability("minecraft", active)
-                elif hasattr(id_sys, "set_capability"):
-                    id_sys.set_capability("minecraft", active)
-
-            # Atualizar contexto no tools_manager
-            rg = getattr(self.eva_brain, "response_generator", None)
-            if rg and hasattr(rg, "tools_manager") and rg.tools_manager:
-                if active and self.minecraft_integration:
-                    try:
-                        mc_state = self.minecraft_integration.get_live_snapshot()
-                        # set_minecraft_context(user_id, data, ttl) — usar "global" como chave
-                        rg.tools_manager.set_minecraft_context("global", mc_state, ttl=30.0)
-                    except Exception:
-                        pass
-                else:
-                    try:
-                        rg.tools_manager.set_minecraft_context("global", None, ttl=0.0)
-                    except Exception:
-                        pass
-
-            # Conectar/desconectar Minecraft na EVAConsciousness
-            if self.consciousness:
-                if active and self.minecraft_integration:
-                    self.consciousness.set_minecraft_integration(self.minecraft_integration)
-                    # Conectar Brain V6 se disponível
-                    brain_obj = getattr(self.eva_brain, 'mc_eva_brain', None)
-                    if brain_obj and hasattr(self.consciousness, 'set_mc_brain'):
-                        self.consciousness.set_mc_brain(brain_obj)
-                    # Ativar consciousness mesmo sem call de voz
-                    # Para que o loop processe ações MC mesmo sozinha
-                    guild_ids = list(self.consciousness._guilds.keys()) if hasattr(self.consciousness, '_guilds') else []
-                    if not guild_ids:
-                        # Nenhuma guild ativa — criar uma guild virtual para MC
-                        # Usar a primeira guild do bot como referência
-                        for guild in self.bot.guilds:   # self.bot.guilds, não self.guilds
-                            mc_guild_id = guild.id
-                            # Pegar usuários na call, se houver; senão lista vazia
-                            vc_members = []
-                            for vc in guild.voice_channels:
-                                vc_members = [str(m.id) for m in vc.members if not m.bot]
-                                if vc_members:
-                                    break
-                            self.consciousness.activate_guild(mc_guild_id, vc_members)
-                            print(f"🎮 [Consciousness] Guild MC ativada via Minecraft: {mc_guild_id}")
-                            break
-                    else:
-                        # Guilds existem — garantir que estão ativas
-                        for gid in guild_ids:
-                            gs = self.consciousness._guilds.get(gid)
-                            if gs and not gs.active:
-                                gs.active = True
-                                print(f"🎮 [Consciousness] Guild {gid} reativada via MC")
-                else:
-                    self.consciousness.set_minecraft_integration(None)
-
-            status = "ATIVA ✅" if active else "INATIVA ⭕"
-            print(f"[EVA] Consciência Minecraft: {status}")
-        except Exception as e:
-            print(f"[EVA] Erro ao setar minecraft context: {e}")
-            import traceback; traceback.print_exc()
 
     def _register_events(self):
 
@@ -774,75 +662,8 @@ class EvaDiscordBot:
         action = (action or "status").lower().strip()
         args   = (args or "").strip()
 
-        # ═══════════════════════════════════════════════════════════════
-        # GRUPO 1 — Comandos que NÃO precisam de minecraft_integration
-        # (ServerManager gerencia o processo Node.js independentemente)
-        # ═══════════════════════════════════════════════════════════════
-
-        if action == "start":
-            mgr = getattr(self, "_mc_server_manager", None)
-            if not mgr:
-                await ctx.send(
-                    "❌ MinecraftServerManager não disponível.\n"
-                    "Verifique se `MINECRAFT_ENABLED=true` está no `.env`."
-                )
-                return
-            if mgr.node_running:
-                pid = mgr._process.pid if mgr._process else "?"
-                rpc = "✅" if mc and mc.connected else "❌ (use `!mc connect`)"
-                await ctx.send(f"⚠️ Node.js já está rodando.\nPID: `{pid}` | RPC: {rpc}")
-                return
-            msg = await ctx.send("🚀 Iniciando bot Minecraft...")
-            async def _notify(text: str):
-                await msg.edit(content=text)
-            ok = await mgr.start_node(notify_fn=_notify)
-            if ok and mc and mc.connected:
-                self._set_minecraft_context_active(True)
-            return
-
-        if action in ("stop-server", "stop_server", "kill"):
-            mgr = getattr(self, "_mc_server_manager", None)
-            if not mgr:
-                await ctx.send("❌ MinecraftServerManager não disponível.")
-                return
-            if not mgr.node_running:
-                await ctx.send("⚠️ Node.js não está rodando.")
-                return
-            msg = await ctx.send("🔌 Encerrando Node.js...")
-            await mgr.stop_node()
-            self._set_minecraft_context_active(False)
-            await msg.edit(content="✅ Node.js encerrado e RPC desconectado.")
-            return
-
-        if action in ("node-status", "node_status", "ps"):
-            mgr = getattr(self, "_mc_server_manager", None)
-            if not mgr:
-                await ctx.send("❌ MinecraftServerManager não disponível.")
-                return
-            s = mgr.get_status()
-            embed = discord.Embed(
-                title="🖥️ Status do Processo Node.js",
-                color=discord.Color.green() if s["node_running"] else discord.Color.red(),
-            )
-            embed.add_field(name="Processo",         value="✅ Rodando" if s["node_running"] else "❌ Parado", inline=True)
-            embed.add_field(name="RPC Python",       value="✅ Conectado" if s["rpc_connected"] else "❌ Desconectado", inline=True)
-            embed.add_field(name="PID",              value=str(s["pid"] or "—"), inline=True)
-            embed.add_field(name='Reinicializações', value="{}/{}".format(s.get('restart_count',0), s.get('max_restarts',0)), inline=True)
-            embed.add_field(name="Auto-restart",     value="✅" if s["auto_restart"] else "❌", inline=True)
-            embed.add_field(name='Diretório Node',   value=f"`{s.get('node_dir','?')}`", inline=False)
-            embed.set_footer(text="!mc start | !mc stop-server | !mc connect")
-            await ctx.send(embed=embed)
-            return
-
         if action == "help":
             embed = discord.Embed(title="🎮 Comandos Minecraft — EVA", color=discord.Color.green())
-            embed.add_field(
-                name="🖥️ Processo Node.js",
-                value=(
-                    "`!mc start` — iniciar Node.js + conectar EVA\n"
-                    "`!mc stop-server` — encerrar Node.js\n"
-                    "`!mc node-status` — PID, restarts, estado"
-                ), inline=False)
             embed.add_field(
                 name="📡 Conexão RPC",
                 value=(
@@ -872,7 +693,7 @@ class EvaDiscordBot:
         if not mc:
             await ctx.send(
                 "❌ Minecraft integration não disponível.\n"
-                "Verifique se `MINECRAFT_ENABLED=true` está no `.env` e use `!mc start`."
+                    "Verifique se `MINECRAFT_ENABLED=true` está no `.env`."
             )
             return
 
@@ -931,7 +752,6 @@ class EvaDiscordBot:
                     f"HP: {getattr(state, 'health', 0):.0f}/20 | "
                     f"Modo: `{mc.mode}`"
                 ))
-                self._set_minecraft_context_active(True)
             else:
                 await msg.edit(content=(
                     f"❌ Falha ao conectar em `{mc.rpc_url}`.\n"
@@ -941,7 +761,6 @@ class EvaDiscordBot:
 
         if action == "disconnect":
             await mc.disconnect()
-            self._set_minecraft_context_active(False)
             await ctx.send("🔌 RPC desconectado.")
             return
 

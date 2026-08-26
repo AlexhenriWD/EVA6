@@ -54,6 +54,18 @@ class LLMConfig:
     temperatura: float = float(os.environ.get("EVA_TEMP", "0.7"))
     top_p: float = 0.9
 
+    # top_k e min_p nao eram enviados em lugar nenhum do payload -- o
+    # comportamento dependia inteiramente do default interno do
+    # llama-server (pode nao bater com o que o modelo carregado espera).
+    # Valores abaixo seguem a recomendacao publicada pelo criador da
+    # familia Helcyon/Angelic_Eclipse (Mistral Nemo 12B): top_k=40,
+    # min_p=0.05. Sao aplicados em completar()/completar_stream() via
+    # _aplicar_penalidades() em llm.py -- mesmo mecanismo do
+    # repeat_penalty, com getattr+checagem pra nao quebrar configs que
+    # nao definem os dois campos (ex: _ConfigExtrator do orchestrator).
+    top_k: int = int(os.environ.get("EVA_TOP_K", "40"))
+    min_p: float = float(os.environ.get("EVA_MIN_P", "0.05"))
+
     # Teto de texto. O dataset tem mediana de 74 caracteres e p99 de 222,
     # entao 400 tokens ja e folga generosa -- serve para as respostas longas
     # (eva_longas_*.jsonl) sem permitir divagacao.
@@ -71,6 +83,26 @@ class LLMConfig:
     # igual com este valor, o teto não era a causa raiz.
     max_tokens_voz: int = int(os.environ.get("EVA_MAX_TOKENS_VOZ", "200"))
 
+    # Teto SEPARADO pra fala espontânea (falar_sozinha). Muito menor que
+    # `max_tokens_voz`, e por um motivo que só apareceu medindo uma call
+    # inteira: no log de 26/08, sete tarefas do modelo conversacional se
+    # dividiram em 80.5s de GPU pra fala espontânea contra 51.6s pra
+    # responder a pessoa. 61% do modelo foi gasto em fala que ninguém
+    # pediu -- e ela ainda ocupou o canal por 89s somados
+    # ("falando 26.7s", "18.9s", "30.5s", "13.3s").
+    #
+    # O raciocínio que justifica 200 acima NÃO vale aqui. Lá o teto
+    # generoso existe pra ela não cortar um pensamento no meio quando
+    # ALGUÉM PERGUNTOU algo aberto. Puxar assunto sozinha é o caso
+    # oposto: quanto mais curto, melhor -- é um convite pra conversa, não
+    # uma resposta. Meia frase a mais aqui é meio minuto de monólogo em
+    # cima de gente esperando pra falar.
+    #
+    # `_cortar_na_ultima_frase` (llm.py) já garante que bater neste teto
+    # termina numa frase fechada, não no meio de uma palavra.
+    max_tokens_espontanea: int = int(
+        os.environ.get("EVA_MAX_TOKENS_ESPONTANEA", "70"))
+
     timeout: int = 120
 
     # Como o bloco de dados e serializado no system prompt: "json" ou "prosa".
@@ -82,6 +114,13 @@ class LLMConfig:
     # so risco (exige o modelo "parsear" estrutura em vez de so ler texto
     # dividido em linhas). Padrao trocado pra "prosa" por isso.
     formato_contexto: str = os.environ.get("EVA_FORMATO_CONTEXTO", "prosa")
+
+    # Formato da âncora de personalidade: "treinada" (string curta, só tem
+    # respaldo empírico com um modelo fine-tunado especificamente pra ela)
+    # ou "sicatxt" (persona-card no formato Persona/Traits/Likes/Dislikes/
+    # Quirks/Goals -- o que modelos de RP genéricos tipo Sweet_Dreams_12B
+    # foram treinados a ler). Ver PERSONA_SICATXT em context.py.
+    ancora_formato: str = os.environ.get("EVA_ANCORA_FORMATO", "sicatxt")
 
     # Linha aditiva de humor/carisma (ver LINHA_CARISMA em context.py).
     # Ligada por padrão a pedido explícito -- desligue com EVA_CARISMA=0
@@ -99,13 +138,22 @@ class LLMConfig:
     # token repetido, 1.0 = desligado). frequency_penalty/presence_penalty
     # são o par equivalente da API OpenAI -- backend diferente pode
     # respeitar um ou outro; mandar os dois não tem custo, o servidor
-    # ignora o que não reconhece. 1.15/0.3/0.3 são pontos de partida
-    # moderados -- teste e ajuste se sentir a fala engessada demais (alto
-    # repeat_penalty pode fazer o modelo evitar até repetição natural,
-    # tipo "sim, sim" ou uma palavra-chave que devia mesmo se repetir).
-    repeat_penalty: float = float(os.environ.get("EVA_REPEAT_PENALTY", "1.15"))
-    frequency_penalty: float = float(os.environ.get("EVA_FREQUENCY_PENALTY", "0.3"))
-    presence_penalty: float = float(os.environ.get("EVA_PRESENCE_PENALTY", "0.3"))
+    # ignora o que não reconhece. Baixei frequency/presence pra 0.0 (eram
+    # 0.3) ao trocar pro Sweet_Dreams_12B: esses dois foram calibrados pro
+    # Qwen fine-tunado, e modelo de RP tende a ser mais sensível a
+    # penalidade de repetição empurrando ele pra fora do personagem.
+    # repeat_penalty puro em 1.1 é o ponto de partida mais seguro. Ajuste
+    # e teste se sentir a fala engessada demais.
+    repeat_penalty: float = float(os.environ.get("EVA_REPEAT_PENALTY", "1.1"))
+    frequency_penalty: float = float(os.environ.get("EVA_FREQUENCY_PENALTY", "0.0"))
+    presence_penalty: float = float(os.environ.get("EVA_PRESENCE_PENALTY", "0.0"))
+    # Quantos tokens pra trás repeat_penalty considera. Default do
+    # llama-server (quando omitido) costuma ser 64 -- curto demais pra
+    # alcançar a resposta do turno ANTERIOR quando tem system prompt +
+    # bloco volátil + histórico no meio, frequentemente bem mais que 64
+    # tokens. 256 cobre confortavelmente pelo menos a última troca
+    # completa. -1 = considera o contexto inteiro, mais caro de calcular.
+    repeat_last_n: int = int(os.environ.get("EVA_REPEAT_LAST_N", "256"))
 
     # Linha curta e sempre presente sobre capacidade real (roda local, ouve
     # e fala em call de Discord, tem memória) -- ver AUTOCONHECIMENTO em
@@ -114,6 +162,47 @@ class LLMConfig:
     # semântica achar algo específico. EVA_AUTOCONHECIMENTO=0 desliga se
     # quiser comparar antes/depois.
     autoconhecimento: bool = os.environ.get("EVA_AUTOCONHECIMENTO", "1") == "1"
+
+    # Onde SUBIR o llama-server deste modelo, se quiser que discord.py
+    # suba sozinho (ver SupervisorLlama em integrations/discord.py) em vez
+    # de você abrir um terminal manualmente. Vazio = sobe na mão (mesmo
+    # padrão de sempre) ou já está rodando -- discord.py detecta se já
+    # tem algo respondendo em base_url e não tenta subir outro em cima.
+    server_exe: str = os.environ.get("EVA_LLM_SERVER_EXE", "")
+    server_modelo: str = os.environ.get("EVA_LLM_SERVER_MODELO", "")
+    server_flags: list[str] = field(default_factory=lambda: os.environ.get(
+        "EVA_LLM_SERVER_FLAGS",
+        "-ngl 999 -fa on --cache-type-k q8_0 --cache-type-v q8_0 "
+        "-c 4096 -ub 1024 -b 1024 --parallel 1 --jinja "
+        "--cache-reuse 256 --cache-ram -1",
+    ).split())
+    # MEDIDO EM CALL REAL (log de 26/08): decode a 9.5 tok/s neste modelo
+    # (~7.1GB Q4_K_M) contra 70 tok/s do gemma-3-4b (~2.6GB) NA MESMA
+    # PLACA e no mesmo backend. Escalando por tamanho, banda efetiva de
+    # ~180 GB/s no gemma contra ~67 GB/s aqui -- e 67 GB/s não é GDDR6,
+    # é RAM de sistema. Parte das camadas não estava na VRAM.
+    #
+    # O prefill confirma por outro lado: gemma 250-350 tok/s, este 100
+    # tok/s -- razão coerente com 4B->12B. Prefill é limitado por
+    # compute e escalou como esperado; decode é limitado por banda e
+    # estava 2.7x pior do que deveria. Sintoma clássico de offload
+    # parcial, que o llama-server NÃO reporta como erro.
+    #
+    # `-c 16384` era o suspeito: KV de 16k num 12B com KV q8 passa de
+    # 1GB, e o mesmo log mostra n_tokens nunca acima de 2313 -- contexto
+    # reservado pra 16k, usado 2.3k. 4096 devolve essa VRAM com folga de
+    # sobra pro uso real.
+    #
+    # CONFIRA NA SUBIDA: a linha `offloaded XX/YY layers to GPU` precisa
+    # ter XX == YY. Se não tiver, o problema continua e nenhuma outra
+    # otimização aqui importa perto disso.
+    #
+    # --cache-reuse 256: o bloco volátil (ver Contexto.cauda em
+    # context.py) fica entre o histórico e a mensagem do usuário, então
+    # tudo depois dele recomputa todo turno. Com KV shifting o servidor
+    # reusa a fatia mesmo não sendo prefixo puro. O mesmo log mostra
+    # f_keep oscilando entre 0.40 e 0.80 -- a 100 tok/s de prefill, cada
+    # ponto perdido aí são segundos.
 
 
 @dataclass
@@ -149,9 +238,34 @@ class DecisionConfig:
     groq_ativo: bool = os.environ.get("EVA_DECISION_GROQ", "0") == "1"
     groq_url: str = os.environ.get("EVA_DECISION_GROQ_URL", "https://api.groq.com/openai/v1")
     groq_modelo: str = os.environ.get("EVA_DECISION_GROQ_MODEL", "openai/gpt-oss-20b")
+
     # Reaproveita a mesma chave que já existe pro STT via Groq -- um só
     # lugar pra configurar a chave, não duas variáveis fazendo a mesma coisa.
     groq_key: str = os.environ.get("GROQ_API_KEY", "")
+
+    # Onde SUBIR o llama-server de decisão/visão, se quiser que discord.py
+    # suba sozinho -- mesmo padrão do LLMConfig.server_exe acima, mas com
+    # server_mmproj porque este modelo também faz visão (VisaoConfig.base_url
+    # aponta pro MESMO servidor, é a mesma instância atendendo os dois
+    # papéis -- decisão e visão sempre foram o mesmo modelo, só mudou de
+    # LM Studio pra llama-server). --parallel 2 porque decisão, extração de
+    # memória e visão podem se sobrepor no tempo; suba se sobrar VRAM.
+    server_exe: str = os.environ.get("EVA_DECISAO_SERVER_EXE", "")
+    server_modelo: str = os.environ.get("EVA_DECISAO_SERVER_MODELO", "")
+    server_mmproj: str = os.environ.get("EVA_DECISAO_SERVER_MMPROJ", "")
+    server_flags: list[str] = field(default_factory=lambda: os.environ.get(
+        "EVA_DECISAO_SERVER_FLAGS",
+        "-ngl 999 -fa on --cache-type-k q8_0 --cache-type-v q8_0 "
+        "-c 8192 --parallel 2 --jinja "
+        "--cache-reuse 256 --swa-full",
+    ).split())
+    # --swa-full: o gemma-3 usa Sliding Window Attention, e nessa família
+    # o llama-server descarta o cache e reprocessa o prompt INTEIRO a
+    # cada chamada (ele loga "forcing full prompt re-processing due to
+    # lack of cache data"). Como decisão, visão e extração de memória
+    # repetem quase o mesmo prompt toda vez, isso é prefill jogado fora
+    # em todo turno. A flag aloca o cache SWA em tamanho cheio -- custa
+    # VRAM, devolve o reuso.
 
 
 @dataclass
@@ -209,6 +323,19 @@ class MemoriaConfig:
     embeddings_modelo: str = os.environ.get(
         "EVA_EMBEDDINGS_MODEL", "text-embedding-nomic-embed-text-v1.5@q4_k_m")
     embeddings_timeout: int = 30
+
+    # Onde SUBIR o llama-server de embeddings, se quiser que discord.py
+    # suba sozinho -- nomic-embed é minúsculo (~84MB Q4_K_M), então isto é
+    # mais sobre isolar do resto (tirar a última dependência do LM Studio)
+    # do que sobre economizar VRAM. --embeddings habilita o endpoint
+    # /v1/embeddings no llama-server -- sem essa flag ele nem serve esse
+    # endpoint.
+    embeddings_server_exe: str = os.environ.get("EVA_EMBEDDINGS_SERVER_EXE", "")
+    embeddings_server_modelo: str = os.environ.get("EVA_EMBEDDINGS_SERVER_MODELO", "")
+    embeddings_server_flags: list[str] = field(default_factory=lambda: os.environ.get(
+        "EVA_EMBEDDINGS_SERVER_FLAGS",
+        "-ngl 999 --embeddings -c 2048 --parallel 4 --jinja",
+    ).split())
 
     # Consolidacao periodica (memory/consolidacao.py): memorias episodicas
     # antigas e similares viram um resumo semantico, reduzindo o que
@@ -283,7 +410,11 @@ class ConscienciaConfig:
     # só de borda), suba este valor -- mas teste em
     # ferramentas/simular_portao.py antes de rodar numa call de verdade,
     # mesma política dos dois campos acima.
-    forca_vazio: float = float(os.environ.get("EVA_INICIATIVA_VAZIO_FORCA", "0.35"))
+    # 0.35 era abaixo de qualquer limiar praticado (0.48-0.55): o impulso
+    # "vazio" NUNCA passava, e todo log mostrava "impulso fraco (vazio)".
+    # 0.62 torna viável sem tornar automático -- ainda depende de
+    # silêncio longo e curiosidade alta pra ser escolhido.
+    forca_vazio: float = float(os.environ.get("EVA_INICIATIVA_VAZIO_FORCA", "0.62"))
     intervalo_tick: float = 5.0
     max_fios: int = 8
     horas_para_fio_azedar: float = 48.0
@@ -292,6 +423,13 @@ class ConscienciaConfig:
     # impulso expirasse sem ninguém ter ouvido, o tick seguinte tentaria
     # pesquisar de novo: rajada de chamadas ao SearXNG por hora de silêncio.
     cooldown_curiosidade: float = float(os.environ.get("EVA_COOLDOWN_CURIOSIDADE", "600"))
+    # Cooldown pra ela puxar assunto de verdade (ver bridge_client.
+    # _tentar_puxar_assunto / Consciencia.sugestao_assunto) -- diferente de
+    # "vazio" (placeholder genérico "puxar assunto", sem conteúdo real),
+    # isto gera um assunto/pergunta de verdade a partir de memória. Mais
+    # curto que o da curiosidade porque não depende de pesquisa na internet,
+    # só de uma chamada ao decisor.
+    cooldown_assunto: float = float(os.environ.get("EVA_COOLDOWN_ASSUNTO", "240"))
 
 
 @dataclass
@@ -321,6 +459,16 @@ class VisaoConfig:
     """
     ativa: bool = os.environ.get("EVA_VISAO", "0") == "1"
 
+    # Visão do ROBÔ -- flag SEPARADA de propósito. `ativa` acima liga a
+    # visão de TELA; isto liga o sistema de visão da câmera do robô
+    # (vision/visao_robo.py). Achado real: sem separar, toda call
+    # (mesmo sem robô nenhum envolvido) rodava o laço de tick do robô
+    # tentando capturar um quadro que nunca chega, gerando log a cada
+    # ~tick_intervalo segundos pra sempre -- ruído puro em qualquer call
+    # "normal". Com a flag separada, quem não usa robô nem entra nesse
+    # caminho.
+    robo_ativa: bool = os.environ.get("EVA_ROBOT_VISAO", "0") == "1"
+
     # Qual monitor (mss: 0 é "todos combinados", 1 é tipicamente o
     # principal) e em que largura reduzir antes de mandar pro modelo.
     # 672px corta os tokens de visão por 3-4x frente a 1280x720 -- é o
@@ -334,9 +482,12 @@ class VisaoConfig:
     limiar_desvios: float = 2.5
     limiar_minimo_absoluto: float = 3.0
 
-    # MiniCPM-V via LM Studio -- servidor separado do conversacional
-    # (mesmo LM Studio, endpoint igual, mas nunca a mesma requisição) para
-    # não competir por latência com decisão/conversa.
+    # MiniCPM-V via llama-server -- servidor separado do conversacional
+    # (mesma máquina, endpoint diferente, mas nunca a mesma requisição)
+    # para não competir por latência com decisão/conversa. Aponta pro
+    # MESMO servidor que DecisionConfig.base_url -- é o mesmo processo
+    # llama-server, com --mmproj, atendendo os dois papéis (decisão e
+    # visão sempre foram o mesmo modelo).
     base_url: str = os.environ.get("EVA_VISAO_URL", "http://localhost:1234/v1")
     api_key: str = os.environ.get("EVA_LLM_KEY", "lm-studio")
     modelo: str = os.environ.get("EVA_VISAO_MODEL", "minicpm-v-4.6")
@@ -413,8 +564,27 @@ class VozConfig:
     stt_whisper_cpp_modelo: str = os.environ.get("EVA_STT_WHISPER_CPP_MODELO", "")
     # Threads pro servidor (-t). Antes era passado por CHAMADA (cli, uma
     # vez por frase); agora é passado uma vez só, na inicialização do
-    # servidor. Vazio = usa o padrão do binário (4).
-    stt_whisper_cpp_threads: int | None = int(os.environ.get("EVA_STT_WHISPER_CPP_THREADS", "0")) or None
+    # servidor.
+    #
+    # MEDIDO (log de call, 26/08): `n_threads = 4 / 16`. O default deste
+    # campo era "0" -> `or None` -> falsy -> o SupervisorWhisper não
+    # acrescentava a flag `-t` -> o binário caía no padrão dele, que é 4.
+    # Ou seja: três quartos da CPU parados por um default que parecia
+    # neutro e não era. Nenhum erro, nenhum aviso -- só STT mais lento
+    # que o necessário, para sempre, até alguém ler a linha de system_info.
+    #
+    # Agora deriva sozinho. Metade dos núcleos LÓGICOS aproxima os
+    # núcleos físicos em CPU com SMT/hyperthreading, e é onde o
+    # whisper.cpp costuma render melhor -- passar do número de físicos
+    # normalmente PIORA, porque as threads brigam pela mesma unidade de
+    # execução. Teto de 8 porque o ganho satura e o resto da máquina
+    # precisa de CPU pro TTS (que roda em CPU de propósito) e pro Node.
+    #
+    # EVA_STT_WHISPER_CPP_THREADS continua vencendo se você quiser fixar
+    # outro número -- o automático é o piso de qualidade, não uma trava.
+    stt_whisper_cpp_threads: int | None = int(
+        os.environ.get("EVA_STT_WHISPER_CPP_THREADS", "0")
+    ) or max(2, min(8, (os.cpu_count() or 4) // 2))
 
     # TTS: Pocket TTS, unico backend. Suporta portugues via o modelo
     # DESTILADO `portuguese` (pocket-tts >= 2.0.0) -- ver eva/voice/pocket.py

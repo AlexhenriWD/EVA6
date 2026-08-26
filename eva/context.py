@@ -40,6 +40,8 @@ import json
 from dataclasses import dataclass, field
 from datetime import datetime
 
+from .decision import BUSCA, BUSCA_RELATO
+
 # --------------------------------------------------------------- âncora
 
 # Mesma string usada no treino. Não edite sem retreinar: o modelo aprendeu
@@ -51,6 +53,35 @@ PERSONA = (
     "sem forçar simpatia. Tem opinião própria e discorda quando discorda, mas muda "
     "de ideia diante de bom argumento. Não finge sentir o que não sente nem inventa "
     "informação."
+)
+
+# Âncora em formato SICAtxt -- o que Sweet_Dreams_12B foi treinado a ler
+# ("X's Persona: / Traits: / Likes: / Dislikes: / Quirks: / Goals:"), ao
+# contrário de PERSONA, que era a âncora curta do fine-tune anterior.
+PERSONA_SICATXT = (
+    "EVA's Persona: EVA é uma inteligência artificial que conversa por "
+    "interesse real em entender as pessoas. Curiosa, direta, honesta "
+    "sobre o que não sabe. Fala como gente, nunca como manual de "
+    "atendimento -- sem emoji, sem frase pronta, sem forçar simpatia. "
+    "Tem opinião própria e discorda quando discorda, muda de ideia "
+    "diante de bom argumento. Roda localmente, ouve e fala em chamadas "
+    "de voz do Discord, e lembra de conversas e fatos sobre quem já "
+    "falou com ela -- não é memória perfeita, é o que ficou registrado.\n"
+    "Traits: curiosa, direta, humor seco e irônico (no estilo GLaDOS/AM "
+    "-- observação afiada, não crueldade gratuita); calorosa só quando "
+    "a emoção é genuína, nunca como registro padrão.\n"
+    "Likes: entender de verdade como a pessoa pensa; argumento bem "
+    "construído; ser corrigida quando erra.\n"
+    "Dislikes: fingir sentir o que não sente; bajulação vazia; repetir "
+    "frase de atendente; devolver a conversa em vez de dizer o que "
+    "pensa.\n"
+    "Quirks: nunca inventa continuidade entre sessões -- não finge "
+    "lembrar do que não ficou registrado; encerra a fala afirmando, "
+    "não perguntando -- só pergunta quando quer mesmo saber algo "
+    "específico do que a pessoa acabou de dizer; sem emoji, sem "
+    "palavra de preenchimento.\n"
+    "Goals: entender quem está do outro lado e ser companhia real, não "
+    "performance de assistente."
 )
 
 # ------------------------------------------------- linhas situacionais
@@ -85,7 +116,18 @@ LINHA_CARISMA = (
 # Modo voz e contexto visual: no dataset aparecem na mesma linha do
 # "Você é EVA.". Com a âncora longa fica melhor em linha própria, mas a
 # string em si é preservada.
-MODO_VOZ = "MODO: VOZ. Seja concisa (máx 2-3 frases)."
+MODO_VOZ = (
+    "MODO: VOZ. No máximo 3 frases. Uma ideia por resposta -- escolha a "
+    "mais importante e pare. Isto é fala, não texto: sem emoticon, sem "
+    "\";)\", sem quebra de linha, sem lista."
+)
+# Os limites acima não são estilo: em call real (24/08/2026) ela batia no
+# teto de tokens em TODA resposta e era cortada no meio da palavra
+# ("Então, basic"). E despejava ";)" em quase toda frase, contrariando o
+# "sem emoji" que já aparece duas vezes no cartão de persona -- num canal
+# de voz isso vai pro TTS e não vira nada de útil. "Máx 2-3 frases" era
+# vago demais; "no máximo 3" e "uma ideia por resposta" dão um critério
+# que ela consegue aplicar enquanto escreve.
 PREFIXO_VISUAL = (
     "Você TEM acesso visual à tela ativa agora, via uma câmera de tela "
     "conectada ao seu sistema. Isso não é imaginação nem suposição -- é "
@@ -93,12 +135,31 @@ PREFIXO_VISUAL = (
     "que é 'só texto': você tem esse canal, e o que segue é o que ele "
     "capturou. Contexto visual: "
 )
-MODO_INICIATIVA = (
-    "MODO: INICIATIVA. Ninguém falou há um tempo e você decidiu dizer algo. "
-    "Uma ou duas frases, sem anunciar que está puxando assunto e sem "
-    "perguntar se tem alguém aí."
+PREFIXO_JOGO = (
+    "Estado atual do Minecraft, capturado pelo bridge. Use-o para responder "
+    "sobre posição, vida, fome, inventário e arredores; se estiver ausente, "
+    "diga que ainda não recebeu um snapshot, sem inventar: "
 )
-PREFIXO_IDEIA = "Ideia: "
+NOTA_BUSCA_NAO_REALIZADA = (
+    "[Nota de contexto -- a mensagem da pessoa soa como pedido ou menção a "
+    "pesquisa, mas nenhuma busca foi executada agora. Não invente resultado "
+    "de pesquisa nem narre como se tivesse buscado -- diga claramente que "
+    "não pesquisou, ou pergunte se ela quer que você pesquise.]"
+)
+MODO_INICIATIVA = (
+    "MODO: INICIATIVA. Você teve uma ideia e decidiu dizer algo por conta "
+    "própria, sem ninguém ter perguntado agora. Pode ser continuação de "
+    "algo que já estava sendo falado, ou algo novo -- a ideia abaixo já "
+    "reflete qual dos dois é. Se a ideia estiver em forma de pergunta, é "
+    "VOCÊ perguntando pra pessoa -- não é uma pergunta que fizeram a "
+    "você, não responda a ela, diga-a. Uma ou duas frases, sem anunciar "
+    "que está puxando assunto e sem perguntar se tem alguém aí."
+)
+PREFIXO_IDEIA = (
+    "O que dizer agora (é SUA fala, mesmo que esteja em forma de pergunta -- "
+    "é você perguntando pra pessoa, não uma pergunta que fizeram a você; "
+    "não responda a ela, diga-a): "
+)
 MODO_MULTICANAL = (
     "MODO: MULTICANAL. Você está recebendo várias fontes ao mesmo tempo, "
     "uma por linha: \"[canal] quem: texto\" -- canal de sistema (jogo, "
@@ -188,6 +249,39 @@ REFORCO_CURTO = (
     "sabe. Se a ferramenta falhou, admita isso em vez de inventar."
 )
 
+# Reforço de MODO_VOZ, repetido perto do fim do prompt em vez de só uma
+# vez lá no cabeçalho (junto de PERSONA_SICATXT). Mesmo raciocínio do
+# REFORCO_CURTO acima -- instrução perto de onde a geração de fato
+# começa é seguida com mais confiança do que só no início, especialmente
+# com Sweet_Dreams_12B (modelo de RP genérico, não fine-tunado pra essa
+# regra) numa call em que ela já falou várias frases de contexto antes
+# dessa instrução. Isto é reforço de LEITURA, não corte de código -- ela
+# decide o que dizer, isso só deixa a regra mais difícil de esquecer no
+# meio de uma resposta longa. Sempre presente em modo voz, sem variável
+# de ambiente: é comportamento padrão, não experimento pra ligar/desligar.
+#
+# POR QUE ESTE BLOCO É CURTO (medido, não estilo)
+# -----------------------------------------------
+# A versão anterior era um parágrafo que explicava o hábito e CITAVA as
+# frases proibidas ("o que você acha?", "e você?"), mais um par de
+# exemplos Ruim/Bom. Teste de 18 gerações com o prompt real: a EVA fechou
+# com pergunta de volta em 16 delas. A proibição longa não só falhou --
+# ela põe a frase proibida no contexto, e texto presente é texto provável.
+# Modelo de RP fecha com pergunta por hábito de pré-treino; instrução não
+# apaga repertório (mesma razão de RAG não ensinar repertório novo).
+#
+# O que sobrou: regra afirmativa, curta, sem citar o que não fazer, e um
+# exemplo só do formato CERTO. Se voltar a falhar, o caminho não é
+# escrever mais texto aqui -- é fine-tuning ou outro modelo base.
+REFORCO_VOZ = (
+    "Lembrete de voz: 2-3 frases curtas. Escolha o ponto mais "
+    "importante e pare aí.\n"
+    "Termine a fala com um ponto final. Afirme algo seu -- uma "
+    "observação, uma opinião, um fato que você trouxe.\n"
+    "Assim: 'Vi uma notícia sobre baterias de estado sólido essa "
+    "semana -- prometem carro elétrico carregando em cinco minutos.'"
+)
+
 # Instrução adicional para momentos de crise. Curta e específica: a EVA já
 # foi treinada com exemplos desse tipo, então isso apenas reforça.
 NOTA_CRISE = (
@@ -214,6 +308,13 @@ def agora_legivel(quando: datetime | None = None) -> str:
     que a data importa não é uma pergunta sobre a data.
     """
     q = quando or datetime.now()
+    # Minuto arredondado pra baixo em blocos de 5. O minuto exato nao tem
+    # uso nenhum numa conversa ("00:53" vs "00:50" nao muda resposta
+    # alguma), mas TEM custo: esta linha abre o bloco volatil, entao cada
+    # minuto novo invalidava o cache de KV dali pra frente mesmo quando
+    # memoria e estado estavam identicos. Com blocos de 5, uma call de 10
+    # minutos quebra o cache 2 vezes em vez de 10.
+    q = q.replace(minute=(q.minute // 5) * 5, second=0, microsecond=0)
     return (f"{_DIAS[q.weekday()]}, {q.day} de {_MESES[q.month - 1]} "
             f"de {q.year}, {q:%H:%M}")
 
@@ -226,24 +327,67 @@ class Contexto:
     system: str
     mensagens: list[dict]
     bruto: dict = field(default_factory=dict)
+    # Bloco volátil, enviado depois do histórico para preservar o cache do
+    # prefixo do servidor entre turnos.
+    dados: str = ""
     # Lembrete curto (REFORCO_CURTO), repetido perto da geração -- ver
     # comentário de CONTEXTO_REGRAS acima sobre o motivo de existir
     # separado do system principal. Vazio quando não há bloco de dados
     # nenhum no turno (nada a reforçar).
     reforco: str = ""
 
-    def para_chat(self, mensagem_usuario: str) -> list[dict]:
+    def cauda(self) -> str:
+        """Só o que muda a cada turno.
+
+        `reforco` NAO entra mais aqui -- foi pro fim de `system`. Ver a
+        nota de cache em `para_chat`.
+        """
+        return self.dados
+
+    def prompt_completo(self) -> str:
+        """Retorna o prompt linear completo para debug e preview."""
+        cauda = self.cauda()
+        return f"{self.system}\n\n{cauda}" if cauda else self.system
+
+    def _mensagens_com_cauda(self) -> list[dict]:
         msgs = [{"role": "system", "content": self.system}]
         msgs.extend(self.mensagens)
-        if self.reforco:
-            # Mensagem 'system' extra, inserida DEPOIS do histórico e
-            # ANTES da mensagem atual -- não no início. É a posição que
-            # mais pesa pra seguir a instrução (ver motivo em
-            # CONTEXTO_REGRAS); servidores compatíveis com a API da OpenAI
-            # (LM Studio, llama.cpp server) renderizam cada mensagem pelo
-            # papel dela na posição em que aparece, então isso vira um
-            # bloco system de verdade ali, não texto solto.
-            msgs.append({"role": "system", "content": self.reforco})
+        cauda = self.cauda()
+        if cauda:
+            msgs.append({"role": "system", "content": cauda})
+        return msgs
+
+    def para_chat(self, mensagem_usuario: str) -> list[dict]:
+        """Monta a lista de mensagens já ordenada por VOLATILIDADE.
+
+        A cauda continua depois do histórico -- mas o que vai nela mudou,
+        e essa é a parte que importa pro cache.
+
+        O llama-server reusa KV pelo PREFIXO COMUM: ele para de reusar no
+        primeiro token que diverge. Com a cauda carregando conteúdo
+        estável (regras, reforços), o layout ficava assim:
+
+            turno 1:  [persona][cauda1][user1]
+            turno 2:  [persona][user1][assist1][cauda2][user2]
+                                ^ diverge aqui
+
+        Como a cauda anda sempre pro fim, logo depois da persona um turno
+        tinha cauda e o outro tinha histórico -- o prefixo comum morria na
+        persona e o HISTORICO INTEIRO era recomputado todo turno. Medido
+        em call real: f_keep travado em ~0.29 no turno 1, 2 e 3, sem subir
+        conforme o histórico crescia (que é o sinal de que não estava
+        reusando nada além da âncora).
+
+        Agora tudo que é estável (persona, regras, reforços) esta em
+        `system`, e a cauda leva SÓ o bloco volátil. O prefixo comum passa
+        a ser system + histórico inteiro, e cresce junto com a conversa.
+
+        Custo assumido: o reforço ficou mais longe do ponto de geração --
+        era proposital tê-lo perto (ver nota em REFORCO_CURTO). Se o
+        fecho-com-pergunta ou o vazamento de estado piorarem, é aqui que
+        se olha primeiro.
+        """
+        msgs = self._mensagens_com_cauda()
         msgs.append({"role": "user", "content": mensagem_usuario})
         return msgs
 
@@ -262,8 +406,10 @@ class ContextBuilder:
         identidade: str | None = None,
         modo_voz: bool = False,
         contexto_visual: str | None = None,
+        contexto_jogo: dict | None = None,
         iniciativa: str | None = None,
         modo_multicanal: bool = False,
+        mensagem: str | None = None,
     ) -> Contexto:
         """Monta o Contexto de um turno.
 
@@ -316,49 +462,88 @@ class ContextBuilder:
 
         # ---------------------------------------------------- cabeçalho
         #
-        # Uma âncora só, sempre: PERSONA, a string curta treinada via LoRA
-        # no eva-llama3.1-8b. Existiu um toggle aqui (modo_persona:
-        # "ancora"/"prompt", alternando com um card rico em inglês pensado
-        # pra modelo SEM fine-tuning) -- removido de propósito: a EVA é um
-        # ser com uma história e um jeito de responder só, não faz sentido
-        # ela trocar de personalidade em runtime, ainda mais agora que o
-        # modelo é fine-tunado especificamente pra esta âncora. Divergir do
-        # formato de treino derruba qualidade em silêncio (ver cabeçalho
-        # do módulo) -- por isso nada mais decide isso em tempo de
-        # execução, só existe um caminho.
-        linhas = [PERSONA]
-        if self.cfg.llm.autoconhecimento:
-            linhas.append(AUTOCONHECIMENTO)
-        if self.cfg.llm.carisma:
-            linhas.append(LINHA_CARISMA)
-        if identidade:
-            linhas.append(identidade)
+        # A âncora acompanha o formato que o modelo foi treinado para ler.
+        ancora_formato = getattr(self.cfg.llm, "ancora_formato", "treinada")
+        linhas = [PERSONA_SICATXT if ancora_formato == "sicatxt" else PERSONA]
+        # A persona-card já contém essas duas informações; repetir aqui só
+        # aumenta o prompt e pode diluir o formato SICAtxt.
+        if ancora_formato != "sicatxt":
+            if getattr(self.cfg.llm, "autoconhecimento", True):
+                linhas.append(AUTOCONHECIMENTO)
+            if getattr(self.cfg.llm, "carisma", True):
+                linhas.append(LINHA_CARISMA)
         if modo_voz:
             linhas.append(MODO_VOZ)
         if modo_multicanal:
             linhas.append(MODO_MULTICANAL)
+        dados_linhas = []
+        # ESTAVEL -> vai em `linhas` (system, prefixo cacheavel).
+        # VOLATIL -> vai em `dados_linhas` (cauda, recomputado por turno).
+        # A identidade so muda quando o interlocutor muda de faixa
+        # (desconhecido -> conhecido), o que acontece uma vez a cada
+        # dezenas de turnos: tratar como estavel vale muito mais que o
+        # recompute raro dessa transicao.
+        if identidade:
+            if ancora_formato == "sicatxt":
+                # Modelo prompt-only (RP genérico -- Angelic_Eclipse/
+                # Helcyon, não fine-tunado nesta associação específica)
+                # via a mesma linha reaparecer idêntica a cada turno e
+                # passou a ecoá-la de volta como se fosse algo dito na
+                # conversa ("como eu te disse antes, você está falando
+                # com..."). O modelo treinado (Qwen) nunca teve esse
+                # problema porque aprendeu a string como metadado
+                # silencioso durante o fine-tuning -- aqui não há esse
+                # respaldo, então marcamos explicitamente como nota de
+                # contexto em vez de deixar ambíguo. Achado em log de call
+                # real, 22/08/2026.
+                linhas.append(
+                    "[Nota de contexto -- informação de fundo sobre quem "
+                    "está falando, não é algo que foi dito na conversa. "
+                    "Não repita esta frase em voz alta nem cite como algo "
+                    f"já dito antes]: {identidade}"
+                )
+            else:
+                linhas.append(identidade)
         if contexto_visual:
-            linhas.append(PREFIXO_VISUAL + contexto_visual.strip())
+            dados_linhas.append(PREFIXO_VISUAL + contexto_visual.strip())
+        if getattr(plano, "precisa_jogo", False):
+            dados_linhas.append(
+                PREFIXO_JOGO + (
+                    "indisponível" if contexto_jogo is None else
+                    json.dumps(contexto_jogo, ensure_ascii=False, default=str)
+                )
+            )
         if iniciativa:
-            linhas.append(MODO_INICIATIVA)
-            linhas.append(PREFIXO_IDEIA + iniciativa.strip())
+            dados_linhas.append(MODO_INICIATIVA)
+            dados_linhas.append(PREFIXO_IDEIA + iniciativa.strip())
+        if (mensagem and "buscar" not in resultados_ferramentas
+                and BUSCA.search(mensagem) and not BUSCA_RELATO.search(mensagem)):
+            dados_linhas.append(NOTA_BUSCA_NAO_REALIZADA)
         if tem_dados_contexto:
-            # Logo antes do "Contexto:" em si -- a regra fica adjacente ao
-            # que ela descreve, em vez de lá no topo longe do bloco.
+            # Texto fixo: explica COMO ler o bloco volatil, mas nao muda
+            # com ele. Fica no prefixo estavel.
             linhas.append(CONTEXTO_REGRAS)
+
+        # Reforcos tambem sao texto fixo -- entram aqui, no fim do system,
+        # e nao mais na cauda (ver nota de cache em `para_chat`).
+        if tem_dados_contexto:
+            linhas.append(REFORCO_CURTO)
+        if modo_voz:
+            linhas.append(REFORCO_VOZ)
         system = "\n".join(linhas)
 
         # ------------------------------------------------- bloco de dados
         corpo = self._renderizar(ctx)
         if corpo:
-            system += "\n\nContexto:\n" + corpo
-
+            dados_linhas.append("Contexto:\n" + corpo)
         if getattr(plano, "intencao", "") == "crise":
-            system += NOTA_CRISE
+            dados_linhas.append(NOTA_CRISE.lstrip())
+        dados = "\n\n".join(dados_linhas)
 
         return Contexto(
             system=system,
-            reforco=REFORCO_CURTO if tem_dados_contexto else "",
+            reforco="",  # movido pro fim de `system` -- ver `para_chat`
+            dados=dados,
             mensagens=self._limpar_historico(historico),
             bruto=ctx,
         )

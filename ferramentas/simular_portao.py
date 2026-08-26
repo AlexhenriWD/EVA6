@@ -27,15 +27,33 @@ AMARELO = "\033[93m"
 FIM = "\033[0m"
 
 
-def cenario(nome, cfg, estado, roteiro, passo=5.0, duracao=300.0):
-    """`roteiro` é uma lista de (segundo, usuario, mensagem)."""
+def cenario(nome, cfg, estado, roteiro, passo=5.0, duracao=300.0,
+            eventos=()):
+    """`roteiro` é uma lista de (segundo, usuario, mensagem).
+
+    `eventos` é uma lista de (segundo, tipo, texto) para injetar impulso
+    que não vem de fala: "pesquisa", "visual", "visual_robo", "corporal".
+    Sem isso o simulador só exercitava `fio` e `vazio` -- e portanto não
+    conseguia validar nada sobre os tipos que mais importam (pesquisa é a
+    1ª preferência, visual_robo existe só quando há robô).
+    """
     print(f"\n{AMARELO}━━ {nome} ━━{FIM}")
     c = Consciencia(cfg, canal="sim")
     t = 0.0
     c.ultima_fala_alguem = t
     c.ultima_fala_dela = t
     falas = 0
+    por_tipo = {}
     pendentes = sorted(roteiro)
+    evs = sorted(eventos)
+
+    metodo = {
+        "pesquisa": "pesquisa_pronta",
+        "visual": "evento_visual",
+        "visual_robo": "evento_visual_robo",
+        "corporal": "evento_corporal",
+        "iniciativa": "sugestao_assunto",
+    }
 
     while t < duracao:
         while pendentes and pendentes[0][0] <= t:
@@ -47,17 +65,29 @@ def cenario(nome, cfg, estado, roteiro, passo=5.0, duracao=300.0):
             if fios:
                 print(f"  {CINZA}{'':6} └ fio: {fios[-1]}{FIM}")
 
+        while evs and evs[0][0] <= t:
+            _, tipo, texto = evs.pop(0)
+            getattr(c, metodo[tipo])(texto)
+            print(f"  {CINZA}{t:6.0f}s [{tipo}] {texto[:52]}{FIM}")
+
         v = c.tick(estado, agora=t)
         if v.passou:
             falas += 1
+            por_tipo[v.impulso.tipo] = por_tipo.get(v.impulso.tipo, 0) + 1
             print(f"  {VERDE}{t:6.0f}s EVA →{FIM} {v.impulso.conteudo}")
             print(f"  {CINZA}{'':6} └ {v}{FIM}")
             c.ela_falou(espontanea=True)
             c.ultima_fala_dela = t
+        elif "substancia" in (v.motivo or ""):
+            # Rejeição do 2º portão é resultado, não ruído: é o caso em
+            # que ela ia falar e o conteúdo não prestava.
+            print(f"  {CINZA}{t:6.0f}s (barrado) {v.motivo}{FIM}")
 
         t += passo
 
+    resumo = " ".join(f"{k}:{n}" for k, n in sorted(por_tipo.items())) or "nenhuma"
     print(f"  {CINZA}total: {falas} fala(s) espontânea(s) em {duracao:.0f}s"
+          f" [{resumo}]"
           f" | limiar final {c.portao.limiar(estado, c.falas_sem_resposta):.2f}{FIM}")
     return falas
 
@@ -113,6 +143,37 @@ def main():
     estressada = EstadoInterno(curiosidade=0.9, energia=0.7, estresse=0.85)
     cenario("estresse alto — esperado: cala a boca", cfg, estressada,
             [(0, "alex", "comecei um tratamento novo essa semana")])
+
+    # ---------------------------------------------------------------
+    # Cenários de PRIORIDADE. Os de cima só produzem fio e vazio -- não
+    # exercitam pesquisa nem visual_robo, que são justamente os dois tipos
+    # de maior peso. Sem isto, a tabela de forças não é testada.
+    # ---------------------------------------------------------------
+
+    # Pesquisa contra fio, disputando o mesmo momento. Pesquisa (0.72)
+    # deve ganhar do fio (0.50) -- é a 1ª preferência declarada.
+    cenario("pesquisa vs fio — esperado: pesquisa ganha", cfg, estado,
+            [(0, "alex", "tô mexendo naquele projeto de robótica")],
+            eventos=[(30, "pesquisa",
+                      "A Mistral lançou o Nemo 12B com 128 mil tokens de "
+                      "janela de contexto.")])
+
+    # Robô conectado: visual_robo (0.68) deve ganhar de visual (0.58).
+    cenario("robô vs tela — esperado: robô ganha", cfg, estado, [],
+            eventos=[(30, "visual", "A tela exibe o navegador com abas."),
+                     (30, "visual_robo",
+                      "A câmera mostra uma parede a uns 30cm à frente.")])
+
+    # Portão de substância: lixo real de log, que ANTES virava fala.
+    cenario("impulso vazio de conteúdo — esperado: barrado", cfg, estado, [],
+            eventos=[(30, "pesquisa",
+                      "Preparar-se para os desafios do futuro exige visão "
+                      "de longo prazo e coragem para inovar.")])
+
+    # Silêncio com curiosidade alta: agora o "vazio" é viável (0.62).
+    curiosa = EstadoInterno(curiosidade=0.95, energia=0.8, estresse=0.05)
+    cenario("silêncio + curiosidade alta — esperado: puxa assunto",
+            cfg, curiosa, [])
 
 
 if __name__ == "__main__":

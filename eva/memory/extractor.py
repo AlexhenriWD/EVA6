@@ -212,14 +212,11 @@ def extrair_por_llm(conversa: list[dict], cliente, max_fatos: int = 5) -> list[d
     )
     prompt = PROMPT_LLM.replace("{conversa}", texto)
 
-    try:
-        argumentos = cliente.completar_com_ferramenta(
-            [{"role": "user", "content": prompt}],
-            FERRAMENTA_EXTRACAO,
-            temperatura=0.0, max_tokens=300,
-        )
-    except Exception:
-        return []
+    argumentos = cliente.completar_com_ferramenta(
+        [{"role": "user", "content": prompt}],
+        FERRAMENTA_EXTRACAO,
+        temperatura=0.0, max_tokens=300,
+    )
 
     if argumentos is None:
         return []  # modelo não chamou a ferramenta -- nada a extrair
@@ -277,14 +274,11 @@ def extrair_personalidade_propria(conversa: list[dict], cliente, max_itens: int 
     )
     prompt = PROMPT_AUTORREFLEXAO.replace("{conversa}", texto)
 
-    try:
-        argumentos = cliente.completar_com_ferramenta(
-            [{"role": "user", "content": prompt}],
-            FERRAMENTA_AUTORREFLEXAO,
-            temperatura=0.0, max_tokens=200,
-        )
-    except Exception:
-        return []
+    argumentos = cliente.completar_com_ferramenta(
+        [{"role": "user", "content": prompt}],
+        FERRAMENTA_AUTORREFLEXAO,
+        temperatura=0.0, max_tokens=200,
+    )
 
     if argumentos is None:
         return []

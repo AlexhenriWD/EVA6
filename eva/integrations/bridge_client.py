@@ -14,6 +14,8 @@ Python -> Node:
     {"type":"join",  "guild_id":..., "channel_id":...}
     {"type":"leave", "guild_id":...}
     {"type":"play",  "guild_id":...}   seguido de um quadro BINÁRIO com PCM
+    {"type":"stop_play", "guild_id":...}          corta a fala em andamento
+    {"type":"fonte_de_eco", "guild_id":..., "user_id":..., "ttl_ms":N}
 
 Node -> Python:
     {"type":"ready", "version":"2.0"}
@@ -22,9 +24,11 @@ Node -> Python:
     {"type":"reconnecting", "guild_id":...}
     {"type":"reconnected", "guild_id":..., "channel_id":...}
     {"type":"error", "message":...}
-    {"type":"audio", "guild_id":..., "user_id":..., "bytes":N}
+    {"type":"audio", "guild_id":..., "user_id":..., "bytes":N,
+     "durante_fala":bool}
         seguido de um quadro BINÁRIO com N bytes de PCM
-    {"type":"play_done", "guild_id":...}
+    {"type":"play_done", "guild_id":..., "cortada":bool,
+     "bytes_reproduzidos":N, "bytes_totais":N}
 
 Áudio nos dois sentidos: PCM 48kHz, estéreo, s16le.
 
@@ -35,11 +39,29 @@ Rodá-lo direto no laço de eventos travaria o WebSocket, e o bridge ficaria
 sem resposta -- inclusive para o keepalive. Por isso tudo que bloqueia vai
 para thread via asyncio.to_thread.
 
-Enquanto a EVA fala, o áudio recebido é ignorado. O bridge já evita
-decodificar nesse período (o comentário sobre CPU no bridge.js), mas a
-guarda aqui cobre o intervalo entre o fim da reprodução e o Discord parar
-de mandar pacotes -- sem isso, ela ouviria o próprio eco de quem estiver
-sem fone.
+FALA DA PESSOA NUNCA É DESCARTADA
+---------------------------------
+Antes, três guardas jogavam fora o áudio recebido: o bridge.js nem
+assinava o microfone durante o playback, e aqui `est.falando` e
+`est.processando.locked()` davam `return` seco. O efeito somado é o que
+mais atrapalhava na call: a pessoa respondia enquanto a EVA pensava ou
+falava, e a resposta dela simplesmente não existia -- sem log, sem aviso,
+sem nada. Nenhuma das três guardas existe mais nessa forma. Hoje:
+
+  * áudio que chega enquanto ela GERA (ainda sem som saindo) é transcrito
+    e guardado em `est.pendentes`. A geração em curso é invalidada e as
+    duas falas viram UM turno só -- ver `_drenar_pendentes`;
+
+  * áudio que chega enquanto ela FALA passa antes pelo teste de eco
+    (`_parece_eco`): se for a voz dela voltando pelo microfone de quem
+    está em caixa de som, é descartado e aquele usuário é marcado como
+    fonte de eco no bridge.js; se for fala de verdade, ela é INTERROMPIDA
+    (`stop_play`) e o turno entra na fila de pendentes;
+
+  * o que ela chegou a falar antes do corte substitui, no histórico, a
+    resposta inteira que tinha sido gerada (`corrigir_ultimo_turno`) --
+    senão o prompt do próximo turno teria como exemplo uma fala que
+    nunca aconteceu.
 """
 
 from __future__ import annotations
@@ -48,8 +70,12 @@ import asyncio
 import json
 import queue
 import random
+import re
+import threading
 import time
+import unicodedata
 from dataclasses import dataclass, field
+from difflib import SequenceMatcher
 
 try:
     import websockets
@@ -59,6 +85,7 @@ except ImportError:  # pragma: no cover
 from ..config import EVAConfig, carregar_config
 from ..orchestrator import EVA
 from ..tools import robot_tools
+from ..tools import minecraft_tools
 from ..voice.audio import (
     ErroAudio,
     alinhar_frames,
@@ -69,6 +96,112 @@ from ..voice.audio import (
 )
 from ..voice.stt import Transcricao, criar_stt, parece_ruido
 from ..voice.tts import ErroTTS, criar_tts
+
+
+PROMPT_PUXAR_ASSUNTO = """Você está numa call. De vez em quando você considera se vale
+comentar ou perguntar algo por conta própria, sem esperar ser provocada.
+
+Como a conversa andou nos últimos turnos (pode estar vazio se ninguém falou
+ainda, ou pode mostrar um assunto em andamento):
+{conversa_recente}
+
+O que você sabe de verdade sobre essa pessoa, de conversas passadas (não
+invente nada além disso):
+{fatos}
+
+REGRA MAIS IMPORTANTE: se a conversa recente mostra um assunto ainda ativo
+(as últimas falas são sobre um tema específico, não genérico), responda
+null -- puxar um assunto novo por cima de um assunto vivo é o pior erro
+possível aqui, pior que ficar em silêncio. Só sugira algo novo se a conversa
+recente estiver vazia, tiver esfriado (última fala foi um fechamento, tipo
+"tá bom" ou "valeu"), ou não houver conversa recente nenhuma.
+
+Se for sugerir algo, pode ser: (a) uma pergunta/comentário sobre algo da
+memória de longo prazo (fatos acima), OU (b) uma continuação natural do que
+já estava sendo dito -- nunca as duas coisas misturadas, e nunca um tema
+aleatório desconectado de tudo.
+
+Responda APENAS um JSON:
+{{"assunto": "pergunta ou comentário pronto pra dizer, em primeira pessoa"}}
+ou
+{{"assunto": null}}"""
+
+
+def _normalizar_para_eco(texto: str) -> list[str]:
+    """Texto virando lista de palavras comparável: sem acento, sem
+    pontuação, minúsculo. O STT e o TTS quase nunca concordam na
+    pontuação, e acento some ou aparece dependendo de como o Whisper
+    ouviu -- comparar a string crua daria falso negativo demais."""
+    sem_acento = "".join(
+        c for c in unicodedata.normalize("NFD", texto.lower())
+        if unicodedata.category(c) != "Mn"
+    )
+    return re.findall(r"[a-z0-9]+", sem_acento)
+
+
+def _parece_eco(ouvido: str, falado: str) -> bool:
+    """A transcrição que chegou é a própria voz da EVA voltando?
+
+    É o teste que torna a interrupção viável com alguém em caixa de som.
+    Sem ele, a única alternativa seria manter o microfone fechado durante
+    a fala dela -- que é exatamente o comportamento antigo, o que impedia
+    interromper.
+
+    Compara sequências de palavras e olha o maior bloco em comum. Eco é
+    sempre um TRECHO CONTÍGUO do que ela está dizendo (o microfone pegou
+    um pedaço do meio da fala), então bloco contíguo grande = eco;
+    palavras espalhadas que coincidem por acaso = fala de verdade.
+
+    Assimetria proposital nos dois erros possíveis:
+      * achar que é eco quando era fala real -> a pessoa é ignorada de
+        novo, que é o bug que estamos consertando. Caro.
+      * achar que é fala real quando era eco -> ela se interrompe à toa
+        uma vez, e o usuário vira fonte de eco marcada. Barato e
+        auto-corrigível.
+    Por isso o limiar é conservador e falas curtas exigem casamento
+    exato: "sim", "verdade", "pois é" são coisas que a pessoa fala por
+    cima dela o tempo todo, e barrar isso seria pior que o eco.
+    """
+    palavras_ouvidas = _normalizar_para_eco(ouvido)
+    palavras_faladas = _normalizar_para_eco(falado)
+    if not palavras_ouvidas or not palavras_faladas:
+        return False
+
+    matcher = SequenceMatcher(None, palavras_faladas, palavras_ouvidas,
+                              autojunk=False)
+    maior = max((b.size for b in matcher.get_matching_blocks()), default=0)
+
+    if len(palavras_ouvidas) < 3:
+        # Curto demais pra ter estatística: só conta como eco se TODAS as
+        # palavras aparecerem coladas dentro da fala dela.
+        return maior == len(palavras_ouvidas)
+
+    return (maior / len(palavras_ouvidas)) >= 0.6
+
+
+def _cortar_texto_na_fracao(texto: str, fracao: float) -> str:
+    """Trecho do texto que corresponde à parte que virou som.
+
+    Corta na fronteira de frase mais próxima do ponto, não no caractere
+    exato: gravar meia palavra no histórico seria pior que arredondar. Se
+    nenhuma frase inteira coube, devolve a primeira -- ela começou a
+    falar, então alguma coisa saiu.
+    """
+    texto = texto.strip()
+    if fracao >= 0.98 or not texto:
+        return texto
+    if fracao <= 0.02:
+        return ""
+
+    limite = max(1, int(len(texto) * fracao))
+    frases = re.findall(r"[^.!?…]+[.!?…]*\s*", texto) or [texto]
+
+    acumulado = ""
+    for frase in frases:
+        if len(acumulado) + len(frase) > limite and acumulado:
+            break
+        acumulado += frase
+    return (acumulado or frases[0]).strip()
 
 
 @dataclass
@@ -87,6 +220,44 @@ class EstadoGuild:
     t_stt_fim: float = 0.0
     processando: asyncio.Lock = field(default_factory=asyncio.Lock)
 
+    # --- interrupção e turnos pendentes ---
+    # O que ela está falando NESTE instante. Só serve para o teste de eco
+    # (`_parece_eco`) -- é a única forma de distinguir "a pessoa falou por
+    # cima dela" de "a voz dela voltou pelo microfone de quem está em
+    # caixa de som", já que os dois chegam aqui como áudio idêntico vindo
+    # de um user_id humano.
+    texto_em_voz: str = ""
+    # Última fala já terminada. O eco chega ATRASADO -- a captura só fecha
+    # depois do silêncio, então pacotes de eco aparecem aqui depois do
+    # play_done, quando `texto_em_voz` já foi limpo. Sem guardar isso, o
+    # primeiro eco pós-fala passaria como fala legítima e ela responderia
+    # à própria voz.
+    ultimo_texto_falado: str = ""
+    # Bytes de PCM entregues ao bridge nesta fala -- com os bytes que o
+    # Node reporta como REPRODUZIDOS, dá a fração da fala que virou som,
+    # e daí o ponto de corte no texto.
+    bytes_em_voz: int = 0
+    # Marcado quando um corte foi pedido; lido no play_done pra decidir se
+    # corrige o histórico.
+    corte_pedido: bool = False
+    # Sinaliza pra thread de síntese (streaming) parar de gerar frases
+    # novas. threading.Event, não asyncio: quem lê roda em to_thread.
+    cortar: threading.Event = field(default_factory=threading.Event)
+    # Resposta gerada mas ainda não falada por inteiro, junto do usuário
+    # dela -- o par que `_corrigir_historico_apos_corte` precisa.
+    usuario_em_voz: str | None = None
+
+    # Falas capturadas enquanto ela estava ocupada, esperando a vez:
+    # (user_id, texto, timestamp).
+    pendentes: list = field(default_factory=list)
+    tarefa_drenagem: asyncio.Task | None = None
+    # A geração em curso não vale mais: chegou fala nova antes dela virar
+    # som, e as duas viram um turno só.
+    geracao_invalidada: bool = False
+    # A mensagem que originou a geração em curso -- volta pra fila de
+    # pendentes quando ela é invalidada, pra ser reperguntada junto.
+    mensagem_em_curso: str | None = None
+
     # --- multicanal: agregação quando mais de uma pessoa fala por perto ---
     # user_id -> timestamp da última fala dessa pessoa. Usado só para
     # decidir "tem mais gente ativa agora?" -- não é histórico de verdade,
@@ -103,6 +274,11 @@ class ClienteBridge:
         self.cfg = config or carregar_config()
         self.url = url
         self.eva = EVA(self.cfg)
+        # Tarefas de fundo (extração de memória) consultam isto antes de
+        # gastar GPU -- ver EVA._esperar_ocioso pro número medido. Fica
+        # aqui, e não dentro do orchestrator, porque quem sabe se existe
+        # turno em andamento é o cliente de voz, não o núcleo cognitivo.
+        self.eva.ocupado_agora = self._ocupada_em_alguma_guild
 
         self.stt, aviso_stt = criar_stt(self.cfg.voz)
         if aviso_stt:
@@ -139,6 +315,8 @@ class ClienteBridge:
         self.consciencias: dict[str, Consciencia] = {}
         self._tarefas_consciencia: dict[str, asyncio.Task] = {}
         self._ultima_curiosidade: dict[str, float] = {}
+        self._curiosidades_usadas: dict[str, set[str]] = {}
+        self._ultimo_assunto: dict[str, float] = {}
 
         # Visão: uma instância só (há uma tela, a do PC rodando a EVA --
         # não uma por guild como Consciencia, que é por canal porque cada
@@ -159,7 +337,23 @@ class ClienteBridge:
                     f"Rode: pip install mss pillow numpy"
                 )
         self._tarefa_visao: asyncio.Task | None = None
+
+        # Visão do ROBÔ -- flag separada de propósito (ver
+        # VisaoConfig.robo_ativa): call sem robô nenhum não deve rodar
+        # este laço nem gerar log nenhum. Não depende de mss (a fonte é
+        # a câmera do robô via rede, não o PC local) -- só falha se
+        # PIL/numpy faltarem, o que já quebraria a visão de tela também.
+        self.visao_robo = None
+        self.erro_visao_robo: str | None = None
+        if self.cfg.visao.robo_ativa:
+            try:
+                from ..vision.visao_robo import SistemaVisualRobo
+                self.visao_robo = SistemaVisualRobo(self.cfg)
+            except ImportError as e:
+                self.erro_visao_robo = f"visão do robô ligada em config mas dependência faltando: {e}"
+        self._tarefa_visao_robo: asyncio.Task | None = None
         self._tarefa_corpo: asyncio.Task | None = None
+        self._tarefa_jogo: asyncio.Task | None = None
         self._dashboard = None  # criado em rodar(), só se cfg.dashboard.ativa
         self._guilds_com_call: set[str] = set()
 
@@ -196,6 +390,12 @@ class ClienteBridge:
         # nova que chega, então é silêncio de todo mundo por esse tempo,
         # não um teto fixo desde a primeira fala.
         self.janela_debounce_multicanal = 1.8
+        # Quanto tempo um usuário fica marcado como fonte de eco no
+        # bridge.js depois de uma transcrição confirmada como eco. Curto
+        # de propósito: se a pessoa colocar o fone, ela volta a poder
+        # interromper em menos de um minuto, sem precisar de nenhum
+        # comando nem reiniciar nada.
+        self.ttl_fonte_de_eco = 45.0
 
     def estado(self, guild_id: str) -> EstadoGuild:
         return self.guilds.setdefault(str(guild_id), EstadoGuild())
@@ -251,13 +451,19 @@ class ClienteBridge:
         raise ultimo_erro
 
     async def _contexto_visual_para(self, texto: str) -> str | None:
-        """A cena para injetar neste turno, ou None. Ver docstring
-        original -- só mudou o caminho de pedido explícito, que agora
-        dispara análise sob demanda em vez de confiar no último tick.
+        """A cena para injetar neste turno, ou None. Roteia entre visão
+        de TELA e visão do ROBÔ conforme o assunto da mensagem -- as
+        duas fontes nunca fazem sentido juntas no mesmo turno (ou a
+        pergunta é sobre o que está no monitor, ou é sobre o que o robô
+        está vendo, não as duas).
         """
+        from ..decision import robo_estado_relevante, robo_olhar_relevante, visao_relevante
+
+        if robo_olhar_relevante(texto) or robo_estado_relevante(texto):
+            return await self._contexto_visual_robo_para(texto)
+
         if self.visao is None:
             return None
-        from ..decision import visao_relevante
 
         if visao_relevante(texto):
             fresca = await asyncio.to_thread(self.visao.analisar_agora)
@@ -268,6 +474,21 @@ class ClienteBridge:
             return self.visao.contexto_atual()
 
         return None
+
+    async def _contexto_visual_robo_para(self, texto: str) -> str | None:
+        """Mesmo padrão de _contexto_visual_para, só que na câmera do
+        robô: pergunta direta (aqui, QUALQUER pergunta que chegou até
+        este ponto já é sobre o robô -- ver o roteamento acima) vale uma
+        análise fresca sob demanda, não só confiar no último tick de
+        fundo. Se o robô não estiver conectado, analisar_agora() falha
+        silenciosamente (best-effort) e contexto_atual() devolve None --
+        a pessoa recebe a resposta normal sem contexto visual, não um
+        erro.
+        """
+        if self.visao_robo is None:
+            return None
+        fresca = await asyncio.to_thread(self.visao_robo.analisar_agora)
+        return fresca or self.visao_robo.contexto_atual()
 
     async def _pesquisar_e_registrar(self, guild_id: str, consulta: str) -> None:
         """Pesquisa em fundo e, se achar algo, alimenta a Consciencia.
@@ -301,16 +522,86 @@ class ClienteBridge:
         if any(not f.usado for f in c.fios):
             return
 
-        topico = self._topico_de_curiosidade(c.ultimo_falante or self.cfg.usuario)
+        usados = self._curiosidades_usadas.setdefault(guild_id, set())
+        topico = self._topico_de_curiosidade(
+            c.ultimo_falante or self.cfg.usuario, usados)
         if not topico:
             return
 
         self._ultima_curiosidade[guild_id] = agora
+        usados.add(topico)
         asyncio.create_task(self._pesquisar_e_registrar(guild_id, topico))
         if self.cfg.debug:
             print(f"[curiosidade] pesquisando sozinha: {topico[:80]!r}")
 
-    def _topico_de_curiosidade(self, usuario: str) -> str | None:
+    def _tentar_puxar_assunto(self, guild_id: str, c) -> None:
+        """Decide se vale puxar assunto -- olhando tanto a memória de longo
+        prazo quanto a conversa recente de verdade, pra não sugerir um
+        tema desconectado por cima de um assunto que ainda está ativo."""
+        agora = time.time()
+        if (agora - self._ultimo_assunto.get(guild_id, 0.0)
+                < self.cfg.consciencia.cooldown_assunto):
+            return
+        if any(not f.usado for f in c.fios):
+            return
+
+        usuario = c.ultimo_falante or self.cfg.usuario
+        try:
+            fatos = self.eva.memoria.listar(usuario=usuario, limite=10)
+        except Exception:
+            fatos = []
+        try:
+            historico = self.eva.memoria.historico(
+                usuario=usuario, limite=self.cfg.memoria.janela_historico)
+        except Exception:
+            historico = []
+        # Sem fatos de longo prazo E sem conversa recente: não há matéria
+        # nenhuma pro modelo trabalhar em cima, então nem vale gastar a
+        # chamada. Qualquer um dos dois presentes já é o bastante -- é o
+        # próprio prompt (PROMPT_PUXAR_ASSUNTO) quem decide se um assunto
+        # novo cabe ou se a resposta certa é null.
+        if not fatos and not historico:
+            return
+
+        self._ultimo_assunto[guild_id] = agora
+        asyncio.create_task(self._decidir_assunto(guild_id, usuario, fatos, historico))
+
+    async def _decidir_assunto(self, guild_id: str, usuario: str, fatos, historico) -> None:
+        try:
+            resumo = "\n".join(f"- {f.conteudo[:150]}" for f in fatos) or "(nada registrado ainda)"
+            # Só os últimos turnos importam aqui -- é "a conversa esfriou
+            # ou ainda está quente", não um resumo completo da sessão.
+            # Mesmo formato role/content que o resto do projeto usa
+            # (self.eva.memoria.historico), convertido pra prosa simples
+            # porque quem lê isto é um prompt de decisão, não um chat
+            # real com roles.
+            ultimos = historico[-6:] if historico else []
+            if ultimos:
+                linhas_conversa = []
+                for turno in ultimos:
+                    quem = "ela" if turno.get("role") == "assistant" else "a pessoa"
+                    linhas_conversa.append(f"- {quem}: {turno.get('content', '')[:150]}")
+                conversa_recente = "\n".join(linhas_conversa)
+            else:
+                conversa_recente = "(nenhuma troca recente -- silêncio real)"
+            prompt = PROMPT_PUXAR_ASSUNTO.format(fatos=resumo, conversa_recente=conversa_recente)
+            from ..decision import completar_com_reserva, clientes_decisao
+            principal, reserva = clientes_decisao(self.cfg.decisao)
+            bruto = await asyncio.to_thread(
+                completar_com_reserva, principal, reserva, prompt)
+            m = re.search(r"\{.*\}", bruto, re.S)
+            if not m:
+                return
+            texto = json.loads(m.group(0)).get("assunto")
+            if texto:
+                self.consciencia(guild_id).sugestao_assunto(texto)
+                if self.cfg.debug:
+                    print(f"[assunto] sugestão: {texto[:80]!r}")
+        except Exception as e:
+            if self.cfg.debug:
+                print(f"[assunto] erro: {e}")
+
+    def _topico_de_curiosidade(self, usuario: str, usados: set[str] | None = None) -> str | None:
         """Assunto pra puxar sozinha, tirado de memória episódica recente --
         retomar algo que a pessoa mencionou é mais crível que pesquisar
         tópico genérico do nada (mesma filosofia de 'fio', virando busca).
@@ -319,13 +610,46 @@ class ClienteBridge:
             recentes = self.eva.memoria.listar(usuario=usuario, tipo="episodica", limite=8)
         except Exception:
             return None
-        if not recentes:
+        recentes = [m for m in recentes if m.conteudo not in (usados or set())]
+
+        # Filtra memória vaga ANTES de virar busca. O extrator produz
+        # resumo sem sujeito ("o usuário indica que está se preparando
+        # para lidar com desafios") e prefixar "novidades sobre:" nisso dá
+        # uma consulta sem alvo -- o SearXNG devolve texto motivacional
+        # genérico, que o PortaoSubstancia depois barra. Barrar no fim
+        # funciona, mas a busca já foi feita à toa; aqui a gente não gasta
+        # a busca. Mesmo teste de concretude do portão, na origem.
+        # Prefixo neutro na frente: `_tem_concreto` ignora a primeira
+        # palavra de cada frase de propósito (maiúscula de início não é
+        # nome próprio). Aqui isso barraria "Alex terminou de montar o
+        # robô", que é justamente o tipo de memória que DÁ uma boa busca.
+        # Empurrar a frase uma posição resolve sem afrouxar a regra.
+        from ..consciousness import _tem_concreto
+        concretas = [m for m in recentes
+                     if _tem_concreto("sobre " + m.conteudo)]
+        if not concretas:
+            # Nenhuma memória serve pra pesquisar. Devolver None é a
+            # resposta certa: melhor não ter tópico de curiosidade agora
+            # do que pesquisar sobre nada.
             return None
-        escolhida = random.choice(recentes)
+
+        escolhida = random.choice(concretas)
         return f"novidades sobre: {escolhida.conteudo[:120]}"
 
     def _tts_tocando(self, guild_id: str) -> bool:
         return self.estado(guild_id).falando
+
+    def _ocupada_em_alguma_guild(self) -> bool:
+        """Tem algum turno em andamento em qualquer guild?
+
+        Qualquer uma, não só a de origem: os modelos são compartilhados,
+        então uma extração de memória disparada pela guild A atrapalharia
+        a resposta em andamento da guild B do mesmo jeito. Num setup
+        pessoal isso quase sempre é uma call só, mas a versão errada
+        desta função só apareceria no dia em que não fosse.
+        """
+        return any(est.processando.locked() or est.falando
+                   for est in self.guilds.values())
 
     def _cancelar_laco_consciencia(self, guild_id: str) -> None:
         gid = str(guild_id)
@@ -343,11 +667,48 @@ class ClienteBridge:
         # quando tem gente numa call -- mesmo _guilds_com_call de sempre,
         # só que sinalizado pra outra thread via threading.Event.
         robot_tools.definir_em_call(bool(self._guilds_com_call))
-        if self.visao is None or self.visao.ativo:
+        if self.visao is not None and not self.visao.ativo:
+            self.visao.ligar()
+            if self._tarefa_visao is None or self._tarefa_visao.done():
+                self._tarefa_visao = asyncio.create_task(self._laco_visao())
+
+        # Visão do robô -- liga o SISTEMA (fica pronto pra produzir cena
+        # assim que houver quadro), sem forçar conexão com o robô aqui
+        # (isso continua sob demanda, ver _ligar_robo_consciencia_se_precisar).
+        if self.visao_robo is not None and not self.visao_robo.ativo:
+            self.visao_robo.ligar()
+            if self._tarefa_visao_robo is None or self._tarefa_visao_robo.done():
+                self._tarefa_visao_robo = asyncio.create_task(self._laco_visao_robo())
+
+    def _ligar_robo_consciencia_se_precisar(self, guild_id: str) -> None:
+        robot_tools.definir_consciencia_callback(
+            lambda texto: self._propagar_comentario_robo(texto)
+        )
+        # SEM warm-up automático aqui de propósito (removido -- ver
+        # histórico se precisar do porquê da versão antiga). Conectar
+        # sob demanda agora é: o botão "Conectar agora" no dashboard
+        # (robot_tools.conectar_dashboard), ou qualquer ferramenta
+        # robo_* real chamada em conversa (_chamar já sobe a thread na
+        # hora, via _iniciar_thread_robo, e esperar _pronto funciona
+        # pra QUALQUER chamador desde o fix da corrida -- não só quem
+        # cria a thread). Entrar na call não é mais gatilho de conexão.
+
+    def _propagar_comentario_robo(self, texto: str) -> None:
+        for gid in list(self._guilds_com_call):
+            self.consciencia(gid).evento_corporal(texto)
+
+    def _desligar_robo_consciencia_se_precisar(self) -> None:
+        if self._guilds_com_call:
             return
-        self.visao.ligar()
-        if self._tarefa_visao is None or self._tarefa_visao.done():
-            self._tarefa_visao = asyncio.create_task(self._laco_visao())
+        robot_tools.definir_consciencia_callback(None)
+
+    def _fechar_tts_se_precisar(self) -> None:
+        """Fecha recursos persistentes do TTS quando a última call sai."""
+        if self._guilds_com_call or not self.tts:
+            return
+        motor = getattr(self.tts, "motor", None)
+        if motor and hasattr(motor, "fechar"):
+            motor.fechar()
 
     def _desligar_visao_se_precisar(self, guild_id: str) -> None:
         """Só desliga quando a ÚLTIMA call sai -- não a cada guild que sai
@@ -355,11 +716,16 @@ class ClienteBridge:
         uma da outra."""
         self._guilds_com_call.discard(str(guild_id))
         robot_tools.definir_em_call(bool(self._guilds_com_call))
-        if self.visao is None or self._guilds_com_call:
+        if self._guilds_com_call:
             return
-        self.visao.desligar()
-        if self._tarefa_visao and not self._tarefa_visao.done():
-            self._tarefa_visao.cancel()
+        if self.visao is not None:
+            self.visao.desligar()
+            if self._tarefa_visao and not self._tarefa_visao.done():
+                self._tarefa_visao.cancel()
+        if self.visao_robo is not None:
+            self.visao_robo.desligar()
+            if self._tarefa_visao_robo and not self._tarefa_visao_robo.done():
+                self._tarefa_visao_robo.cancel()
 
     async def _laco_visao(self) -> None:
         """Chama SistemaVisual.tick() periodicamente. tick() é síncrono e
@@ -387,6 +753,28 @@ class ClienteBridge:
                 # voz, texto ou consciência, que são o núcleo da conversa.
                 print(f"[visao] erro no laço: {e}")
 
+    async def _laco_visao_robo(self) -> None:
+        """Mesmo padrão exato de _laco_visao, câmera do robô em vez da
+        tela. tick() aqui pode falhar-silenciosamente MUITO mais vezes
+        no início (robô ainda não conectou) -- isso é esperado, não é
+        erro, ver SistemaVisualRobo.tick()/CapturaRobo.
+        """
+        while True:
+            await asyncio.sleep(self.cfg.visao.tick_intervalo)
+            try:
+                evento = await asyncio.to_thread(self.visao_robo.tick)
+                if evento:
+                    print(f"[visao-robo] evento: {evento}")
+                    for gid in list(self._guilds_com_call):
+                        # evento_visual_robo, nao evento_visual: tipo
+                        # proprio, com forca maior. O que a camera do robo
+                        # mostra e a unica coisa que so ela esta vendo.
+                        self.consciencia(gid).evento_visual_robo(evento)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                print(f"[visao-robo] erro no laço: {e}")
+
     async def _laco_corpo(self) -> None:
         """Drena eventos corporais (transição de segurança, recusa de
         comando -- ver robot_tools.drenar_eventos_corpo) e empurra pra
@@ -406,6 +794,24 @@ class ClienteBridge:
                 for gid in list(self._guilds_com_call):
                     self.consciencia(gid).evento_corporal(evento)
 
+    async def _laco_jogo(self) -> None:
+        """Drena eventos de Minecraft (fala de jogador no chat do jogo,
+        dano, morte -- ver minecraft_tools.drenar_eventos_jogo) e empurra
+        pra Consciencia de toda guild com call ativa. Mesmo padrão exato
+        de _laco_corpo, inclusive rodar sempre: drenar fila vazia é
+        barato, e evita mais um "só liga se" espalhado."""
+        while True:
+            await asyncio.sleep(2.0)
+            try:
+                eventos = minecraft_tools.drenar_eventos_jogo()
+            except Exception as e:
+                print(f"[jogo] erro ao drenar eventos: {e}")
+                continue
+            for descricao, forca in eventos:
+                print(f"[jogo] evento: {descricao}")
+                for gid in list(self._guilds_com_call):
+                    self.consciencia(gid).evento_jogo(descricao, forca)
+
     async def _laco_consciencia(self, guild_id: str) -> None:
         """Bate no portão de tempos em tempos. Não decide nada -- só pergunta."""
         c = self.consciencia(guild_id)
@@ -420,20 +826,42 @@ class ClienteBridge:
                     print(f"[consciencia] {v}")
 
                 if v.impulso is not None and v.impulso.tipo == "vazio":
-                    self._tentar_curiosidade(guild_id, c)
+                    # SÓ com a EVA livre. Estas duas disparam chamadas de
+                    # LLM em segundo plano (pesquisa de curiosidade e
+                    # sugestão de assunto), e no log de 26/08 elas rodaram
+                    # CONCORRENTES com a resposta que a pessoa estava
+                    # esperando -- o decisor caiu de 65-74 tok/s pra 10.70
+                    # tok/s naquele momento exato, 6x mais lento por
+                    # contenção de GPU. Uma sugestão de assunto que chega
+                    # três segundos depois não perde nada; uma resposta que
+                    # chega seis segundos depois perde a conversa.
+                    #
+                    # `c.ocupada` acabou de ser calculado acima, então usa
+                    # ele em vez de reconsultar o estado.
+                    if not c.ocupada:
+                        self._tentar_curiosidade(guild_id, c)
+                        self._tentar_puxar_assunto(guild_id, c)
 
                 if not v.passou:
                     continue
 
                 async with est.processando:
                     c.ocupada = True
-                    r = await self.eva.falar_sozinha_async(
-                        v.impulso.conteudo, usuario=c.ultimo_falante, modo_voz=True)
-                    if r.resposta:
-                        print(f"[eva espontânea] {r.resposta}")
-                        await self.falar(guild_id, r.resposta)
-                        c.ela_falou(espontanea=True)
-                    c.ocupada = False
+                    try:
+                        r = await self.eva.falar_sozinha_async(
+                            v.impulso.conteudo, usuario=c.ultimo_falante, modo_voz=True)
+                        if r.resposta:
+                            print(f"[eva espontânea] {r.resposta}")
+                            # `usuario` importa mesmo na fala espontânea:
+                            # falar_sozinha() grava o turno em nome de
+                            # c.ultimo_falante (ver orchestrator), então
+                            # é esse o turno a corrigir se ela for
+                            # cortada puxando assunto.
+                            await self.falar(guild_id, r.resposta,
+                                             usuario=c.ultimo_falante)
+                            c.ela_falou(espontanea=True)
+                    finally:
+                        c.ocupada = False
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -458,10 +886,20 @@ class ClienteBridge:
         # lento ou uma queda de rede antes da confirmação chegar deixaria
         # a captura de tela ligada indefinidamente depois de "sair" da call.
         self._desligar_visao_se_precisar(guild_id)
+        self._desligar_robo_consciencia_se_precisar()
+        self._fechar_tts_se_precisar()
         await self._enviar({"type": "leave", "guild_id": str(guild_id)})
 
-    async def falar(self, guild_id: str, texto: str) -> None:
-        """Sintetiza e envia para o Discord."""
+    async def falar(self, guild_id: str, texto: str,
+                    usuario: str | None = None) -> None:
+        """Sintetiza e envia para o Discord.
+
+        `usuario` é de quem é o turno no histórico -- só usado se a fala
+        for interrompida no meio, pra saber qual turno corrigir. Fala
+        espontânea (consciência) passa None e simplesmente não corrige
+        nada, o que está certo: se ela é cortada puxando assunto sozinha,
+        o assunto morre ali mesmo.
+        """
         if not self.tts or not texto.strip():
             return
 
@@ -481,14 +919,30 @@ class ClienteBridge:
             print(f"[tts] {e}")
             return
 
+        # Estado da fala em andamento. Precisa estar completo ANTES do
+        # primeiro byte sair: o áudio de quem fala por cima já pode estar
+        # a caminho, e sem `texto_em_voz` preenchido o teste de eco não
+        # tem com o que comparar -- o eco passaria como fala legítima e
+        # ela se interromperia sozinha.
+        est.texto_em_voz = texto.strip()
+        est.usuario_em_voz = usuario
+        est.bytes_em_voz = len(pcm)
+        est.corte_pedido = False
+        est.cortar.clear()
+
         est.falando = True
         print(f"[voz] falando {duracao_segundos(pcm):.1f}s")
         # O cabeçalho JSON avisa o bridge que o próximo quadro é áudio --
         # dentro do lock (ver __init__): sem isso, uma fala espontânea e
         # esta poderiam intercalar cabeçalho/payload uma da outra.
         async with self._envio_audio_lock:
-            await self._enviar({"type": "play", "guild_id": str(guild_id)})
-            await self.ws.send(pcm)
+            try:
+                await self._enviar({"type": "play", "guild_id": str(guild_id)})
+                await self.ws.send(pcm)
+            except Exception:
+                est.falando = False
+                est.fim_da_fala = time.time()
+                raise
 
         # "Tempo até o primeiro som": do fim da transcrição até o áudio
         # sair pelo WebSocket. Só faz sentido se este `falar` veio de uma
@@ -525,12 +979,18 @@ class ClienteBridge:
         if not self.tts.motor._carregado:
             await self.tts.motor.inicializar()
 
+        est = self.estado(guild_id)
+        est.texto_em_voz = ""
+        est.usuario_em_voz = usuario
+        est.bytes_em_voz = 0
+        est.corte_pedido = False
+        est.cortar.clear()
+
         fila: queue.Queue = queue.Queue()
         asyncio.create_task(asyncio.to_thread(
             self._produzir_stream_de_voz, mensagem, usuario, contexto_visual,
-            fila, modo_multicanal))
+            fila, modo_multicanal, est.cortar))
 
-        est = self.estado(guild_id)
         resultado = None
         iniciou = False
         pre_buffer = bytearray()
@@ -549,7 +1009,19 @@ class ClienteBridge:
 
         while True:
             tipo, dado = await asyncio.to_thread(fila.get)
+            if tipo == "frase":
+                # Chega ANTES do áudio da frase: é o que mantém
+                # `texto_em_voz` em dia pro teste de eco enquanto a
+                # resposta ainda está sendo gerada.
+                est.texto_em_voz = (est.texto_em_voz + " " + dado).strip()
+                continue
             if tipo == "audio":
+                if est.corte_pedido:
+                    # Interrompida: o bridge já está encerrando no fim do
+                    # que tem em fila. Mandar mais áudio agora só faria
+                    # ela continuar falando depois do corte.
+                    continue
+                est.bytes_em_voz += len(dado)
                 if not iniciou:
                     pre_buffer.extend(dado)
                     if len(pre_buffer) < alvo_pre_buffer:
@@ -568,7 +1040,7 @@ class ClienteBridge:
                 print(f"[voz-stream] {dado}")
                 break
 
-        if not iniciou and pre_buffer:
+        if not iniciou and pre_buffer and not est.corte_pedido:
             # Resposta curta o bastante pra nunca bater o alvo de
             # pré-buffer -- manda o que tem em vez de nunca falar nada.
             await _iniciar_reproducao(bytes(pre_buffer))
@@ -577,11 +1049,22 @@ class ClienteBridge:
         if iniciou:
             await self._enviar({"type": "play_end", "guild_id": str(guild_id)})
         else:
+            # Nenhum som saiu: não vai vir `play_done` nenhum, então a
+            # limpeza que normalmente acontece lá tem que acontecer aqui
+            # -- senão `texto_em_voz` fica preso com um texto que nunca
+            # foi falado, e o teste de eco passa a comparar contra ele.
             est.falando = False
+            est.fim_da_fala = time.time()
+            est.ultimo_texto_falado = est.texto_em_voz or est.ultimo_texto_falado
+            est.texto_em_voz = ""
+            est.usuario_em_voz = None
+            est.corte_pedido = False
+            est.cortar.clear()
         return resultado
 
     def _produzir_stream_de_voz(self, mensagem, usuario, contexto_visual, fila,
-                                modo_multicanal: bool = False) -> None:
+                                modo_multicanal: bool = False,
+                                cortar: threading.Event | None = None) -> None:
         """Roda inteiro numa thread dedicada: monta contexto, consome o
         streaming do LLM, sintetiza frase a frase, põe áudio na fila. Nada
         bloqueante toca o event loop direto -- mesma política do resto do
@@ -600,15 +1083,27 @@ class ClienteBridge:
         buffer = ""
         try:
             for pedaco in stream:
+                # Interrompida: para de sintetizar frase nova na hora. O
+                # que já está na fila do bridge continua e termina a frase
+                # atual -- é o "termina a frase e cede". Sair do laço aqui
+                # também abandona o resto do streaming do LLM, que é o que
+                # a gente quer: o texto seguinte não vai ser dito.
+                if cortar is not None and cortar.is_set():
+                    break
                 buffer += pedaco
                 frases, buffer = extrair_frases_fechadas(buffer)
                 for frase in frases:
+                    fila.put(("frase", frase))
                     self._sintetizar_e_enfileirar(frase, fila)
+                    if cortar is not None and cortar.is_set():
+                        break
         except Exception as e:
             fila.put(("erro", str(e)))
             return
 
-        if buffer.strip():
+        cortada = cortar is not None and cortar.is_set()
+        if buffer.strip() and not cortada:
+            fila.put(("frase", buffer))
             self._sintetizar_e_enfileirar(buffer, fila)
 
         fila.put(("fim", stream.resultado))
@@ -650,24 +1145,29 @@ class ClienteBridge:
 
     # ---------------------------------------------------------- recepção
 
-    async def _ao_receber_audio(self, guild_id: str, user_id: str, pcm: bytes) -> None:
+    async def _ao_receber_audio(self, guild_id: str, user_id: str, pcm: bytes,
+                                durante_fala: bool = False) -> None:
         est = self.estado(guild_id)
 
-        # Ignora o próprio eco: enquanto fala, e por uma janela curta depois
-        if est.falando or (time.time() - est.fim_da_fala) < self.janela_eco:
-            return
-
-        # Uma resposta de cada vez: se já está gerando/falando, descarta em
-        # vez de enfileirar -- resposta atrasada a uma fala antiga confunde
-        # mais do que ajuda numa conversa por voz. Note que isso guarda só
-        # a fase de RESPONDER, não a de transcrever -- ver comentário mais
-        # abaixo sobre por que a transcrição ficou fora do lock.
-        if est.processando.locked():
-            return
+        # `durante_fala` vem do bridge.js e diz se o microfone abriu
+        # ENQUANTO ela falava. Não dá pra reconstruir isso aqui: a captura
+        # só fecha depois de EVA_VOZ_SILENCIO de silêncio, então quando
+        # este áudio chega ela já pode ter terminado. A janela de eco
+        # continua valendo depois do fim da fala pelo mesmo motivo -- o
+        # Discord ainda entrega pacotes atrasados por um tempinho.
+        pode_ser_eco = (durante_fala or est.falando
+                        or (time.time() - est.fim_da_fala) < self.janela_eco)
 
         # Descarta silêncio antes de gastar chamada de API
         if esta_silencioso(pcm):
             return
+
+        # Já sabemos que é áudio real (não silêncio) -- avisa a
+        # consciência AGORA, antes do STT (que leva 1-2s de `await` logo
+        # abaixo). Fecha a janela de corrida onde a proatividade podia
+        # falar por cima do início desta fala -- ver Consciencia.
+        # audio_detectado() para o histórico completo do bug.
+        self.consciencia(guild_id).audio_detectado()
 
         # Transcrição fica FORA do lock de propósito: se isso estivesse
         # dentro do `async with est.processando`, a fala da segunda pessoa
@@ -689,9 +1189,72 @@ class ClienteBridge:
         if parece_ruido(t):
             return
 
+        # ---------------------------------------------------- eco vs fala
+        referencia = est.texto_em_voz or est.ultimo_texto_falado
+        if pode_ser_eco and referencia:
+            if _parece_eco(t.texto, referencia):
+                # Não é ninguém falando: é a voz dela voltando pelo
+                # microfone de quem está sem fone. Avisa o bridge pra
+                # nem decodificar esse usuário durante o playback daqui
+                # pra frente -- é o que devolve a economia de CPU que o
+                # fix v2 do bridge.js tinha, sem fechar o microfone de
+                # quem está de fone.
+                print(f"[eco] descartado de {user_id}: {t.texto[:60]!r}")
+                await self._enviar({
+                    "type": "fonte_de_eco", "guild_id": str(guild_id),
+                    "user_id": str(user_id),
+                    "ttl_ms": int(self.ttl_fonte_de_eco * 1000),
+                })
+                return
+
+            if est.falando:
+                # Fala de verdade por cima dela: interrompe.
+                #
+                # Exige mais de UMA palavra. Em call real, um clipe de
+                # 0.9s virou "Yes." e cortou a fala dela no meio -- ruído
+                # ou eco que o Whisper resolveu como palavra solta, em
+                # inglês, então `_parece_eco` não tinha como pegar (o
+                # texto dela é português). Interromper é uma ação cara e
+                # visível; uma palavra solta não é evidência suficiente
+                # de que alguém realmente quis falar.
+                #
+                # A fala NÃO é descartada por isso -- ela segue pro fluxo
+                # normal logo abaixo e entra em `pendentes`. A pessoa é
+                # respondida quando a EVA terminar; só não ganha o corte.
+                if len(_normalizar_para_eco(t.texto)) > 1:
+                    await self._interromper(
+                        guild_id, motivo=f"{user_id} falou por cima")
+                else:
+                    print(f"[interrupção] ignorada, fala curta demais: "
+                          f"{t.texto[:40]!r}")
+
         print(f"[call] {user_id}: {t.texto}")
         self.consciencia(guild_id).alguem_falou(
             str(user_id), t.texto, nome=self._nome(user_id))
+
+        # ------------------------------------------- ela ainda está ocupada
+        # Nada aqui descarta a fala. Ou ela vira turno agora, ou entra em
+        # `pendentes` e vira turno assim que der -- ver `_drenar_pendentes`.
+        if est.processando.locked() or est.falando:
+            est.pendentes.append((str(user_id), t.texto, time.time()))
+            # Continua contando como "esta pessoa falou agora" mesmo indo
+            # pra fila -- senão, a fala seguinte de outra pessoa não veria
+            # ninguém ativo e não abriria a janela multicanal.
+            est.ultima_fala_por[str(user_id)] = time.time()
+            if not est.falando and est.mensagem_em_curso is not None:
+                # Ela está GERANDO e nada saiu como som ainda: a resposta
+                # que está vindo já nasceu incompleta, porque a pessoa
+                # emendou mais coisa. Invalida e junta as duas falas num
+                # turno só, em vez de falar uma resposta obsoleta e depois
+                # responder o resto separado.
+                est.geracao_invalidada = True
+                print(f"[turno] fala nova durante a geração -- "
+                      f"as duas viram um turno só")
+            else:
+                print(f"[turno] fala guardada, ela ainda está ocupada "
+                      f"({len(est.pendentes)} pendente(s))")
+            self._agendar_drenagem(guild_id)
+            return
 
         agora = time.time()
         outra_pessoa_ativa = any(
@@ -717,6 +1280,132 @@ class ClienteBridge:
             est.tarefa_agregacao.cancel()
         est.tarefa_agregacao = asyncio.create_task(
             self._fechar_janela_multicanal(guild_id))
+
+    # ------------------------------------------------------ interrupção
+
+    async def _interromper(self, guild_id: str, motivo: str = "") -> None:
+        """Corta a fala em andamento.
+
+        Dois efeitos, nesta ordem: sinaliza pra thread de síntese parar de
+        gerar frases novas (só o caminho de streaming tem isso; no
+        bloqueante o áudio já foi todo gerado) e pede o corte ao bridge.
+        O bridge decide COMO cortar -- fim da frase atual no streaming,
+        fade no bloqueante. Ver `stopPlay` no bridge.js.
+        """
+        est = self.estado(guild_id)
+        if est.corte_pedido:
+            return
+        est.corte_pedido = True
+        est.cortar.set()
+        print(f"[interrupção] {motivo or 'corte pedido'}")
+        try:
+            await self._enviar({"type": "stop_play", "guild_id": str(guild_id)})
+        except Exception as e:
+            print(f"[interrupção] falha ao pedir corte: {e}")
+
+    def _corrigir_historico_apos_corte(self, guild_id: str, bytes_ouvidos: int,
+                                       bytes_totais: int) -> None:
+        """Troca, no histórico, a resposta inteira pelo trecho que virou som.
+
+        Por que isso importa mais do que parece: `_pos_processar` grava o
+        turno "assistant" quando o LLM termina de gerar, muito antes de
+        virar áudio. Uma resposta cortada na metade fica registrada
+        inteira, e na volta ela entra no prompt do turno seguinte como
+        exemplo do próprio comportamento -- o mesmo mecanismo de few-shot
+        acidental que já derrubou o tique de abertura repetida neste
+        projeto. Só que aqui é pior: ela passa a "lembrar" de ter dito
+        coisas que ninguém ouviu, e responde como se tivessem sido ditas.
+        """
+        est = self.estado(guild_id)
+        texto = est.texto_em_voz
+        usuario = est.usuario_em_voz
+        if not texto or not usuario:
+            return
+
+        fracao = (bytes_ouvidos / bytes_totais) if bytes_totais else 1.0
+        dito = _cortar_texto_na_fracao(texto, fracao)
+        if dito == texto.strip():
+            return
+
+        try:
+            if dito:
+                self.eva.memoria.corrigir_ultimo_turno(
+                    "assistant", dito, usuario=usuario)
+                print(f"[interrupção] histórico corrigido para o que saiu no "
+                      f"áudio ({int(fracao * 100)}%): {dito[-60:]!r}")
+            else:
+                self.eva.memoria.remover_ultimo_turno("assistant", usuario=usuario)
+                print("[interrupção] cortada antes de sair som -- "
+                      "turno removido do histórico")
+        except Exception as e:
+            print(f"[interrupção] não consegui corrigir o histórico: {e}")
+
+    # ------------------------------------------------- turnos pendentes
+
+    def _agendar_drenagem(self, guild_id: str) -> None:
+        est = self.estado(guild_id)
+        if est.tarefa_drenagem is not None and not est.tarefa_drenagem.done():
+            return
+        est.tarefa_drenagem = asyncio.create_task(self._drenar_pendentes(guild_id))
+
+    async def _drenar_pendentes(self, guild_id: str) -> None:
+        """Espera ela ficar livre e responde tudo que ficou esperando.
+
+        Junta as falas acumuladas num turno só -- é o comportamento certo
+        tanto pra pessoa que emendou uma frase na outra quanto pra duas
+        pessoas falando ao mesmo tempo (nesse caso vira o mesmo bloco
+        multicanal que `_fechar_janela_multicanal` já montava).
+
+        Enquanto espera, `pendentes` continua recebendo -- por isso a
+        leitura da lista é feita só depois do laço de espera, e a tarefa
+        se re-agenda se algo tiver chegado no meio do caminho.
+        """
+        est = self.estado(guild_id)
+        # Teto de espera. `est.falando` só volta a False quando o
+        # `play_done` do bridge chega -- se ele se perder (queda de rede,
+        # bridge reiniciado no meio de uma fala), sem este teto a fala da
+        # pessoa ficaria presa em `pendentes` para sempre, que é
+        # exatamente o sintoma que estamos consertando, só que mais raro
+        # e mais difícil de enxergar. Preso é preso.
+        limite = time.time() + 60.0
+        try:
+            while est.processando.locked() or est.falando:
+                if time.time() > limite:
+                    print("[turno] esperei 60s e ela continua ocupada -- "
+                          "respondendo o pendente assim mesmo")
+                    est.falando = False
+                    break
+                await asyncio.sleep(0.05)
+        except asyncio.CancelledError:
+            return
+
+        itens, est.pendentes = est.pendentes, []
+        if not itens:
+            return
+
+        vozes = {uid for uid, _, _ in itens}
+        ultimo_usuario = itens[-1][0]
+
+        if len(itens) == 1:
+            bloco = itens[0][1]
+            multicanal = False
+        elif len(vozes) == 1:
+            # Mesma pessoa emendando: vira uma fala só, sem marcação
+            # nenhuma de canal -- pro modelo isso é uma frase comprida,
+            # não uma conversa entre gente diferente.
+            bloco = " ".join(texto for _, texto, _ in itens)
+            multicanal = False
+        else:
+            bloco = "\n".join(
+                f"[voz] {self._nome(uid) or uid}: {texto}" for uid, texto, _ in itens)
+            multicanal = True
+
+        print(f"[turno] respondendo {len(itens)} fala(s) que estavam esperando")
+        await self._responder_a(guild_id, bloco, ultimo_usuario,
+                                modo_multicanal=multicanal)
+
+        if est.pendentes:
+            self._agendar_drenagem(guild_id)
 
     async def _responder_a(self, guild_id: str, mensagem: str, usuario: str,
                            modo_multicanal: bool = False) -> None:
@@ -765,10 +1454,16 @@ class ClienteBridge:
         """
         est = self.estado(guild_id)
         async with est.processando:
-            contexto_visual = await self._contexto_visual_para(mensagem)
-            r = await self._falar_stream(
-                guild_id, mensagem, usuario, contexto_visual,
-                modo_multicanal=modo_multicanal)
+            est.mensagem_em_curso = mensagem
+            est.geracao_invalidada = False
+            try:
+                contexto_visual = await self._contexto_visual_para(mensagem)
+                r = await self._falar_stream(
+                    guild_id, mensagem, usuario, contexto_visual,
+                    modo_multicanal=modo_multicanal)
+            finally:
+                em_curso = est.mensagem_em_curso
+                est.mensagem_em_curso = None
 
             if r is None or r.erro:
                 if r and r.erro:
@@ -776,6 +1471,25 @@ class ClienteBridge:
                 return
             if not r.resposta:
                 return
+
+            # Só descarta se NADA virou som. Aqui isso é raro de verdade
+            # (o primeiro áudio sai em ~120ms depois da primeira frase
+            # pronta); se já saiu som, o caminho certo é a interrupção,
+            # não o descarte -- a pessoa ouviu parte da resposta.
+            if est.geracao_invalidada and est.bytes_em_voz == 0:
+                est.geracao_invalidada = False
+                try:
+                    self.eva.memoria.remover_ultimo_turno("assistant", usuario=usuario)
+                    self.eva.memoria.remover_ultimo_turno("user", usuario=usuario)
+                except Exception as e:
+                    print(f"[turno] não consegui limpar o turno descartado: {e}")
+                if em_curso:
+                    est.pendentes.insert(0, (usuario, em_curso, time.time()))
+                print("[turno] resposta descartada -- vai ser refeita com as "
+                      "duas falas juntas")
+                self._agendar_drenagem(guild_id)
+                return
+            est.geracao_invalidada = False
 
             print(f"[eva] {r.resposta}")
             self.consciencia(guild_id).ela_falou()
@@ -801,11 +1515,18 @@ class ClienteBridge:
         """
         est = self.estado(guild_id)
         async with est.processando:
-            contexto_visual = await self._contexto_visual_para(mensagem)
-            r = await asyncio.to_thread(
-                self.eva.responder, mensagem, usuario=usuario, modo_voz=True,
-                contexto_visual=contexto_visual, modo_multicanal=modo_multicanal,
-            )
+            est.mensagem_em_curso = mensagem
+            est.geracao_invalidada = False
+            try:
+                contexto_visual = await self._contexto_visual_para(mensagem)
+                r = await asyncio.to_thread(
+                    self.eva.responder, mensagem, usuario=usuario, modo_voz=True,
+                    contexto_visual=contexto_visual, modo_multicanal=modo_multicanal,
+                )
+            finally:
+                em_curso = est.mensagem_em_curso
+                est.mensagem_em_curso = None
+
             if r is None or r.erro:
                 if r and r.erro:
                     print(f"[eva] {r.erro}")
@@ -813,8 +1534,39 @@ class ClienteBridge:
             if not r.resposta:
                 return
 
+            if est.geracao_invalidada:
+                # A pessoa emendou outra fala enquanto isto era gerado.
+                # Esta resposta não vale mais: ela responde só metade do
+                # que foi dito, e falar metade agora pra responder o resto
+                # depois é justamente o ping-pong que a gente não quer.
+                #
+                # CUSTO ASSUMIDO: esta geração inteira vai pro lixo, e o
+                # llama-server já gastou o tempo dela. Não dá pra abortar
+                # -- llm.py usa urllib bloqueante, e mesmo cancelando a
+                # thread o servidor continuaria gerando e a próxima
+                # requisição ficaria na fila atrás dela. Cancelar não
+                # economizaria nada; só esconderia o custo.
+                #
+                # Essa janela encolhe muito com EVA_VOZ_STREAMING=1: lá o
+                # som começa na primeira frase pronta, então "gerando sem
+                # nada tocando" dura menos de um segundo, e o caso normal
+                # passa a ser interrupção (que não desperdiça nada) em vez
+                # de invalidação.
+                est.geracao_invalidada = False
+                try:
+                    self.eva.memoria.remover_ultimo_turno("assistant", usuario=usuario)
+                    self.eva.memoria.remover_ultimo_turno("user", usuario=usuario)
+                except Exception as e:
+                    print(f"[turno] não consegui limpar o turno descartado: {e}")
+                if em_curso:
+                    est.pendentes.insert(0, (usuario, em_curso, time.time()))
+                print("[turno] resposta descartada -- vai ser refeita com as "
+                      "duas falas juntas")
+                self._agendar_drenagem(guild_id)
+                return
+
             print(f"[eva] {r.resposta}")
-            await self.falar(guild_id, r.resposta)
+            await self.falar(guild_id, r.resposta, usuario=usuario)
             self.consciencia(guild_id).ela_falou()
 
             if r.plano.possivel_lacuna:
@@ -902,9 +1654,12 @@ class ClienteBridge:
 
         gid = str(d.get("guild_id") or f"dm:{canal}")
         est = self.estado(gid)
-        if est.processando.locked():
-            return
 
+        # Não descarta mensagem por estar ocupada. Era o mesmo `return`
+        # seco do caminho de voz, com um agravante: no texto a pessoa VÊ a
+        # mensagem dela entregue no canal e a EVA simplesmente não
+        # responder. `async with` abaixo já enfileira naturalmente -- ela
+        # responde quando terminar o que está fazendo.
         async with est.processando:
             await self._enviar({"type": "typing", "channel_id": canal})
             autor = str(d.get("author_id") or canal)
@@ -924,7 +1679,7 @@ class ClienteBridge:
 
             # se estiver numa call desse servidor, fala também
             if est.canal_id:
-                await self.falar(gid, r.resposta)
+                await self.falar(gid, r.resposta, usuario=autor)
 
             if r.plano.possivel_lacuna:
                 asyncio.create_task(
@@ -1023,7 +1778,9 @@ class ClienteBridge:
                 return
             cab = self._audio_pendente
             self._audio_pendente = None
-            await self._ao_receber_audio(cab["guild_id"], cab["user_id"], bytes(msg))
+            await self._ao_receber_audio(
+                cab["guild_id"], cab["user_id"], bytes(msg),
+                durante_fala=bool(cab.get("durante_fala")))
             return
 
         try:
@@ -1044,16 +1801,24 @@ class ClienteBridge:
         elif tipo == "joined":
             gid = str(d["guild_id"])
             self.estado(gid).canal_id = str(d.get("channel_id"))
+            # Sessao nova a cada call. Sem isso, o historico da call
+            # anterior entra no prompt como papel "assistant" e a EVA copia
+            # o proprio comportamento passado -- inclusive tique de modelo
+            # ja trocado (ver SESSAO DE CONVERSA em memory/store.py).
+            self.eva.memoria.nova_sessao()
             self._cancelar_laco_consciencia(gid)
             self._tarefas_consciencia[gid] = asyncio.create_task(
                 self._laco_consciencia(gid))
             self._ligar_visao_se_precisar(gid)
+            self._ligar_robo_consciencia_se_precisar(gid)
             print(f"[bridge] entrou em '{d.get('channel_name')}'")
         elif tipo == "left":
             gid = str(d["guild_id"])
             self.estado(gid).canal_id = None
             self._cancelar_laco_consciencia(gid)
             self._desligar_visao_se_precisar(gid)
+            self._desligar_robo_consciencia_se_precisar()
+            self._fechar_tts_se_precisar()
             motivo = f" ({d['reason']})" if d.get("reason") else ""
             print(f"[bridge] saiu do canal{motivo}")
         elif tipo == "reconnecting":
@@ -1061,9 +1826,27 @@ class ClienteBridge:
         elif tipo == "reconnected":
             print("[bridge] reconectado")
         elif tipo == "play_done":
-            est = self.estado(str(d["guild_id"]))
+            gid = str(d["guild_id"])
+            est = self.estado(gid)
             est.falando = False
             est.fim_da_fala = time.time()
+            if d.get("cortada"):
+                self._corrigir_historico_apos_corte(
+                    gid,
+                    int(d.get("bytes_reproduzidos") or 0),
+                    int(d.get("bytes_totais") or est.bytes_em_voz or 0),
+                )
+            # Limpa DEPOIS da correção: `texto_em_voz` é a entrada dela.
+            # A partir daqui não há fala em andamento, então qualquer
+            # áudio que chegar atrasado não tem mais com o que ser
+            # comparado -- e a janela de eco (`fim_da_fala`) é quem cobre
+            # esse rabicho.
+            est.ultimo_texto_falado = est.texto_em_voz or est.ultimo_texto_falado
+            est.texto_em_voz = ""
+            est.usuario_em_voz = None
+            est.bytes_em_voz = 0
+            est.corte_pedido = False
+            est.cortar.clear()
         elif tipo == "error":
             print(f"[bridge] erro: {d.get('message')}")
 
@@ -1081,6 +1864,7 @@ class ClienteBridge:
             self._dashboard.iniciar()
 
         self._tarefa_corpo = asyncio.create_task(self._laco_corpo())
+        self._tarefa_jogo = asyncio.create_task(self._laco_jogo())
 
         tentativa = 0
         while True:
@@ -1158,6 +1942,12 @@ class ClienteBridge:
             self._tarefa_visao.cancel()
         if self._tarefa_corpo and not self._tarefa_corpo.done():
             self._tarefa_corpo.cancel()
+        if self._tarefa_jogo and not self._tarefa_jogo.done():
+            self._tarefa_jogo.cancel()
+        if self.tts:
+            motor = getattr(self.tts, "motor", None)
+            if motor and hasattr(motor, "fechar"):
+                motor.fechar()
         if self.visao:
             self.visao.fechar()
         if self._dashboard:

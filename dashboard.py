@@ -434,6 +434,9 @@ class ServidorDashboard:
         if acao == "minecraft_cancelar_tarefa":
             return minecraft_tools.minecraft_cancelar_tarefa()
 
+        if acao == "robo_conectar":
+            return robot_tools.conectar_dashboard()
+
         if acao == "robo_parar":
             return robot_tools.parar_dashboard()
 
@@ -447,7 +450,8 @@ class ServidorDashboard:
         raise ValueError(
             f"ação desconhecida: {acao!r}. Válidas: visao_ligar, "
             f"visao_desligar, visao_tick_agora, esquecer_memoria, "
-            f"minecraft_cancelar_tarefa, robo_parar, robo_estop, robo_reset_estop"
+            f"minecraft_cancelar_tarefa, robo_conectar, robo_parar, "
+            f"robo_estop, robo_reset_estop"
         )
 
     # ------------------------------------------------------------ ciclo
@@ -665,6 +669,13 @@ async function acao(nome, extra) {
   return r;
 }
 
+async function roboConectar() {
+  const r = await acao('robo_conectar');
+  if (r.resultado && r.resultado.erro) {
+    alert('Não consegui conectar: ' + JSON.stringify(r.resultado));
+  }
+}
+
 async function roboEstop() {
   if (!confirm('EMERGENCY STOP no robô agora?')) return;
   await acao('robo_estop');
@@ -793,6 +804,7 @@ async function carregar() {
       <div class="kv" style="margin-top:6px">vida ${mc.vida ?? '-'} &nbsp;·&nbsp; fome ${mc.fome ?? '-'}</div>
       ${mc.posicao ? `<div class="kv">posição (${mc.posicao.x}, ${mc.posicao.y}, ${mc.posicao.z})</div>` : ''}
       <div class="kv" style="margin-top:8px"><b>Tarefa:</b> ${t ? `${t.objetivo} -- ${t.status} (${t.passos} passo(s))` : '(nenhuma ainda)'}</div>
+      <div class="kv">eventos na fila: ${mc.eventos_na_fila ?? 0}</div>
       ${t && t.status === 'ativa' ? `<button onclick="acao('minecraft_cancelar_tarefa')">Cancelar tarefa</button>` : ''}`;
   }
 
@@ -802,7 +814,9 @@ async function carregar() {
     roboDiv.innerHTML = `
       <div class="linha"><div class="rotulo">Conectado</div>${pill(false)}</div>
       <div class="vazio" style="margin-top:6px">Sem conexão ainda -- conecta sozinho na primeira vez que
-        alguma ferramenta de robô for usada (eva_command_server.py precisa estar rodando no robô).</div>`;
+        alguma ferramenta de robô for usada, ou ao entrar numa call (eva_command_server.py precisa
+        estar rodando no robô).</div>
+      <button style="margin-top:8px" onclick="roboConectar()">Conectar agora</button>`;
   } else if (ro.erro_estado) {
     roboDiv.innerHTML = `
       <div class="linha"><div class="rotulo">Conectado</div>${pill(true)}</div>
