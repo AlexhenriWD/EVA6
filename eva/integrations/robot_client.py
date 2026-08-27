@@ -176,19 +176,66 @@ class ClienteRobo:
         return await self._enviar("drive", params, ttl_ms=ttl_ms)
 
     async def olhar(self, yaw: int | None = None, pitch: int | None = None,
+                     cabeca: int | None = None, cotovelo: int | None = None,
                      smooth: bool = True) -> dict:
+        """Eixos confirmados por imagem (ver ferramentas/testar_cabeca.py):
+
+            yaw       canal 0, 0..90    gira a BASE       -- horizontal
+            pitch     canal 1, 40..110  levanta/abaixa    -- VERTICAL (o único)
+            cabeca    canal 3, 0..117   gira só a CÂMERA  -- horizontal (pan)
+            cotovelo  canal 2, 90..180  aproxima/afasta
+
+        Não existe eixo de roll -- nada inclina a imagem de lado. E há
+        DOIS eixos horizontais (yaw + cabeça, ~207° somados) contra um
+        vertical só.
+
+        `cabeca` e `cotovelo` são novos aqui: o servidor
+        (eva_command_server._cmd_head) já aceitava os dois, só não havia
+        nada deste lado mandando. O canal 3, apesar do nome, é o servo
+        que originalmente movia a GARRA deste braço acrílico; com a
+        PiCam parafusada no lugar dela, virou o segundo eixo de pan.
+
+        timeout maior que o padrão de _enviar porque `smooth=True` faz o
+        movimento em passos de 2° com 20ms entre eles
+        (ArmController._move_smooth): um curso de 90° leva quase um
+        segundo POR SERVO, e o _command_loop do Pi processa uma mensagem
+        de cada vez."""
         params: dict = {"smooth": smooth}
-        if yaw is not None:
-            params["yaw"] = yaw
-        if pitch is not None:
-            params["pitch"] = pitch
-        return await self._enviar("head", params)
+        for nome, valor in (("yaw", yaw), ("pitch", pitch),
+                            ("cabeca", cabeca), ("cotovelo", cotovelo)):
+            if valor is not None:
+                params[nome] = int(valor)
+        return await self._enviar("head", params, timeout=8.0)
+
+    async def trocar_camera(self, tipo: str | None = None) -> dict:
+        """tipo: "usb", "picam", ou None pra alternar.
+
+        ttl_ms=0 (TTL desligado) de propósito: a troca fecha e reabre um
+        device de vídeo do lado do Pi (camera_manager.switch_camera, com
+        sleep de 0.2s mais aquecimento) e pode segurar o _command_loop
+        por segundos. Com o TTL padrão de 300ms, o próprio comando
+        expiraria na fila se chegasse atrás de qualquer coisa lenta."""
+        params = {"tipo": tipo} if tipo else {}
+        return await self._enviar("camera_switch", params, ttl_ms=0, timeout=15.0)
 
     async def parar(self) -> dict:
         return await self._enviar("stop")
 
     async def heartbeat(self) -> dict:
-        return await self._enviar("heartbeat", background=True)
+        """ttl_ms=0 -- heartbeat NUNCA deve expirar na fila.
+
+        Comando expirado não alimenta o watchdog (is_expired retorna
+        antes de qualquer processamento), e um `head` com smooth=True
+        bloqueia o _command_loop do Pi por ~0.9s POR SERVO. Os
+        heartbeats que chegam durante um movimento longo enfileiram e
+        voltam todos "comando_expirado" -- uma sequência de gestos
+        conseguia estourar o WATCHDOG_TIMEOUT de 5s sozinha e derrubar o
+        robô em emergency stop no meio do próprio gesto.
+
+        Heartbeat que ficou na fila continua sendo prova de que o
+        cliente estava vivo quando mandou, que é exatamente o que o
+        watchdog quer saber. TTL aqui nunca protegeu de nada."""
+        return await self._enviar("heartbeat", ttl_ms=0, background=True)
 
     async def estop(self, motivo: str = "eva solicitou parada de emergência") -> dict:
         return await self._enviar("estop", {"motivo": motivo})
@@ -202,8 +249,8 @@ class ClienteRobo:
 # ============================================================================
 
 async def _loop_comandos(cliente: ClienteRobo) -> None:
-    print("Comandos: mover VX VY VZ | olhar YAW PITCH | parar | estado | "
-          "estop | heartbeat | sair")
+    print("Comandos: mover VX VY VZ | olhar YAW PITCH CABECA COTOVELO | "
+          "camera [usb|picam] | parar | estado | estop | heartbeat | sair")
     loop = asyncio.get_event_loop()
     while True:
         linha = await loop.run_in_executor(None, input, "> ")
@@ -218,9 +265,16 @@ async def _loop_comandos(cliente: ClienteRobo) -> None:
             vx, vy, vz = (float(v) for v in partes[1:4]) if len(partes) >= 4 else (0.0, 0.0, 0.0)
             r = await cliente.mover(vx=vx, vy=vy, vz=vz)
         elif cmd == "olhar":
-            yaw = int(partes[1]) if len(partes) > 1 else None
-            pitch = int(partes[2]) if len(partes) > 2 else None
-            r = await cliente.olhar(yaw=yaw, pitch=pitch)
+            # partes[3] (cabeça) e partes[4] (cotovelo) são lidos agora --
+            # antes eram silenciosamente descartados, e "olhar 90 90 115"
+            # mandava só yaw e pitch, respondia "ok", e não havia nada na
+            # saída indicando que a cabeça tinha sido ignorada.
+            def _arg(i):
+                return int(partes[i]) if len(partes) > i else None
+            r = await cliente.olhar(yaw=_arg(1), pitch=_arg(2),
+                                     cabeca=_arg(3), cotovelo=_arg(4))
+        elif cmd == "camera":
+            r = await cliente.trocar_camera(partes[1] if len(partes) > 1 else None)
         elif cmd == "parar":
             r = await cliente.parar()
         elif cmd == "estado":

@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import asyncio
 import struct
+import time
 
 
 class ClienteVideoRobo:
@@ -42,6 +43,13 @@ class ClienteVideoRobo:
         self.espera_entre_tentativas = espera_entre_tentativas
 
         self.ultimo_frame: bytes | None = None
+        # Sem timestamp, quem lê não tem como distinguir "quadro de
+        # agora" de "quadro de três minutos atrás, guardado depois da
+        # conexão cair" -- as duas coisas são bytes JPEG perfeitamente
+        # válidos. Ver robot_tools.obter_quadro_camera, que usa isto pra
+        # recusar quadro velho em vez de deixar o modelo de visão
+        # descrever com confiança uma cena que não existe mais.
+        self.ultimo_frame_ts: float = 0.0
         self.conectado = False
         self._falhas_conexao_consecutivas = 0
 
@@ -82,7 +90,16 @@ class ClienteVideoRobo:
                 self.conectado = False
                 print(f"[robo-video] erro inesperado: {e}")
 
-            await asyncio.sleep(self.espera_entre_tentativas)
+            # Primeira falha reconecta quase na hora; só depois recua pro
+            # intervalo normal. A queda mais comum aqui é NO MEIO de um
+            # quadro (IncompleteReadError, "N bytes read on a total of M
+            # expected") e se recupera na tentativa seguinte -- esperar
+            # os 2s fixos deixava o último quadro envelhecer até cair na
+            # checagem de idade de obter_quadro_camera, e robo_ver
+            # respondia "video_parado" por uma falha que já tinha passado.
+            espera = (0.2 if self._falhas_conexao_consecutivas <= 1
+                      else self.espera_entre_tentativas)
+            await asyncio.sleep(espera)
 
     async def _ler_quadros(self, reader: asyncio.StreamReader) -> None:
         while True:
@@ -90,3 +107,4 @@ class ClienteVideoRobo:
             (tamanho,) = struct.unpack("<L", cabecalho)
             dados = await reader.readexactly(tamanho)
             self.ultimo_frame = dados
+            self.ultimo_frame_ts = time.monotonic()

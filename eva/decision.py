@@ -133,6 +133,26 @@ ROBO_ESTADO = re.compile(
     re.I,
 )
 
+# Pedido de troca de câmera. Existe como REGRA, e não só como opção no
+# registro de ferramentas, porque a pergunta "você pode trocar sua
+# câmera?" já foi respondida em uso real com "o robô só tem uma câmera,
+# fixa" -- leitura correta de um registro onde a ferramenta não existia,
+# mas mentira sobre o corpo. Pedido físico inequívoco não deve depender
+# do decisor por LLM ter escolhido bem.
+# Ferramentas de corpo físico cuja ativação NÃO pode depender da
+# interpretação do decisor por LLM, nem ser confundida com busca web ou
+# visão de tela. Antes esta lista aparecia escrita à mão em dois pontos
+# de DecisorPorLLM.decidir, e uma ferramenta nova entrava num e não no
+# outro sem nenhum aviso.
+_FERRAMENTAS_FISICAS = {"robo_estado", "robo_olhar", "robo_trocar_camera"}
+
+ROBO_CAMERA = re.compile(
+    r"\b(troc(a|ar|ue)|mud(a|ar|e)|altern(a|ar|e))\s+(a\s+|de\s+|sua\s+|pra\s+|para\s+)*c[âa]mera|"
+    r"\bc[âa]mera (da cabe[çc]a|do bra[çc]o|picam|usb)\b|"
+    r"\bus(a|ar|e)\s+(a\s+)?(picam|c[âa]mera da cabe[çc]a)\b",
+    re.I,
+)
+
 JOGO_ESTADO = re.compile(
     r"\b(no minecraft|no jogo|no servidor|seu invent[áa]rio|quanto de vida)\b",
     re.I,
@@ -159,6 +179,10 @@ def robo_olhar_relevante(texto: str) -> bool:
 
 def robo_estado_relevante(texto: str) -> bool:
     return bool(ROBO_ESTADO.search(texto))
+
+
+def robo_camera_relevante(texto: str) -> bool:
+    return bool(ROBO_CAMERA.search(texto))
 
 
 def minecraft_estado_relevante(texto: str) -> bool:
@@ -376,6 +400,8 @@ class DecisorPorRegras:
             ferramentas.append({"nome": "robo_olhar", "args": {}})
         if robo_estado_relevante(texto):
             ferramentas.append({"nome": "robo_estado", "args": {}})
+        if robo_camera_relevante(texto):
+            ferramentas.append({"nome": "robo_trocar_camera", "args": {}})
 
         if CONTA.search(texto):
             expr = self._extrair_expressao(texto)
@@ -550,7 +576,7 @@ class DecisorPorLLM:
 
     def decidir(self, mensagem: str, historico: list[dict] | None = None) -> Plano:
         base = self.fallback.decidir(mensagem, historico)
-        if any(f.get("nome") in {"robo_estado", "robo_olhar"}
+        if any(f.get("nome") in _FERRAMENTAS_FISICAS
                for f in base.ferramentas):
             base.motivo = "regra física prioritária"
             return base
@@ -586,7 +612,7 @@ class DecisorPorLLM:
         # Pedidos físicos inequívocos não podem depender da interpretação do
         # LLM, nem ser confundidos com busca web ou visão da tela.
         for ferramenta_base in base.ferramentas:
-            if (ferramenta_base.get("nome") in {"robo_olhar", "robo_estado"}
+            if (ferramenta_base.get("nome") in _FERRAMENTAS_FISICAS
                     and not any(f.get("nome") == ferramenta_base.get("nome")
                                 for f in ferramentas)):
                 ferramentas.append(ferramenta_base)

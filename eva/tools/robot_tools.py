@@ -45,6 +45,7 @@ import os
 import queue
 import re
 import threading
+import time
 from typing import Callable
 
 from ..integrations.robot_client import ClienteRobo
@@ -92,6 +93,57 @@ BATERIA_MINIMA_SEGURA_V = float(os.environ.get("EVA_ROBOT_BATERIA_MINIMA", "6.6"
 # sem virar um estado() a cada 0.5-1s.
 CHECAGEM_SEGURANCA_A_CADA_N_TICKS = int(os.environ.get("EVA_ROBOT_CHECAGEM_SEGURANCA_TICKS", "4"))
 
+# Idade máxima de um quadro de câmera pra ele ainda valer como "o que ela
+# está vendo agora" -- ver obter_quadro_camera().
+IDADE_MAXIMA_QUADRO_S = float(os.environ.get("EVA_ROBOT_QUADRO_MAX_IDADE_S", "5.0"))
+
+# Ângulo pro qual robo_destravar_braco recolhe o cotovelo. Valor FIXO no
+# código, nunca parâmetro de ferramenta -- ver a docstring de lá.
+COTOVELO_NEUTRO = int(os.environ.get("EVA_ROBOT_COTOVELO_NEUTRO", "120"))
+
+# Sinal do delta de pitch que LEVANTA a mira. arm_controller.look_up()
+# assume que ângulo menor é pra cima (faz current - graus), mas isso
+# nunca foi conferido contra imagem. Compare 20-pitch-040.jpg com
+# 22-pitch-110.jpg da calibração: se a 040 mostra mais teto, este valor
+# está certo; se mostra mais chão, inverta pra 20 (e look_up/look_down
+# estão trocados desde sempre).
+PITCH_DELTA_CIMA = int(os.environ.get("EVA_ROBOT_PITCH_DELTA_CIMA", "-20"))
+
+# ===========================================================================
+# EIXOS DO CORPO -- confirmados por imagem (ferramentas/testar_cabeca.py),
+# não deduzidos do desenho mecânico.
+#
+#   0 yaw     0..90    gira a BASE          -- horizontal
+#   1 pitch  40..110   levanta/abaixa       -- VERTICAL, é o único
+#   3 cabeça  0..117   gira só a CÂMERA     -- horizontal (pan, não tilt)
+#
+# Duas consequências que mudam o desenho de tudo aqui embaixo:
+#
+# 1) Há DOIS eixos horizontais e UM vertical. Yaw + cabeça somam ~207° de
+#    pan, não os 90° do yaw sozinho -- "olhar em volta" é bem menos
+#    limitado do que o curso da base sugere.
+# 2) Não existe roll. Nada inclina a imagem de lado, então não existe
+#    gesto de "inclinar a cabeça em dúvida" -- inventar um alias que faz
+#    outra coisa seria mentir pra ela sobre o próprio corpo.
+#
+# O yaw parar em 90 (e não 180, que o servo alcança) é o flat CSI da
+# PiCam: ele sobe pelo braço até o Pi e não tem folga pra torcer além
+# disso. Aumentar o limite rasga o cabo.
+#
+# Este dicionário NÃO valida nada -- quem valida é safety.py, no Pi,
+# sempre. Ele existe pra os gestos serem PLANEJADOS dentro do curso que
+# existe, em vez de mandarem ângulo que vai ser clampado em silêncio e
+# virar "gesto" sem movimento nenhum.
+# ===========================================================================
+
+_CURSO_EIXO: dict[int, tuple[int, int]] = {0: (0, 90), 1: (40, 110), 3: (0, 117)}
+_NOME_CANAL = {0: "yaw", 1: "pitch", 3: "cabeca"}
+
+# Yaw que aponta pra frente do carro. robo_olhar_em_volta sempre volta
+# pra cá no fim: deixar a base parada num extremo mantém o flat CSI
+# torcido por tempo indeterminado.
+YAW_FRENTE = int(os.environ.get("EVA_ROBOT_YAW_FRENTE", "90"))
+
 
 def _iniciar_thread_robo() -> None:
     """Sobe a thread com o event loop dedicado, uma vez só, preguiçoso --
@@ -126,9 +178,9 @@ def _iniciar_thread_robo() -> None:
                 # _iniciativa_ativa -- controle de liga/desliga é checado a
                 # cada ciclo (ver definir_iniciativa), não só na
                 # inicialização.
-                _loop.create_task(_ciclo_heartbeat())
-                _loop.create_task(_ciclo_iniciativa())
-                _loop.create_task(_cliente_video.rodar())
+                _criar_tarefa_permanente("heartbeat", _ciclo_heartbeat)
+                _criar_tarefa_permanente("iniciativa", _ciclo_iniciativa)
+                _criar_tarefa_permanente("video", _cliente_video.rodar)
                 _loop.run_forever()
 
             _thread = threading.Thread(target=rodar_loop, daemon=True, name="eva-robot")
@@ -139,6 +191,45 @@ def _iniciar_thread_robo() -> None:
     # arrancar) em vez de simplesmente esperar _pronto -- funcionalmente
     # parecido, mas prende o lock por mais tempo que o necessário à toa.
     _pronto.wait(timeout=5)
+
+
+_tarefas_fundo: dict[str, asyncio.Task] = {}
+
+
+def _criar_tarefa_permanente(nome: str, fabrica) -> None:
+    """Cria uma task de fundo GUARDANDO a referência, e a recria se ela
+    morrer.
+
+    BUG REAL fechado aqui: asyncio guarda só referência FRACA às tasks
+    (Task.__init__ registra em _all_tasks, que é um WeakSet). Uma task
+    criada com create_task() e cujo retorno é descartado pode ser
+    coletada pelo GC no meio da execução. Foi exatamente o que aconteceu
+    com a task de vídeo, 42 segundos depois de subir:
+
+        Task was destroyed but it is pending!
+        task: <Task pending coro=<ClienteVideoRobo.rodar() running at
+              robot_video_client.py:64> ...>
+
+    Depois disso não houve mais NENHUMA linha [robo-video] no log
+    inteiro: a conexão de vídeo morreu em silêncio e `ultimo_frame`
+    congelou no último quadro recebido. robo_ver/robo_olhar continuaram
+    respondendo normalmente, descrevendo uma cena de minutos antes, sem
+    erro nenhum -- o pior tipo de falha, a que parece sucesso.
+
+    A referência forte em _tarefas_fundo fecha a coleta pelo GC. O
+    done_callback cobre o resto: se o laço terminar por exceção não
+    tratada, ele volta, e a linha no terminal registra que voltou --
+    nenhum destes laços pode sumir sem deixar rastro."""
+    def _refazer(tarefa: asyncio.Task) -> None:
+        if tarefa.cancelled():
+            return
+        print(f"[robo] laço de fundo '{nome}' terminou sozinho "
+              f"({tarefa.exception()!r}) -- recriando")
+        _criar_tarefa_permanente(nome, fabrica)
+
+    tarefa = _loop.create_task(fabrica(), name=f"eva-robo-{nome}")
+    tarefa.add_done_callback(_refazer)
+    _tarefas_fundo[nome] = tarefa
 
 
 def _chamar(coro_fn, *args, timeout: float = 10.0, **kwargs) -> dict:
@@ -272,6 +363,16 @@ def _ver_agora(prompt: str | None = None) -> dict:
     _iniciar_thread_robo()
     quadro = obter_quadro_camera()
     if quadro is None:
+        # Distinguir "nunca chegou quadro" de "chegou, mas é velho" --
+        # são causas diferentes e levam a ações diferentes (esperar a
+        # conexão subir vs. investigar por que a conexão caiu). Antes as
+        # duas caíam no mesmo "sem_video", e o segundo caso nem chegava
+        # aqui: o quadro velho era descrito como se fosse atual.
+        if _cliente_video is not None and _cliente_video.ultimo_frame is not None:
+            idade = time.monotonic() - _cliente_video.ultimo_frame_ts
+            return {"erro": "video_parado",
+                    "detalhe": f"o último quadro tem {idade:.0f}s -- a conexão "
+                               f"de vídeo com o robô caiu"}
         return {"erro": "sem_video",
                 "detalhe": "ainda sem quadro da câmera -- conexão de vídeo pode não ter estabelecido ainda"}
     try:
@@ -295,22 +396,58 @@ def robo_ver() -> dict:
     return _ver_agora()
 
 
+def _aguardar_quadro_novo(timeout_s: float = 4.0) -> bool:
+    """Espera chegar um quadro que seja POSTERIOR ao movimento/troca que
+    acabou de acontecer.
+
+    Os dois lados guardam o quadro velho de propósito: no Pi,
+    camera_manager.get_frame() devolve last_good_frame quando ainda não
+    há quadro novo; aqui, `ultimo_frame` só é substituído quando um
+    quadro novo chega de verdade. Isso é o comportamento certo pra
+    soluço momentâneo, e o errado logo depois de uma troca de câmera
+    (onde o quadro velho é literalmente de OUTRA câmera) ou de um
+    movimento suave (que leva quase um segundo, tempo em que o stream de
+    15fps continua entregando quadros da posição anterior).
+
+    Roda na thread que chamou a ferramenta, não no loop do robô -- é só
+    poll de um float, nada que precise do event loop."""
+    if _cliente_video is None:
+        return False
+    marco = _cliente_video.ultimo_frame_ts
+    limite = time.monotonic() + timeout_s
+    while time.monotonic() < limite:
+        if _cliente_video.ultimo_frame_ts > marco:
+            return True
+        time.sleep(0.05)
+    return False
+
+
 @registro.adicionar(
     "robo_olhar",
-    "Move a cabeça do robô (base/yaw e ombro/pitch), em graus, E já "
-    "descreve o que a câmera vê na posição nova -- inclui pessoas, se "
-    "houver. Use pra olhar em volta sem deslocar o corpo -- prefira "
-    "isso a robo_mover quando o objetivo é só ver algo, não chegar em "
-    "algum lugar. Demora um pouco mais que outros comandos (o movimento "
-    "em si é rápido, mas descrever a cena leva alguns segundos) -- é "
-    "esperado.",
-    {"yaw": "graus, 0-180, opcional", "pitch": "graus, 0-180, opcional"},
+    "Aponta a câmera da cabeça do robô e já descreve o que ela vê na "
+    "posição nova -- inclui pessoas, se houver. yaw: gira a base, muda a "
+    "direção horizontal (0-90). cabeca: gira só a câmera, TAMBÉM "
+    "horizontal (0-117) -- é mais rápido e menos forçado que girar a base, "
+    "prefira este pra ajustes pequenos de lado. pitch: levanta e abaixa a "
+    "mira, é o único eixo vertical (40-110). Nada inclina a imagem de "
+    "lado, isso o corpo não faz. Se a câmera ativa for a 'usb' nada disso "
+    "muda o que você vê -- ela é fixa no corpo; troque pra 'picam' antes "
+    "com robo_trocar_camera. Demora alguns segundos (o movimento é "
+    "rápido, descrever a cena não) -- é esperado.",
+    {"yaw": "graus, 0-90, opcional -- direção horizontal, gira a base",
+     "cabeca": "graus, 0-117, opcional -- direção horizontal, gira só a câmera",
+     "pitch": "graus, 40-110, opcional -- direção vertical"},
 )
-def robo_olhar(yaw: int | None = None, pitch: int | None = None) -> dict:
+def robo_olhar(yaw: int | None = None, pitch: int | None = None,
+               cabeca: int | None = None) -> dict:
     async def _fn(cliente: ClienteRobo):
-        return await cliente.olhar(yaw=yaw, pitch=pitch)
-    resultado = _talvez_emitir_recusa(_desembrulhar(_chamar(_fn)))
+        return await cliente.olhar(yaw=yaw, pitch=pitch, cabeca=cabeca)
+    resultado = _talvez_emitir_recusa(_desembrulhar(_chamar(_fn, timeout=12.0)))
     if isinstance(resultado, dict) and not resultado.get("erro"):
+        # Espera o quadro NOVO antes de descrever -- sem isso, com
+        # smooth=True, a descrição sai da posição ANTERIOR e ela conclui
+        # que a cabeça não se moveu.
+        _aguardar_quadro_novo(timeout_s=2.0)
         # Erro de visão aqui não vira erro do robo_olhar -- o movimento
         # em si já teve sucesso; câmera/modelo de visão fora do ar não
         # deveria fazer parecer que a cabeça não se moveu.
@@ -318,6 +455,200 @@ def robo_olhar(yaw: int | None = None, pitch: int | None = None) -> dict:
         if visao.get("descricao_cena"):
             resultado["descricao_cena"] = visao["descricao_cena"]
     return resultado
+
+
+@registro.adicionar(
+    "robo_trocar_camera",
+    "Troca qual câmera do robô está ativa -- ele tem DUAS, e só uma "
+    "funciona por vez. 'usb': fixa no corpo, aponta pra frente, é a de "
+    "navegação. 'picam': montada na ponta do braço, acompanha o "
+    "movimento dos servos -- é a única que você consegue apontar, então é "
+    "a que serve pra olhar pra alguém ou pra algo específico. Depois de "
+    "trocar, robo_ver e robo_olhar passam a descrever o que a câmera nova "
+    "vê.",
+    {"tipo": "'usb', 'picam', ou omita pra alternar"},
+)
+def robo_trocar_camera(tipo: str | None = None) -> dict:
+    async def _fn(cliente: ClienteRobo):
+        return await cliente.trocar_camera(tipo)
+    resultado = _desembrulhar(_chamar(_fn, timeout=18.0))
+    if isinstance(resultado, dict) and not resultado.get("erro"):
+        if not _aguardar_quadro_novo():
+            resultado["aviso"] = ("a câmera trocou, mas nenhum quadro novo "
+                                  "chegou ainda -- espere antes de descrever a cena")
+    return resultado
+
+
+@registro.adicionar(
+    "robo_olhar_em_volta",
+    "Varre o entorno parando em quatro posições e descreve o que a câmera "
+    "vê em cada uma, depois volta a olhar pra frente. Usa os dois eixos "
+    "horizontais (base e câmera) pra cobrir o máximo que o corpo alcança "
+    "-- que não é uma volta completa, a base não gira 360. Demora "
+    "bastante (quatro descrições de cena): use quando quiser mesmo um "
+    "panorama, não pra conferir uma coisa só -- pra isso use robo_olhar "
+    "ou robo_ver.",
+)
+def robo_olhar_em_volta() -> dict:
+    # A base fica nos extremos e a câmera varre dentro de cada um: mover
+    # a base é o caro (flat CSI torcendo), mover só a câmera é barato.
+    paradas = [
+        {"yaw": 90, "cabeca": 117},
+        {"yaw": 90, "cabeca": 30},
+        {"yaw": 0, "cabeca": 90},
+        {"yaw": 0, "cabeca": 20},
+    ]
+    vistas = []
+    for parada in paradas:
+        async def _fn(cliente: ClienteRobo, alvo=parada):
+            # alvo como default de propósito: sem isso o closure leria
+            # `parada` no momento da execução, e todas as chamadas usariam
+            # a última posição da lista.
+            return await cliente.olhar(smooth=True, **alvo)
+        r = _desembrulhar(_chamar(_fn, timeout=12.0))
+        if r.get("erro"):
+            _talvez_emitir_recusa(r)
+            break
+        _aguardar_quadro_novo(timeout_s=2.0)
+        visao = _ver_agora()
+        if visao.get("descricao_cena"):
+            vistas.append({**parada, "descricao_cena": visao["descricao_cena"]})
+
+    # Volta pra frente aconteça o que acontecer -- inclusive se a
+    # varredura foi interrompida no meio por recusa.
+    async def _voltar(cliente: ClienteRobo):
+        return await cliente.olhar(yaw=YAW_FRENTE, smooth=True)
+    _chamar(_voltar, timeout=12.0)
+
+    if not vistas:
+        return {"erro": "varredura_falhou",
+                "detalhe": "nenhuma posição rendeu descrição"}
+    return {"vistas": vistas}
+
+
+# --------------------------------------------------------------- gestos
+#
+# nome: (tipo, canal, amplitude_graus, repeticoes)
+#
+# "sim" é pitch e "nao" é a cabeça, não o contrário: o canal 3 é PAN
+# (gira a câmera pros lados) e o pitch é o único eixo vertical. Trocar os
+# dois produziria a câmera subindo e descendo enquanto encara o mesmo
+# ponto -- um elevador, não um aceno.
+#
+# Nada de "inclinar a cabeça em dúvida": não existe eixo de roll neste
+# corpo, e um gesto que promete uma coisa e faz outra é pior que gesto
+# nenhum. "espiar" usa o pitch e é honesto sobre o que é.
+_GESTOS: dict[str, tuple[str, int, int, int]] = {
+    "sim": ("oscilar", 1, 12, 2),
+    "nao": ("oscilar", 3, 15, 2),
+    "espiar": ("segurar", 1, PITCH_DELTA_CIMA, 1),
+}
+
+
+def _centro_viavel(canal: int, base: int, amplitude: int) -> int | None:
+    """Onde a oscilação cabe inteira dentro do curso do eixo.
+
+    Sem isso, um gesto perto de um batente teria metade dos passos
+    clampados em silêncio pelo ArmController e sairia como: parado,
+    vira, parado, vira. O centro é deslocado só o necessário; o gesto
+    termina voltando pro ponto de onde saiu de qualquer forma."""
+    lo, hi = _CURSO_EIXO[canal]
+    a = abs(amplitude)
+    if hi - lo < 2 * a:
+        return None
+    return max(lo + a, min(hi - a, base))
+
+
+async def _executar_gesto(cliente: ClienteRobo, tipo: str, canal: int,
+                          amplitude: int, repeticoes: int) -> dict:
+    nome_param = _NOME_CANAL[canal]
+    lo, hi = _CURSO_EIXO[canal]
+
+    r = await cliente.estado()
+    if not r.get("ok"):
+        return r
+    angulos = ((r.get("estado") or {}).get("arm") or {}).get("angles") or {}
+    # ArmController.get_status() usa chaves int; o JSON de volta as
+    # transforma em string. Aceita as duas formas.
+    base = int(angulos.get(str(canal), angulos.get(canal, 90)))
+
+    if tipo == "oscilar":
+        centro = _centro_viavel(canal, base, amplitude)
+        if centro is None:
+            return {"ok": False, "erro": "sem_curso",
+                    "detalhe": f"{nome_param} não tem {2 * abs(amplitude)}° livres"}
+        passos = [centro]
+        for _ in range(repeticoes):
+            passos += [centro - abs(amplitude), centro + abs(amplitude)]
+        passos.append(base)
+    else:  # "segurar" -- vai até o alvo, fica, e volta
+        alvo = max(lo, min(hi, base + amplitude))
+        if alvo == base:
+            alvo = max(lo, min(hi, base - amplitude))
+        if alvo == base:
+            return {"ok": False, "erro": "sem_curso",
+                    "detalhe": f"{nome_param} já está no batente ({base}°)"}
+        passos = [alvo] * 4 + [base]  # repetir o alvo é o que segura a pose
+
+    recusa = None
+    for angulo in passos:
+        # smooth=False de propósito: cada passo vira UMA escrita de PWM e
+        # devolve na hora. Com smooth=True o _command_loop do Pi trava
+        # ~0.9s por passo e a sequência inteira engasgaria o heartbeat.
+        passo = await cliente.olhar(**{nome_param: int(angulo)}, smooth=False)
+        if not passo.get("ok"):
+            recusa = passo.get("detalhe") or passo.get("erro")
+            break
+        await asyncio.sleep(0.18)
+
+    if recusa:
+        await cliente.olhar(**{nome_param: base}, smooth=False)
+        return {"ok": False, "erro": "gesto_recusado", "detalhe": recusa}
+    return {"ok": True, "cmd": "gesto"}
+
+
+@registro.adicionar(
+    "robo_gesto",
+    "Faz um gesto físico com o corpo do robô e volta pra posição "
+    "anterior. 'sim': aceno afirmativo. 'nao': nega com a câmera. "
+    "'espiar': levanta a mira e segura, como quem tenta ver melhor. Não "
+    "descreve cena nenhuma -- é só o gesto, pra quando reagir com o corpo "
+    "diz mais que reagir com palavra. Só funciona se alguém estiver vendo "
+    "o robô de verdade.",
+    {"gesto": "sim, nao ou espiar"},
+)
+def robo_gesto(gesto: str) -> dict:
+    entrada = _GESTOS.get((gesto or "").strip().lower())
+    if entrada is None:
+        return {"erro": "gesto_desconhecido",
+                "detalhe": f"conhecidos: {', '.join(_GESTOS)}"}
+    tipo, canal, amplitude, repeticoes = entrada
+
+    async def _fn(cliente: ClienteRobo):
+        return await _executar_gesto(cliente, tipo, canal, amplitude, repeticoes)
+
+    return _talvez_emitir_recusa(_desembrulhar(_chamar(_fn, timeout=15.0)))
+
+
+@registro.adicionar(
+    "robo_destravar_braco",
+    "Recolhe o cotovelo pra posição neutra. Use SÓ quando robo_olhar ou "
+    "robo_gesto forem recusados com 'cotovelo em posição crítica' -- acima "
+    "de 160 graus o cotovelo trava todos os outros eixos por segurança, e "
+    "este é o único comando que sai desse estado.",
+)
+def robo_destravar_braco() -> dict:
+    # Ângulo FIXO, nunca parâmetro. O cotovelo é o único eixo capaz de
+    # travar todos os outros (safety.validate_servo_command, regra 1), e
+    # ele está de fora do robo_olhar justamente por isso. Sem ESTA saída,
+    # porém, um cotovelo deixado em 165 pelo gamepad deixaria ela cega e
+    # paralisada pra sempre: toda chamada voltaria "outros eixos
+    # travados" e nenhuma ferramenta dela alcançaria o canal 2 pra
+    # desfazer. Uma saída, com destino fixo, resolve sem devolver o
+    # controle do eixo perigoso.
+    async def _fn(cliente: ClienteRobo):
+        return await cliente.olhar(cotovelo=COTOVELO_NEUTRO, smooth=True)
+    return _desembrulhar(_chamar(_fn, timeout=15.0))
 
 
 @registro.adicionar(
@@ -652,13 +983,27 @@ def reset_estop_dashboard() -> dict:
     return _desembrulhar(_chamar(_fn, timeout=3.0))
 
 
-def obter_quadro_camera() -> bytes | None:
-    """Último quadro JPEG da câmera do robô, se houver conexão de vídeo
-    ativa -- usado por vision/visao_robo.py (SistemaVisualRobo), que não
-    precisa conhecer ClienteVideoRobo por dentro, só pedir o quadro
-    atual. None se a conexão de vídeo ainda não subiu ou ainda não
-    chegou quadro nenhum."""
-    return _cliente_video.ultimo_frame if _cliente_video is not None else None
+def obter_quadro_camera(idade_maxima_s: float | None = None) -> bytes | None:
+    """Último quadro JPEG da câmera do robô, se for RECENTE -- usado por
+    vision/visao_robo.py (SistemaVisualRobo), que não precisa conhecer
+    ClienteVideoRobo por dentro, só pedir o quadro atual.
+
+    Devolve None quando a conexão de vídeo ainda não subiu, quando não
+    chegou quadro nenhum, OU quando o último quadro é velho demais.
+
+    A checagem de idade é o ponto: sem ela, uma conexão de vídeo que caiu
+    deixa `ultimo_frame` congelado pra sempre, e quem consome isto recebe
+    bytes JPEG perfeitamente válidos de uma cena que não existe mais.
+    Aconteceu em uso real -- a task de vídeo foi coletada pelo GC (ver
+    _criar_tarefa_permanente) e ela descreveu, com confiança, um corredor
+    que tinha visto minutos antes. Recusar o quadro velho transforma isso
+    num erro visível em vez de numa alucinação silenciosa."""
+    if _cliente_video is None or _cliente_video.ultimo_frame is None:
+        return None
+    limite = IDADE_MAXIMA_QUADRO_S if idade_maxima_s is None else idade_maxima_s
+    if limite > 0 and (time.monotonic() - _cliente_video.ultimo_frame_ts) > limite:
+        return None
+    return _cliente_video.ultimo_frame
 
 
 def _cliente_visao_robo():
