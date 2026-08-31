@@ -101,13 +101,18 @@ IDADE_MAXIMA_QUADRO_S = float(os.environ.get("EVA_ROBOT_QUADRO_MAX_IDADE_S", "5.
 # código, nunca parâmetro de ferramenta -- ver a docstring de lá.
 COTOVELO_NEUTRO = int(os.environ.get("EVA_ROBOT_COTOVELO_NEUTRO", "120"))
 
-# Sinal do delta de pitch que LEVANTA a mira. arm_controller.look_up()
-# assume que ângulo menor é pra cima (faz current - graus), mas isso
-# nunca foi conferido contra imagem. Compare 20-pitch-040.jpg com
-# 22-pitch-110.jpg da calibração: se a 040 mostra mais teto, este valor
-# está certo; se mostra mais chão, inverta pra 20 (e look_up/look_down
-# estão trocados desde sempre).
-PITCH_DELTA_CIMA = int(os.environ.get("EVA_ROBOT_PITCH_DELTA_CIMA", "-20"))
+# Delta de pitch que LEVANTA a mira. POSITIVO: pitch maior aponta mais
+# alto e mais à frente. Confirmado por foto na fase 2 da calibração --
+# cotovelo 120 com pitch 110 olha pra frente, com pitch 70 olha pra trás
+# e pra baixo.
+#
+# arm_controller.look_up() faz `current - graus` e portanto olha pra
+# BAIXO; look_down() faz o oposto. Os dois estão com nome trocado desde
+# sempre, junto com look_right(), que calcula 90+30=120, é clampado pelo
+# limite (0,90) e não move um grau. Nenhum dos três está no caminho da
+# EVA -- valem ser apagados de arm_controller.py em vez de corrigidos:
+# helper de conveniência com nome mentiroso é armadilha esperando.
+PITCH_DELTA_CIMA = int(os.environ.get("EVA_ROBOT_PITCH_DELTA_CIMA", "20"))
 
 # ===========================================================================
 # EIXOS DO CORPO -- confirmados por imagem (ferramentas/testar_cabeca.py),
@@ -136,13 +141,85 @@ PITCH_DELTA_CIMA = int(os.environ.get("EVA_ROBOT_PITCH_DELTA_CIMA", "-20"))
 # virar "gesto" sem movimento nenhum.
 # ===========================================================================
 
-_CURSO_EIXO: dict[int, tuple[int, int]] = {0: (0, 90), 1: (40, 110), 3: (0, 117)}
-_NOME_CANAL = {0: "yaw", 1: "pitch", 3: "cabeca"}
+# Teto do cotovelo PARA A EVA. O curso físico vai a 180, mas a partir de
+# 160 safety.validate_servo_command (regra 1) trava TODOS os outros
+# eixos: ela ficaria com a câmera apontada para onde estava, sem yaw, sem
+# pitch e sem cabeça. 155 dá 5° de margem. O curso acima disso continua
+# existindo para o gamepad, e robo_destravar_braco é a saída se o braço
+# for deixado lá em cima pelo controle manual.
+# Teto do cotovelo para a EVA. 165 e 170 foram verificados fisicamente
+# com a base lateral -- sem colisão e sem o servo do ombro reclamar.
+# Acima disso não há observação, e o servo iria a 180.
+#
+# O que limita de verdade não é este número: é a combinação cotovelo alto
+# + base apontando pra FRENTE, que estica o flat CSI da picam. Essa é
+# condicional e vive no safety.py (regra do cabo), aplicada nos dois
+# sentidos -- por isso robo_postura precisa girar a base ANTES de subir.
+COTOVELO_MAX_EVA = int(os.environ.get("EVA_ROBOT_COTOVELO_MAX", "170"))
 
-# Yaw que aponta pra frente do carro. robo_olhar_em_volta sempre volta
-# pra cá no fim: deixar a base parada num extremo mantém o flat CSI
-# torcido por tempo indeterminado.
+# Yaw que aponta pra FRENTE do carro, e yaw LATERAL (direita de quem olha
+# o robô) -- o único lado onde o braço sobe alto sem esticar o cabo.
+#
+# Nomeados e derivados em todo o resto de propósito: o servo da base já
+# foi remontado uma vez, e nessa hora é melhor ter dois números num lugar
+# só do que ângulos crus espalhados por quatro arquivos. Espelham
+# safety.YAW_FRENTE / YAW_LATERAL; se recalibrar um, recalibra o outro.
 YAW_FRENTE = int(os.environ.get("EVA_ROBOT_YAW_FRENTE", "90"))
+YAW_LATERAL = int(os.environ.get("EVA_ROBOT_YAW_LATERAL", "0"))
+
+_CURSO_EIXO: dict[int, tuple[int, int]] = {
+    0: (0, 90), 1: (40, 110), 2: (90, COTOVELO_MAX_EVA), 3: (0, 117),
+    # NOTA: o curso do cotovelo aqui é o INCONDICIONAL. O trecho acima de
+    # COTOVELO_ESTICA_CABO (160) só é alcançável com a base lateral --
+    # quem sabe disso é o safety, e quem respeita é robo_postura.
+}
+_NOME_CANAL = {0: "yaw", 1: "pitch", 2: "cotovelo", 3: "cabeca"}
+
+# ===========================================================================
+# POSTURAS -- confirmadas por foto (ferramentas/calibracao_cabeca, fase 2).
+#
+# Cotovelo e pitch são ACOPLADOS: os dois empurram a câmera no mesmo eixo
+# "à frente e nivelada" vs "recuada e para baixo". Cotovelo alto compensa
+# pitch, e é por isso que a melhor mira nivelada é o par mais alto dos
+# dois, não um par intermediário.
+#
+# Existem como INTENÇÃO nomeada, não como ângulo, porque pedir a ela que
+# descubra qual combinação põe a câmera na altura de um rosto é pedir
+# cinemática inversa a um modelo de RP. Ela escolhe o que quer olhar;
+# qual par de ângulos faz isso é propriedade desta montagem.
+#
+# Descoberta importante da fase 2: abaixo de pitch ~95 a câmera para de
+# inclinar e o pitch passa a só recuar o braço. Por isso "chao" precisa
+# descer BASTANTE o pitch pra mudar alguma coisa, e por isso não existe
+# uma postura "mesa" no meio -- entre "frente" e "chao" não havia
+# terceira altura distinguível nas fotos, e postura que não muda nada
+# visível é só uma opção a mais pra ela escolher errado.
+# ===========================================================================
+_POSTURAS: dict[str, dict] = {
+    # A ÚNICA que chega na altura de um rosto -- e a única que precisa da
+    # base lateral. Com yaw de frente o cabo da picam estica e o safety
+    # recusa; com yaw lateral o braço sobe sobre ar livre.
+    #
+    # Consequência que robo_postura tem que resolver: nesta pose a câmera
+    # aponta pra DIREITA, não pra frente. Quem está na frente do robô não
+    # aparece no quadro. Girar o chassi (rodas mecanum, robo_mover com vz)
+    # é o que compensa -- corpo acompanhando o pescoço que não alcança,
+    # que é o que bicho faz.
+    #
+    # pitch 90, não 110: com o cotovelo mais alto os dois se compensam no
+    # mesmo eixo vertical, e 90 é o que mira reto nesta altura.
+    "rosto":   {"yaw": YAW_LATERAL, "cotovelo": 170, "pitch": 90},
+
+    # As três abaixo ficam de frente e abaixo do limite do cabo, então
+    # não mexem no yaw -- preservam pra onde ela já estava olhando.
+    "frente":  {"cotovelo": 140, "pitch": 100},
+    "chao":    {"cotovelo": 120, "pitch": 70},
+    "repouso": {"cotovelo": 90,  "pitch": 90},
+}
+
+# (YAW_FRENTE / YAW_LATERAL definidos no topo, junto de COTOVELO_MAX_EVA.)
+# robo_olhar_em_volta sempre volta pra YAW_FRENTE no fim: deixar a base
+# parada num extremo mantém o flat CSI torcido por tempo indeterminado.
 
 
 def _iniciar_thread_robo() -> None:
@@ -181,6 +258,7 @@ def _iniciar_thread_robo() -> None:
                 _criar_tarefa_permanente("heartbeat", _ciclo_heartbeat)
                 _criar_tarefa_permanente("iniciativa", _ciclo_iniciativa)
                 _criar_tarefa_permanente("video", _cliente_video.rodar)
+                _criar_tarefa_permanente("reflexo", _ciclo_reflexo)
                 _loop.run_forever()
 
             _thread = threading.Thread(target=rodar_loop, daemon=True, name="eva-robot")
@@ -191,6 +269,20 @@ def _iniciar_thread_robo() -> None:
     # arrancar) em vez de simplesmente esperar _pronto -- funcionalmente
     # parecido, mas prende o lock por mais tempo que o necessário à toa.
     _pronto.wait(timeout=5)
+
+
+from . import reflexo as _rfx
+
+# Estado do reflexo. Módulo-global igual ao resto deste arquivo, mas a
+# lógica toda mora em reflexo.py -- que é matemática pura, sem I/O, e
+# por isso testável sem robô nenhum.
+_reflexo = _rfx.EstadoReflexo()
+_reflexo.ativo = os.environ.get("EVA_ROBOT_REFLEXO", "1") == "1"
+
+
+def definir_reflexo(ativo: bool) -> None:
+    """Liga/desliga o seguimento automático em tempo real (dashboard)."""
+    _reflexo.ativo = ativo
 
 
 _tarefas_fundo: dict[str, asyncio.Task] = {}
@@ -230,6 +322,84 @@ def _criar_tarefa_permanente(nome: str, fabrica) -> None:
     tarefa = _loop.create_task(fabrica(), name=f"eva-robo-{nome}")
     tarefa.add_done_callback(_refazer)
     _tarefas_fundo[nome] = tarefa
+
+
+async def _ciclo_reflexo() -> None:
+    """Acompanha movimento com a câmera. Sem LLM, sem inferência, sem GPU.
+
+    Roda a cada 0.4s contra os 300s do _ciclo_iniciativa, e é essa
+    diferença que decide se o robô lê como criatura ou como brinquedo
+    teleoperado. Nada que se pareça com um bicho DECIDE virar a cabeça
+    quando algo se mexe no canto do olho -- isso acontece antes do
+    pensamento, e o pensamento chega depois, já com a cabeça virada.
+
+    Só usa cabeça (canal 3) e pitch: yaw torce o flat CSI e leva quase um
+    segundo por movimento suave, lento demais pra reflexo. Cotovelo muda
+    a ALTURA do olhar, que é decisão de postura, não reação a movimento.
+
+    Quando o movimento SUSTENTA (ver EstadoReflexo.registrar_movimento),
+    empurra um evento de presença -- que é o gatilho honesto pra ela
+    querer puxar conversa: acontece quando há motivo, não quando o
+    relógio bate.
+    """
+    while True:
+        await asyncio.sleep(_rfx.INTERVALO_REFLEXO_S)
+
+        if not (_reflexo.pode_agir() and _em_call.is_set()):
+            _reflexo.perdeu_referencia()
+            continue
+        if _cliente is None or not _cliente.conectado:
+            _reflexo.perdeu_referencia()
+            continue
+
+        try:
+            if _reflexo.precisa_ressemear:
+                # Depois de uma supressão o corpo está em outro lugar --
+                # os ângulos locais viraram ficção. Uma leitura só, aqui,
+                # em vez de uma por ciclo.
+                r = await _cliente.estado()
+                if not r.get("ok"):
+                    continue
+                ang = ((r.get("estado") or {}).get("arm") or {}).get("angles") or {}
+                _reflexo.cabeca = int(ang.get("3", ang.get(3, 90)))
+                _reflexo.pitch = int(ang.get("1", ang.get(1, 90)))
+                _reflexo.precisa_ressemear = False
+
+            atual = obter_quadro_camera(idade_maxima_s=1.5)
+            if atual is None:
+                _reflexo.perdeu_referencia()
+                continue
+
+            anterior = _reflexo.quadro_anterior
+            _reflexo.quadro_anterior = atual
+            if anterior is None:
+                continue
+
+            alvo_mov = _rfx.centroide_de_movimento(anterior, atual)
+            if alvo_mov is None:
+                continue
+            dx, dy = alvo_mov
+
+            angulos = _rfx.alvo_do_reflexo(dx, dy, _reflexo.cabeca, _reflexo.pitch)
+            if angulos:
+                resultado = await _cliente.olhar(smooth=False, **angulos)
+                if resultado.get("ok"):
+                    _reflexo.cabeca = angulos.get("cabeca", _reflexo.cabeca)
+                    _reflexo.pitch = angulos.get("pitch", _reflexo.pitch)
+                    if _reflexo.deve_avisar():
+                        _eventos_corpo.put(_rfx.descrever_evento(dx, dy))
+                else:
+                    # Recusa aqui é normal (bateria, estop): o reflexo não
+                    # insiste nem reclama, só perde a referência local.
+                    _reflexo.precisa_ressemear = True
+
+            if _reflexo.registrar_movimento(dx):
+                _eventos_corpo.put(_rfx.descrever_presenca(dx))
+
+        except Exception as e:
+            # Reflexo não pode derrubar nada. Perde o ciclo e segue.
+            print(f"[reflexo] ciclo falhou: {e}")
+            _reflexo.perdeu_referencia()
 
 
 def _chamar(coro_fn, *args, timeout: float = 10.0, **kwargs) -> dict:
@@ -440,6 +610,17 @@ def _aguardar_quadro_novo(timeout_s: float = 4.0) -> bool:
 )
 def robo_olhar(yaw: int | None = None, pitch: int | None = None,
                cabeca: int | None = None) -> dict:
+    if yaw is None and pitch is None and cabeca is None:
+        # Falha AQUI, com mensagem que ela consegue usar, em vez de gastar
+        # uma ida ao Pi pra receber "sem_parametros" -- erro de protocolo
+        # que não diz o que fazer e que, em uso real, o modelo leu como
+        # sucesso e narrou o movimento que nunca aconteceu.
+        return {"erro": "sem_direcao",
+                "detalhe": "robo_olhar precisa de yaw, pitch ou cabeca. Pra "
+                           "varrer o entorno sem escolher ângulo use "
+                           "robo_olhar_em_volta; pra mudar a altura do "
+                           "olhar use robo_postura."}
+    _reflexo.suprimir()
     async def _fn(cliente: ClienteRobo):
         return await cliente.olhar(yaw=yaw, pitch=pitch, cabeca=cabeca)
     resultado = _talvez_emitir_recusa(_desembrulhar(_chamar(_fn, timeout=12.0)))
@@ -490,6 +671,7 @@ def robo_trocar_camera(tipo: str | None = None) -> dict:
     "ou robo_ver.",
 )
 def robo_olhar_em_volta() -> dict:
+    _reflexo.suprimir(12.0)
     # A base fica nos extremos e a câmera varre dentro de cada um: mover
     # a base é o caro (flat CSI torcendo), mover só a câmera é barato.
     paradas = [
@@ -538,8 +720,17 @@ def robo_olhar_em_volta() -> dict:
 # Nada de "inclinar a cabeça em dúvida": não existe eixo de roll neste
 # corpo, e um gesto que promete uma coisa e faz outra é pior que gesto
 # nenhum. "espiar" usa o pitch e é honesto sobre o que é.
+# nome: (tipo, canal, amplitude_graus, repeticoes)
+#
+# "sim" usa pitch com amplitude PEQUENA (7°, não 12): a autoridade
+# vertical real do pitch é a faixa 95..110, uns 15° -- oscilar mais que
+# isso sai da zona onde a câmera de fato inclina e vira o braço recuando,
+# que não lê como aceno nenhum.
+#
+# "nao" usa a cabeça (canal 3, pan) com 15°, que sobra: são 117° de
+# curso e o home em 90 fica no meio.
 _GESTOS: dict[str, tuple[str, int, int, int]] = {
-    "sim": ("oscilar", 1, 12, 2),
+    "sim": ("oscilar", 1, 7, 2),
     "nao": ("oscilar", 3, 15, 2),
     "espiar": ("segurar", 1, PITCH_DELTA_CIMA, 1),
 }
@@ -623,11 +814,98 @@ def robo_gesto(gesto: str) -> dict:
         return {"erro": "gesto_desconhecido",
                 "detalhe": f"conhecidos: {', '.join(_GESTOS)}"}
     tipo, canal, amplitude, repeticoes = entrada
+    _reflexo.suprimir(6.0)
 
     async def _fn(cliente: ClienteRobo):
         return await _executar_gesto(cliente, tipo, canal, amplitude, repeticoes)
 
     return _talvez_emitir_recusa(_desembrulhar(_chamar(_fn, timeout=15.0)))
+
+
+@registro.adicionar(
+    "robo_postura",
+    "Muda a ALTURA e a inclinação de onde a câmera do robô olha, "
+    "levantando ou recolhendo o braço. 'rosto': braço no alto, câmera "
+    "nivelada -- é a postura pra olhar uma pessoa em pé no rosto, use "
+    "quando estiver falando com alguém que está aí. 'frente': meio "
+    "termo, olha em frente um pouco mais baixo. 'chao': braço recolhido "
+    "e câmera pra baixo, pra ver o caminho antes de andar. 'repouso': "
+    "braço fechado. Isso muda a altura do olhar; pra mudar a DIREÇÃO use "
+    "robo_olhar. Demora alguns segundos -- o braço se move devagar de "
+    "propósito.",
+    {"postura": "rosto, frente, chao ou repouso"},
+)
+def robo_postura(postura: str) -> dict:
+    alvo = _POSTURAS.get((postura or "").strip().lower())
+    if alvo is None:
+        return {"erro": "postura_desconhecida",
+                "detalhe": f"conhecidas: {', '.join(_POSTURAS)}"}
+    _reflexo.suprimir(6.0)
+
+    async def _fn(cliente: ClienteRobo):
+        """Monta a pose em passos separados, COTOVELO SEMPRE POR ÚLTIMO
+        ao subir e SEMPRE PRIMEIRO ao descer.
+
+        A ordem não é estética. A regra do cabo (safety) barra yaw e
+        cotovelo em função UM DO OUTRO: com o cotovelo já acima de 160,
+        girar a base é recusado; com a base de frente, subir o cotovelo é
+        recusado. Só existe um caminho válido pra pose alta -- girar a
+        base primeiro, subir o cotovelo depois -- e o inverso pra desfazer.
+
+        A versão anterior deste método fazia o contrário (cotovelo
+        primeiro ao subir) e teria falhado no meio, deixando o braço alto
+        com o resto da pose por montar. Em uso real, um comando manual com
+        essa ordem produziu exatamente isso:
+
+            yaw      ✗ Cotovelo em posição crítica
+            pitch    ✗ Cotovelo em posição crítica
+            cabeca   ✗ Cotovelo em posição crítica
+            cotovelo ✓ ok
+
+        Três eixos recusados e o cotovelo subindo assim mesmo."""
+        r = await cliente.estado()
+        ang = ((r.get("estado") or {}).get("arm") or {}).get("angles") or {}
+        atual = int(ang.get("2", ang.get(2, 90)))
+
+        cot = alvo["cotovelo"]
+        outros = {k: v for k, v in alvo.items() if k != "cotovelo"}
+        subindo = cot > atual
+        ordem = ([outros, {"cotovelo": cot}] if subindo
+                 else [{"cotovelo": cot}, outros])
+
+        for passo in ordem:
+            if not passo:
+                continue
+            resp = await cliente.olhar(smooth=True, **passo)
+            if not resp.get("ok"):
+                return resp
+            # Recusa de servo individual NÃO derruba o "ok" do envelope --
+            # vem em `resultados`, um item por eixo. Sem olhar aqui, uma
+            # pose montada pela metade voltaria como sucesso, e ela
+            # narraria um movimento que não aconteceu.
+            for res in resp.get("resultados") or []:
+                if not res.get("ok"):
+                    return {"ok": False, "erro": "postura_incompleta",
+                            "detalhe": f"{res.get('servo')}: {res.get('detalhe')}"}
+
+        aviso = None
+        if alvo.get("yaw") == YAW_LATERAL:
+            aviso = ("nesta postura a câmera aponta pro seu lado direito, não "
+                     "pra frente -- é o único lado onde o braço sobe até essa "
+                     "altura. Pra olhar alguém que está na frente, gire o corpo "
+                     "com robo_mover antes")
+        r = {"ok": True, "cmd": "postura", "postura": postura}
+        if aviso:
+            r["aviso"] = aviso
+        return r
+
+    resultado = _talvez_emitir_recusa(_desembrulhar(_chamar(_fn, timeout=20.0)))
+    if isinstance(resultado, dict) and not resultado.get("erro"):
+        _aguardar_quadro_novo(timeout_s=2.0)
+        visao = _ver_agora()
+        if visao.get("descricao_cena"):
+            resultado["descricao_cena"] = visao["descricao_cena"]
+    return resultado
 
 
 @registro.adicionar(
@@ -638,6 +916,7 @@ def robo_gesto(gesto: str) -> dict:
     "este é o único comando que sai desse estado.",
 )
 def robo_destravar_braco() -> dict:
+    _reflexo.suprimir(10.0)
     # Ângulo FIXO, nunca parâmetro. O cotovelo é o único eixo capaz de
     # travar todos os outros (safety.validate_servo_command, regra 1), e
     # ele está de fora do robo_olhar justamente por isso. Sem ESTA saída,

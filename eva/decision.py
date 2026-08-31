@@ -144,12 +144,30 @@ ROBO_ESTADO = re.compile(
 # visão de tela. Antes esta lista aparecia escrita à mão em dois pontos
 # de DecisorPorLLM.decidir, e uma ferramenta nova entrava num e não no
 # outro sem nenhum aviso.
-_FERRAMENTAS_FISICAS = {"robo_estado", "robo_olhar", "robo_trocar_camera"}
+_FERRAMENTAS_FISICAS = {"robo_estado", "robo_olhar", "robo_olhar_em_volta",
+                        "robo_trocar_camera", "robo_gesto", "robo_postura"}
 
 ROBO_CAMERA = re.compile(
     r"\b(troc(a|ar|ue)|mud(a|ar|e)|altern(a|ar|e))\s+(a\s+|de\s+|sua\s+|pra\s+|para\s+)*c[âa]mera|"
     r"\bc[âa]mera (da cabe[çc]a|do bra[çc]o|picam|usb)\b|"
     r"\bus(a|ar|e)\s+(a\s+)?(picam|c[âa]mera da cabe[çc]a)\b",
+    re.I,
+)
+
+# Pedido de GESTO. Separado de ROBO_OLHAR porque o alvo é outro: aqui a
+# intenção é COMUNICAR com o movimento, não ver nada.
+ROBO_GESTO = re.compile(
+    r"\b(balan[çc]|acen|men[ei])\w*\s+(a\s+|com\s+a\s+)?cabe[çc]a|"
+    r"\b(fal(a|ar|e)|diz(er|e)?|responde?r?)\s+(que\s+)?(sim|n[ãa]o)\s+com\s+a\s+cabe[çc]a|"
+    r"\bcabe[çc]a\s+(pra|para)\s+(dizer|falar)\s+(sim|n[ãa]o)\b",
+    re.I,
+)
+
+# Pedido de POSTURA -- altura do olhar, não direção.
+ROBO_POSTURA = re.compile(
+    r"\b(olh(a|ar|e)|vir(a|ar|e)|apont(a|ar|e))\s+(pra|para)\s+(mim|c[áa]|aqui)\b|"
+    r"\b(levant(a|ar|e)|sob(e|ir)|abaix(a|ar|e))\s+(a\s+)?(c[âa]mera|cabe[çc]a|bra[çc]o)\b|"
+    r"\bolh(a|ar|e)\s+(pro|para o)\s+ch[ãa]o\b",
     re.I,
 )
 
@@ -183,6 +201,31 @@ def robo_estado_relevante(texto: str) -> bool:
 
 def robo_camera_relevante(texto: str) -> bool:
     return bool(ROBO_CAMERA.search(texto))
+
+
+def robo_gesto_pedido(texto: str) -> str | None:
+    """Qual gesto foi pedido, ou None.
+
+    O NOME do gesto sai da regra, não do modelo: robo_gesto conhece só
+    três, e deixar o LLM inventar o argumento devolveria
+    "gesto_desconhecido" -- exatamente o mesmo tipo de falha silenciosa
+    do args={} que ficou meses invisível porque o modelo narrava
+    sucesso por cima do erro."""
+    if not ROBO_GESTO.search(texto):
+        return None
+    if re.search(r"\bn[ãa]o\b", texto, re.I):
+        return "nao"
+    return "sim"
+
+
+def robo_postura_pedida(texto: str) -> str | None:
+    """Qual postura foi pedida, ou None. Mesma lógica de
+    robo_gesto_pedido -- argumento vem da regra, não do modelo."""
+    if not ROBO_POSTURA.search(texto):
+        return None
+    if re.search(r"\bch[ãa]o\b|\babaix", texto, re.I):
+        return "chao"
+    return "rosto"
 
 
 def minecraft_estado_relevante(texto: str) -> bool:
@@ -397,11 +440,24 @@ class DecisorPorRegras:
 
         olhar_robo_acionado = robo_olhar_relevante(texto)
         if olhar_robo_acionado:
-            ferramentas.append({"nome": "robo_olhar", "args": {}})
+            # robo_olhar_em_volta, NÃO robo_olhar: "olha em volta" é pedido
+            # de varredura, não de ângulo. A regra antiga mandava robo_olhar
+            # com args={}, que vira um comando `head` sem eixo nenhum e volta
+            # "sem_parametros" do Pi em 6ms -- sem gerar recusa, sem rastro no
+            # log, e com o modelo narrando o movimento que nunca houve.
+            ferramentas.append({"nome": "robo_olhar_em_volta", "args": {}})
         if robo_estado_relevante(texto):
             ferramentas.append({"nome": "robo_estado", "args": {}})
         if robo_camera_relevante(texto):
             ferramentas.append({"nome": "robo_trocar_camera", "args": {}})
+
+        gesto = robo_gesto_pedido(texto)
+        if gesto:
+            ferramentas.append({"nome": "robo_gesto", "args": {"gesto": gesto}})
+
+        postura = robo_postura_pedida(texto)
+        if postura:
+            ferramentas.append({"nome": "robo_postura", "args": {"postura": postura}})
 
         if CONTA.search(texto):
             expr = self._extrair_expressao(texto)

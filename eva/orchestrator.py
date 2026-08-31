@@ -564,6 +564,12 @@ class EVA:
             return {}
         if len(chamadas) == 1:
             nome, args = chamadas[0]
+            resultado = self.ferramentas.executar(nome, **args)
+            # Sem isto não há como saber, pelo log, se uma ferramenta foi
+            # chamada e falhou ou se nunca foi chamada -- os dois casos
+            # produzem exatamente o mesmo log (nenhum) e a mesma resposta
+            # (o modelo narrando a ação como se tivesse acontecido).
+            print(f"[ferramenta] {nome}({args}) -> {str(resultado)[:200]}")
             return {nome: self.ferramentas.executar(nome, **args)}
 
         # Mais de uma ferramenta no mesmo plano: rodam em paralelo. Eram
