@@ -66,6 +66,51 @@ class LLMConfig:
     top_k: int = int(os.environ.get("EVA_TOP_K", "40"))
     min_p: float = float(os.environ.get("EVA_MIN_P", "0.05"))
 
+    # DRY quebra loop de repetição (frase/molde igual voltando turno após
+    # turno) de um jeito que repeat_penalty sozinho não pega: penaliza a
+    # SEQUÊNCIA repetida, não o token isolado. dry_multiplier=0.0 (default
+    # do llama-server) = desligado -- só liga se EVA_DRY_MULTIPLIER vier
+    # setado no .env, pra não mudar comportamento de quem não pediu.
+    # Valores default abaixo (0.9/1.75/2) são o ponto de partida comum
+    # pra RP/ficção (ver doc do llama-server), não calibrado ainda contra
+    # nenhum modelo específico deste projeto.
+    dry_multiplier: float = float(os.environ.get("EVA_DRY_MULTIPLIER", "0.0"))
+    dry_base: float = float(os.environ.get("EVA_DRY_BASE", "1.75"))
+    dry_allowed_length: int = int(os.environ.get("EVA_DRY_ALLOWED_LENGTH", "2"))
+    # Janela de tokens que o DRY olha pra trás -- mesmo raciocínio de
+    # repeat_last_n (ver acima): curta demais e ela nunca alcança a
+    # resposta do turno anterior. -1 = contexto inteiro.
+    dry_penalty_last_n: int = int(os.environ.get("EVA_DRY_PENALTY_LAST_N", "1152"))
+
+    # XTC empurra a escolha de token pra longe do mais óbvio/previsível --
+    # reduz resposta "em molde" em modelo de RP. xtc_probability=0.0
+    # (default) = desligado. NUNCA usar isso no decisor/extrator (JSON
+    # estruturado): XTC pode remover o token certo e quebrar sintaxe --
+    # por isso esses campos só existem em LLMConfig (conversa), não em
+    # DecisionConfig nem na config do extrator.
+    xtc_probability: float = float(os.environ.get("EVA_XTC_PROBABILITY", "0.0"))
+    xtc_threshold: float = float(os.environ.get("EVA_XTC_THRESHOLD", "0.1"))
+
+    # Role da mensagem de CAUDA (bloco volátil montado no fim do prompt,
+    # depois do histórico -- ver Contexto._mensagens_com_cauda em
+    # context.py). Default "system" é o que sempre funcionou com
+    # Sweet_Dreams/Angelic_Eclipse (Mistral-Nemo) e a maioria dos modelos
+    # RP genéricos, que toleram várias mensagens de role system na lista.
+    #
+    # ACHADO REAL (02/09/2026): o chat template Jinja embutido no GGUF do
+    # Qwen3.5-9B (e de outros modelos Qwen3/3.5) valida explicitamente
+    # que existe NO MÁXIMO uma mensagem de role system e que ela vem na
+    # PRIMEIRA posição -- {% raise_exception('System message must be at
+    # the beginning') %}. Com esse template, um segundo system no meio
+    # da lista (a cauda) derruba o turno inteiro com HTTP 500, sem gerar
+    # nada. EVA_CAUDA_ROLE=user contorna isso: a cauda vira uma mensagem
+    # de role user (com um prefixo textual deixando claro que é dado de
+    # contexto, não fala da pessoa -- ver PREFIXO_CAUDA_USER em
+    # context.py), preservando a arquitetura de cache de prefixo que já
+    # foi medida e otimizada (ver notas de f_keep em para_chat) -- a
+    # ORDEM das mensagens não muda, só o role da última.
+    cauda_role: str = os.environ.get("EVA_CAUDA_ROLE", "system")
+
     # Teto de texto. O dataset tem mediana de 74 caracteres e p99 de 222,
     # entao 400 tokens ja e folga generosa -- serve para as respostas longas
     # (eva_longas_*.jsonl) sem permitir divagacao.
@@ -243,13 +288,17 @@ class DecisionConfig:
     # lugar pra configurar a chave, não duas variáveis fazendo a mesma coisa.
     groq_key: str = os.environ.get("GROQ_API_KEY", "")
 
-    # Onde SUBIR o llama-server de decisão/visão, se quiser que discord.py
-    # suba sozinho -- mesmo padrão do LLMConfig.server_exe acima, mas com
-    # server_mmproj porque este modelo também faz visão (VisaoConfig.base_url
-    # aponta pro MESMO servidor, é a mesma instância atendendo os dois
-    # papéis -- decisão e visão sempre foram o mesmo modelo, só mudou de
-    # LM Studio pra llama-server). --parallel 2 porque decisão, extração de
-    # memória e visão podem se sobrepor no tempo; suba se sobrar VRAM.
+    # server_mmproj FICOU OPCIONAL (02/09/2026): antes este servidor
+    # SEMPRE levava --mmproj porque atendia decisão E visão no mesmo
+    # processo (VisaoConfig.base_url apontava pra cá). Com a visão agora
+    # em servidor PRÓPRIO (ver VisaoConfig.server_exe), este campo só
+    # importa se você quiser voltar ao esquema antigo por algum motivo --
+    # deixe vazio para rodar puro-texto, mais leve.
+    #
+    # --parallel continua em 2, não caiu para 1: decisão do turno atual e
+    # extração de memória do turno ANTERIOR (roda em segundo plano, ver
+    # orchestrator._disparar_extracao_llm/_esperar_ocioso) ainda podem se
+    # sobrepor no tempo -- só a visão saiu deste servidor, não a extração.
     server_exe: str = os.environ.get("EVA_DECISAO_SERVER_EXE", "")
     server_modelo: str = os.environ.get("EVA_DECISAO_SERVER_MODELO", "")
     server_mmproj: str = os.environ.get("EVA_DECISAO_SERVER_MMPROJ", "")
@@ -482,16 +531,50 @@ class VisaoConfig:
     limiar_desvios: float = 2.5
     limiar_minimo_absoluto: float = 3.0
 
-    # MiniCPM-V via llama-server -- servidor separado do conversacional
-    # (mesma máquina, endpoint diferente, mas nunca a mesma requisição)
-    # para não competir por latência com decisão/conversa. Aponta pro
-    # MESMO servidor que DecisionConfig.base_url -- é o mesmo processo
-    # llama-server, com --mmproj, atendendo os dois papéis (decisão e
-    # visão sempre foram o mesmo modelo).
-    base_url: str = os.environ.get("EVA_VISAO_URL", "http://localhost:1234/v1")
+    # MiniCPM-V via llama-server -- SEPARADO do servidor de decisão desde
+    # 02/09/2026 (ver histórico: antes VisaoConfig.base_url apontava pro
+    # MESMO processo que DecisionConfig.base_url, um único gemma-3-4b
+    # com --mmproj atendendo decisão + visão + extração de memória).
+    #
+    # ACHADO REAL que motivou a separação: medido em call real com
+    # Qwen3.5-9B como conversacional -- o tick de fundo da visão de tela
+    # (_laco_visao em bridge_client.py, roda a cada tick_intervalo
+    # segundos, INDEPENDENTE de qualquer turno de conversa) disputava os
+    # mesmos slots do gemma-3-4b que a decisão do turno atual também
+    # usava, E disputava a MESMA GPU que o modelo conversacional (llama,
+    # processo totalmente separado) usava ao mesmo tempo. Um turno
+    # específico no log mostrou o eval do conversacional caindo de 22.75
+    # tok/s (turno sem visão concorrente) para 9.66 tok/s (turno com uma
+    # análise de visão de ~10s rodando em paralelo) -- mais que o DOBRO
+    # de lentidão, na mesma GPU, mesmo modelo, só por causa da disputa.
+    #
+    # Com um servidor DEDICADO e um modelo bem menor (moondream2, ~1B,
+    # ~3.75GB em F16 com mmproj -- contra os ~2.6GB do gemma-3-4b, mas
+    # rodando SOZINHO sem competir com decisão/extração de memória), o
+    # tick de fundo da visão passa a competir só consigo mesmo pela GPU,
+    # nunca com o turno de conversa em andamento.
+    base_url: str = os.environ.get("EVA_VISAO_URL", "http://localhost:8084/v1")
     api_key: str = os.environ.get("EVA_LLM_KEY", "lm-studio")
-    modelo: str = os.environ.get("EVA_VISAO_MODEL", "minicpm-v-4.6")
+    modelo: str = os.environ.get("EVA_VISAO_MODEL", "moondream2")
     timeout: int = 45
+
+    # Onde SUBIR o llama-server de visão, se quiser que discord.py suba
+    # sozinho -- mesmo padrão de LLMConfig.server_exe/DecisionConfig.
+    # server_exe. server_mmproj é obrigatório aqui (moondream2 SEMPRE
+    # precisa do projetor de visão, ao contrário do modelo de decisão
+    # que agora pode rodar puro-texto sem --mmproj).
+    server_exe: str = os.environ.get("EVA_VISAO_SERVER_EXE", "")
+    server_modelo: str = os.environ.get("EVA_VISAO_SERVER_MODELO", "")
+    server_mmproj: str = os.environ.get("EVA_VISAO_SERVER_MMPROJ", "")
+    server_flags: list[str] = field(default_factory=lambda: os.environ.get(
+        "EVA_VISAO_SERVER_FLAGS",
+        "-ngl 999 -fa on --cache-type-k q8_0 --cache-type-v q8_0 "
+        "-c 4096 --parallel 2 --jinja",
+    ).split())
+    # --parallel 2 (não 3 como o antigo decisão+visão combinado): aqui só
+    # dividem slot a análise de tick de fundo e uma eventual análise sob
+    # demanda (analisar_agora) -- não há decisão nem extração de memória
+    # competindo neste servidor.
 
     # Rajada de quadros por análise -- "vídeo de pobre": vários quadros na
     # mesma mensagem em vez de um só, para o modelo entender sequência.

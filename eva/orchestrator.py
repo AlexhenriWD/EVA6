@@ -1,6 +1,6 @@
 """
 Orquestrador -- o ciclo cognitivo completo.
-
+ 
     mensagem
         |
         v
@@ -19,10 +19,10 @@ Orquestrador -- o ciclo cognitivo completo.
         |
         v
     Pós-processo           extrai memórias novas, atualiza estado
-
+ 
 A ordem importa: a EVA aparece por último, e é a única peça que produz
 texto para o usuário. Todo o resto produz dado estruturado.
-
+ 
 SÍNCRONO DE PROPÓSITO
 ---------------------
 `responder` é síncrono: é mais simples de testar e a CLI usa direto. As
@@ -31,16 +31,16 @@ integrações que vivem num laço asyncio (bridge, Discord) chamam via
 do BancoMemoria -- sem ele, duas pessoas falando ao mesmo tempo corrompem
 o cursor do SQLite.
 """
-
+ 
 from __future__ import annotations
-
+ 
 import asyncio
 import difflib
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-
+ 
 from .config import EVAConfig, carregar_config
 from .context import ContextBuilder
 from .decision import DecisorPorLLM, DecisorPorRegras, Plano, clientes_decisao
@@ -51,8 +51,8 @@ from .memory.store import BancoMemoria, USUARIO_HISTORIA
 from .state import GerenciadorEstado
 from .tools.builtin import carregar_ferramentas
 from .tools import minecraft_tools
-
-
+ 
+ 
 @dataclass
 class Resultado:
     """Tudo que aconteceu num turno. Útil para debug e para a CLI mostrar
@@ -67,11 +67,11 @@ class Resultado:
     system: str = ""
     ms: int = 0
     erro: str | None = None
-
-
+ 
+ 
 class RespostaEmStream:
     """Iterável dos pedaços de texto de uma resposta em streaming.
-
+ 
     `.resultado` fica None até a iteração terminar; depois de esgotado,
     tem o Resultado completo (pós-processamento já feito). Existe porque
     generator não aceita atributo arbitrário -- o padrão antigo
@@ -82,19 +82,19 @@ class RespostaEmStream:
     def __init__(self):
         self._gerador = None
         self.resultado: Resultado | None = None
-
+ 
     def __iter__(self):
         return self
-
+ 
     def __next__(self):
         if self._gerador is None:
             raise StopIteration
         return next(self._gerador)
-
-
+ 
+ 
 class _ConfigExtrator:
     """Adaptador leve: ClienteLLM só precisa destes atributos (duck typing).
-
+ 
     Não é um dataclass em EVAConfig porque não é configuração de primeira
     classe -- é a ponte entre MemoriaConfig (onde os valores vivem de
     verdade) e o formato que ClienteLLM espera.
@@ -107,12 +107,12 @@ class _ConfigExtrator:
         self.top_p = 0.9
         self.max_tokens = 300
         self.timeout = mem_cfg.extrator_timeout
-
-
+ 
+ 
 class EVA:
     def __init__(self, config: EVAConfig | None = None):
         self.cfg = config or carregar_config()
-
+ 
         embeddings = None
         if self.cfg.memoria.usar_embeddings:
             from .memory.embeddings import ClienteEmbeddings
@@ -127,7 +127,7 @@ class EVA:
         self.ferramentas = carregar_ferramentas()
         self.llm = ClienteLLM(self.cfg.llm)
         self.builder = ContextBuilder(self.cfg)
-
+ 
         # Cliente separado do de conversa: extração de fatos é tarefa
         # estruturada (JSON), não conversa, e pode ser um modelo diferente
         # no futuro sem afetar o eva-3b conversacional. `_config_extrator`
@@ -136,22 +136,22 @@ class EVA:
         # timeout) -- não é um dataclass registrado em EVAConfig porque só
         # existe para essa injeção.
         self.llm_extrator = ClienteLLM(_ConfigExtrator(self.cfg.memoria))
-
+ 
         if self.cfg.decisao.usar_llm:
             principal, reserva = clientes_decisao(self.cfg.decisao)
             self.decisor = DecisorPorLLM(principal, self.ferramentas, cliente_reserva=reserva)
         else:
             self.decisor = DecisorPorRegras()
-
+ 
         # Tempo parado recupera energia -- sem isso a EVA acumularia cansaço
         # entre sessões e ficaria permanentemente exausta.
         self.estado.aplicar_tempo_decorrido()
-
+ 
         self._registrar_criador()
-
+ 
     def _registrar_criador(self) -> None:
         """Marca o dono da instância como criador, se ainda não estiver.
-
+ 
         Só age quando a relação ainda é a padrão: se você reclassificar
         alguém à mão, o reinício não desfaz.
         """
@@ -160,9 +160,29 @@ class EVA:
         if p["relacao"] == "desconhecido":
             self.memoria.salvar_pessoa(uid, nome=self.cfg.nome_criador,
                                        relacao="criador")
-
+ 
     # ------------------------------------------------------------ ciclo
-
+ 
+    @staticmethod
+    def _estado_visao_robo() -> dict:
+        """Fonte da visão, câmera ativa e idade do último quadro.
+ 
+        Import local de propósito: o orchestrator roda em contextos sem
+        robô nenhum (CLI, testes), e robot_tools sobe thread e cliente de
+        rede quando importado no caminho errado. Falha vira "sem robô",
+        que é o comportamento certo pra quem não tem um."""
+        try:
+            from .tools import robot_tools
+            if not robot_tools.robo_conectado():
+                return {}
+            return {
+                "visao_robo": True,
+                "camera_robo": robot_tools.camera_ativa(),
+                "idade_quadro_s": robot_tools.idade_do_quadro_s(),
+            }
+        except Exception:
+            return {}
+ 
     def responder(
         self,
         mensagem: str,
@@ -174,11 +194,11 @@ class EVA:
         modo_multicanal: bool = False,
     ):
         """Executa um turno completo. Com stream=True devolve um gerador.
-
+ 
         `usuario` é o id de quem falou (id do Discord, por exemplo). Sem ele,
         cai no dono da instância -- que é o certo para a CLI, e errado para
         qualquer integração multiusuário, então as integrações passam sempre.
-
+ 
         `modo_multicanal=True` é para quando `mensagem` já vem pré-formatada
         como várias linhas "[canal] quem: texto" (ver bridge_client, que
         decide quando agregar várias falas antes de chamar aqui). Nesse
@@ -193,18 +213,18 @@ class EVA:
         if not mensagem:
             return Resultado(resposta="", plano=Plano(), usuario=usuario,
                              erro="mensagem vazia")
-
+ 
         historico = self.memoria.historico(
             usuario=usuario, limite=self.cfg.memoria.janela_historico)
-
+ 
         # 1. decidir
         plano = self.decisor.decidir(mensagem, historico)
         contexto_jogo = (minecraft_tools.snapshot_atual()
                  if plano.precisa_jogo else None)
-
+ 
         # 2. quem é a pessoa
         identidade = self._identidade(usuario)
-
+ 
         # 3. buscar memória + 4. executar ferramentas -- independentes
         # entre si (nenhuma usa o resultado da outra, as duas só dependem
         # de `plano`/`usuario`/`mensagem`), então rodam em paralelo em vez
@@ -219,7 +239,7 @@ class EVA:
             futuro_ferramentas = pool.submit(self._executar_ferramentas, plano)
             memorias = futuro_memorias.result()
             resultados = futuro_ferramentas.result()
-
+ 
         # 5. montar contexto
         ctx = self.builder.montar(
             plano=plano,
@@ -233,19 +253,25 @@ class EVA:
             contexto_jogo=contexto_jogo,
             modo_multicanal=modo_multicanal,
             mensagem=mensagem,
+            # Estado do corpo lido AQUI, no momento de montar o prompt --
+            # não passado de fora. Quem chama (bridge_client) decide o
+            # texto da cena; de qual câmera ela veio e há quanto tempo é
+            # fato do robô, e ler no ponto de montagem evita os dois
+            # ficarem fora de sincronia.
+            **self._estado_visao_robo(),
         )
         mensagens = ctx.para_chat(mensagem)
-
+ 
         # Em voz, o teto de tokens é bem menor: a mediana do dataset é 74
         # caracteres e o p99 é 222. 400 tokens viram uns 40 segundos de fala,
         # tempo demais para alguém esperando numa call.
         teto = self.cfg.llm.max_tokens_voz if modo_voz else self.cfg.llm.max_tokens
-
+ 
         if stream:
             return self._responder_stream(
                 mensagem, usuario, plano, memorias, resultados, ctx,
                 mensagens, teto, inicio)
-
+ 
         # 6. gerar resposta
         try:
             resposta = self.llm.completar(mensagens, max_tokens=teto, parar=STOP_CONVERSA)
@@ -253,11 +279,11 @@ class EVA:
         except ErroLLM as e:
             resposta = ""
             erro = str(e)
-
+ 
         # 7. pós-processo
         novas = self._pos_processar(mensagem, resposta, plano, usuario,
                                     sucesso=erro is None)
-
+ 
         return Resultado(
             resposta=resposta,
             plano=plano,
@@ -270,10 +296,10 @@ class EVA:
             ms=int((time.time() - inicio) * 1000),
             erro=erro,
         )
-
+ 
     async def responder_async(self, mensagem: str, **kwargs):
         """Versão para quem vive num laço asyncio.
-
+ 
         O trabalho pesado (HTTP para o LLM, SQLite) é bloqueante e roda numa
         thread. Chamar `responder` direto de dentro do laço trava o event
         loop por segundos: o bridge de voz perde frames e o heartbeat do
@@ -281,25 +307,25 @@ class EVA:
         """
         return await asyncio.to_thread(
             lambda: self.responder(mensagem, **kwargs))
-
-
+ 
+ 
     def pre_visualizar(
         self, mensagem: str, *, usuario: str | None = None,
         modo_voz: bool = False, contexto_visual: str | None = None,
     ) -> dict:
         """Monta o que SERIA enviado ao modelo, sem chamar o modelo.
-
+ 
         Reaproveita passo a passo a mesma pipeline de responder() (decisão,
         identidade, memória, ferramentas, contexto) -- só para antes do
         passo de gerar a resposta. Existe para o dashboard de debug: ver
         o prompt exato que seria montado para uma mensagem de teste, sem
         gastar uma chamada real ao modelo nem esperar geração.
-
+ 
         Duplica ~10 linhas de responder() de propósito, em vez de extrair
         um helper compartilhado -- responder() já é código testado e em
         produção (stream, tratamento de erro do LLM, pós-processamento);
         arriscar isso por uma ferramenta de debug não vale a pena.
-
+ 
         Síncrono e thread-safe (BancoMemoria usa RLock) -- chamável direto
         da thread do servidor do dashboard, sem ponte com asyncio.
         """
@@ -331,14 +357,14 @@ class EVA:
             "max_tokens": teto,
             "identidade": identidade,
         }
-
+ 
     def falar_sozinha(self, ideia: str, *, usuario: str | None = None,
                       modo_voz: bool = True) -> Resultado:
         """Produz uma fala espontânea a partir de um impulso aprovado.
-
+ 
         Quem decide SE ela fala é o portão em eva/consciousness.py. Aqui ela
         já tem permissão -- este método só escreve.
-
+ 
         A lista de mensagens termina no histórico, sem turno de `user`: não
         houve pergunta. Servidores compatíveis com a API da OpenAI aplicam o
         template e abrem o turno do assistente de qualquer forma. Se o seu
@@ -350,11 +376,11 @@ class EVA:
         usuario = usuario or self.cfg.usuario
         plano = Plano(intencao="iniciativa", precisa_memoria=True,
                       guardar_memoria=False, consulta_memoria=ideia)
-
+ 
         historico = self.memoria.historico(
             usuario=usuario, limite=self.cfg.memoria.janela_historico)
         memorias = self._buscar_memorias(plano, usuario, ideia)
-
+ 
         ctx = self.builder.montar(
             plano=plano, memorias=memorias, resultados_ferramentas={},
             estado=self.estado.estado, historico=historico,
@@ -362,7 +388,7 @@ class EVA:
             modo_voz=modo_voz, iniciativa=ideia,
         )
         mensagens = ctx._mensagens_com_cauda()
-
+ 
         # Teto próprio, bem menor que o de resposta -- ver
         # LLMConfig.max_tokens_espontanea pro número medido que motivou
         # a separação. Puxar assunto é convite, não exposição.
@@ -373,21 +399,21 @@ class EVA:
             erro = None
         except ErroLLM as e:
             resposta, erro = "", str(e)
-
+ 
         if resposta and self._fala_espontanea_repetida(resposta, historico):
             print("[eva espontânea] fala repetida descartada")
             resposta = ""
-
+ 
         # Só o lado dela entra no histórico -- não houve turno de usuário.
         # E `guardar_memoria=False` no plano evita o outro erro: extrair
         # "fato sobre o usuário" de uma frase que quem escreveu foi ela.
         if resposta:
             self.memoria.registrar_turno("assistant", resposta, usuario=usuario)
-
+ 
         return Resultado(resposta=resposta, plano=plano, usuario=usuario,
                          contexto=ctx.bruto, system=ctx.prompt_completo(),
                          ms=int((time.time() - inicio) * 1000), erro=erro)
-
+ 
     @staticmethod
     def _fala_espontanea_repetida(resposta: str, historico: list[dict]) -> bool:
         atual = " ".join(resposta.lower().split())
@@ -402,7 +428,7 @@ class EVA:
             if difflib.SequenceMatcher(None, atual, anterior).ratio() >= 0.82:
                 return True
         return False
-
+ 
     async def falar_sozinha_async(self, ideia: str, **kwargs) -> Resultado:
         return await asyncio.to_thread(lambda: self.falar_sozinha(ideia, **kwargs))
     
@@ -411,7 +437,7 @@ class EVA:
         """Gera a resposta em pedaços; o pós-processo roda no fim."""
         partes: list[str] = []
         envelope = RespostaEmStream()
-
+ 
         def gerar():
             erro = None
             try:
@@ -422,7 +448,7 @@ class EVA:
                 # Erro do LLM não vira texto pra falar/mostrar -- fica só em
                 # resultado.erro, igual o caminho não-streaming já faz.
                 erro = str(e)
-
+ 
             resposta = "".join(partes)
             novas = self._pos_processar(mensagem, resposta, plano, usuario,
                                         sucesso=erro is None)
@@ -433,15 +459,15 @@ class EVA:
                 system=ctx.prompt_completo(),
                 ms=int((time.time() - inicio) * 1000), erro=erro,
             )
-
+ 
         envelope._gerador = gerar()
         return envelope
-
+ 
     # ------------------------------------------------------------ etapas
-
+ 
     def _identidade(self, usuario: str) -> str | None:
         """A segunda linha do system prompt, ou None.
-
+ 
         None é o caso mais treinado (784 dos 1.135 exemplos não têm segunda
         linha), então não inventar é seguro.
         """
@@ -451,10 +477,10 @@ class EVA:
         if promover(p, self.cfg.identidade.turnos_para_conhecido):
             self.memoria.salvar_pessoa(usuario, relacao=p.relacao)
         return p.linha()
-
+ 
     def _buscar_memorias(self, plano: Plano, usuario: str, mensagem: str) -> dict[str, list]:
         saida: dict[str, list] = {}
-
+ 
         if plano.precisa_memoria and plano.consulta_memoria:
             limites = {
                 "semantica": self.cfg.memoria.max_fatos,
@@ -486,7 +512,7 @@ class EVA:
                     achadas = futuro.result()
                     if achadas:
                         saida[tipo] = achadas
-
+ 
         # Fatos-núcleo entram SEMPRE, mesmo quando o plano dispensa memória.
         # A busca por palavra-chave falha justamente onde o fato mais importa,
         # e "não precisa de memória" é uma decisão sobre a pergunta, não sobre
@@ -499,7 +525,7 @@ class EVA:
                 saida["semantica"] = (saida.get("semantica", []) + extras)[
                     : self.cfg.memoria.max_fatos
                 ]
-
+ 
         # História/lore da própria EVA -- independente de precisa_memoria, de
         # propósito: essa flag decide se a pergunta precisa saber algo sobre A
         # PESSOA, não sobre a EVA. "sobre_si" desativa precisa_memoria e sem
@@ -539,20 +565,20 @@ class EVA:
                 )
                 historia = futuro_historia.result()
                 regras = futuro_regras.result()
-
+ 
             if historia:
                 existentes = {m.id for m in saida.get("semantica", [])}
                 extras = [m for m in historia if m.id not in existentes]
                 if extras:
                     saida["semantica"] = saida.get("semantica", []) + extras
-
+ 
             if regras:
                 existentes = {m.id for m in saida.get("procedural", [])}
                 extras = [m for m in regras if m.id not in existentes]
                 if extras:
                     saida["procedural"] = saida.get("procedural", []) + extras
         return saida
-
+ 
     def _executar_ferramentas(self, plano: Plano) -> dict:
         if not plano.precisa_ferramenta:
             return {}
@@ -571,7 +597,7 @@ class EVA:
             # (o modelo narrando a ação como se tivesse acontecido).
             print(f"[ferramenta] {nome}({args}) -> {str(resultado)[:200]}")
             return {nome: self.ferramentas.executar(nome, **args)}
-
+ 
         # Mais de uma ferramenta no mesmo plano: rodam em paralelo. Eram
         # sequenciais antes (um for simples), e cada ferramenta é uma
         # chamada própria (ex.: busca web no SearXNG pode levar 1-3s+),
@@ -587,7 +613,7 @@ class EVA:
             for futuro, nome in futuros.items():
                 saida[nome] = futuro.result()
         return saida
-
+ 
     def _pos_processar(self, mensagem: str, resposta: str, plano: Plano,
                        usuario: str, sucesso: bool) -> list:
         # histórico -- só registra o par se a EVA respondeu de verdade.
@@ -598,10 +624,10 @@ class EVA:
         if resposta:
             self.memoria.registrar_turno("user", mensagem, usuario=usuario)
             self.memoria.registrar_turno("assistant", resposta, usuario=usuario)
-
+ 
         reg = self.memoria.pessoa(usuario)
         self.memoria.salvar_pessoa(usuario, turnos=reg["turnos"] + 1)
-
+ 
         # novas memórias -- só as de regra entram aqui, porque são
         # instantâneas (regex, sem chamada de rede) e o Resultado devolvido
         # ao chamador já reflete o que foi guardado. A extração por LLM roda
@@ -616,7 +642,7 @@ class EVA:
                 )
                 if id_:
                     novas.append(item)
-
+ 
         # Extração por LLM: cobre o que a regra não pega (declaração
         # indireta, "estou testando minha IA e o desenvolvimento vai bem"
         # não tem forma fixa nenhuma pra regex casar). Roda em SEGUNDO
@@ -627,7 +653,7 @@ class EVA:
         # PRÓXIMO turno usar.
         if plano.guardar_memoria and self.cfg.memoria.extrair_com_llm:
             self._disparar_extracao_llm(usuario)
-
+ 
         # Consolidação periódica (memory/consolidacao.py): não a cada
         # turno -- é trabalho pesado (embedding de dezenas de memórias,
         # comparação par a par) que só compensa de tempos em tempos.
@@ -640,7 +666,7 @@ class EVA:
         if (self.cfg.memoria.consolidar_com_llm and intervalo > 0
                 and turnos_novo % intervalo == 0):
             self._disparar_consolidacao(usuario)
-
+ 
         # Auto-reflexão: a EVA "olhando pra trás" pro que ela mesma acabou
         # de dizer, tentando notar traço específico que apareceu nessa
         # troca. Mesmo gatilho por contagem de turnos que a consolidação
@@ -651,7 +677,7 @@ class EVA:
         if (self.cfg.memoria.autorreflexao_ativa and intervalo_reflexao > 0
                 and resposta and turnos_novo % intervalo_reflexao == 0):
             self._disparar_autorreflexao(usuario)
-
+ 
         # estado interno
         #
         # Global de propósito: energia, curiosidade e estresse são dela, não
@@ -671,25 +697,25 @@ class EVA:
             "assunto": plano.intencao if plano.intencao not in FOCO_IGNORADO else None,
         })
         return novas
-
+ 
     # ------------------------------------------------------------- extras
-
+ 
     def lembrar(self, conteudo: str, tipo: str = "semantica",
                 usuario: str | None = None) -> int | None:
         """Adiciona uma memória manualmente."""
         return self.memoria.adicionar(
             tipo, conteudo, usuario=usuario or self.cfg.usuario,
             fonte="manual", confianca=1.0)
-
+ 
     def esquecer(self, termo: str, usuario: str | None = None) -> int:
         return self.memoria.esquecer_por_texto(
             termo, usuario=usuario or self.cfg.usuario)
-
+ 
     def apresentar(self, usuario: str, nome: str,
                    relacao: str = "conhecido") -> None:
         """Registra quem é alguém. Muda a linha situacional do prompt."""
         self.memoria.salvar_pessoa(usuario, nome=nome, relacao=relacao)
-
+ 
     def diagnostico(self) -> dict:
         return {
             "llm_disponivel": self.llm.disponivel(),
@@ -715,18 +741,18 @@ class EVA:
             "decisor": "llm" if self.cfg.decisao.usar_llm else "regras",
             "banco": str(self.cfg.memoria.caminho_db),
         }
-
+ 
     async def pesquisar_lacuna(self, consulta: str) -> str | None:
         """Busca em fundo o que uma mensagem pode ter deixado sem resposta
         atualizada, e devolve um resumo pronto para virar impulso de
         iniciativa -- ou None se a busca não trouxe nada útil.
-
+ 
         Quem chama isto é o bridge_client (ou qualquer integração que tenha
         uma Consciencia por perto), a partir de `Resultado.plano.
         possivel_lacuna`. O EVA não conhece Consciencia de propósito -- ele
         continua utilizável sozinho pela CLI, sem call nem iniciativa
         nenhuma. A ponte fica do lado de quem já sabe orquestrar os dois.
-
+ 
         `async def` direto, sem variante sync: pesquisar_lacuna só faz
         sentido vindo de uma integração que já vive num loop (bridge,
         Discord) -- não existe caso de uso pela CLI síncrona.
@@ -738,24 +764,24 @@ class EVA:
             if self.cfg.debug:
                 print(f"[lacuna] erro ao buscar '{consulta[:60]}': {e}")
             return None
-
+ 
         if not isinstance(resultado, dict) or resultado.get("erro"):
             return None
-
+ 
         resumo = resultado.get("resumo")
         if not resumo:
             relacionados = resultado.get("relacionados") or []
             resumo = relacionados[0] if relacionados else None
         if not resumo:
             return None
-
+ 
         # "segundo uma busca" fica explícito de propósito -- você pediu que
         # ela possa citar que pesquisou, em vez de falar como se já soubesse.
         return f"segundo uma busca sobre isso: {resumo}"
-
+ 
     def _disparar_extracao_llm(self, usuario: str) -> None:
         """Roda extrair_por_llm em segundo plano, sem bloquear a resposta.
-
+ 
         Dois caminhos porque `responder` é chamado tanto de dentro de um
         event loop (bridge, Discord) quanto de fora dele (CLI). Detectar
         qual é o certo em vez de assumir um dos dois evita que a CLI quebre
@@ -766,22 +792,22 @@ class EVA:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             loop = None
-
+ 
         if loop is not None:
             loop.create_task(self._extrair_e_salvar_async(usuario))
         else:
             threading.Thread(
                 target=self._extrair_e_salvar, args=(usuario,), daemon=True
             ).start()
-
+ 
     async def _extrair_e_salvar_async(self, usuario: str) -> None:
         await self._esperar_ocioso()
         await asyncio.to_thread(self._extrair_e_salvar, usuario)
-
+ 
     async def _esperar_ocioso(self, teto: float = 30.0) -> None:
         """Segura uma tarefa de fundo até a EVA não estar mais no meio de
         um turno.
-
+ 
         MEDIDO (log de call, 26/08): a extração de memória roda no
         servidor de decisão, que divide GPU com o conversacional. Rodando
         junto com a resposta, o decisor caiu de 65-74 tok/s pra 10.70
@@ -789,11 +815,11 @@ class EVA:
         que estava esperando a EVA responder. No mesmo log, quatro dessas
         extrações terminaram em "nada extraído neste turno": custo real,
         resultado nenhum.
-
+ 
         Extração é assíncrona por natureza -- ninguém está esperando por
         ela. Rodar 3s depois não muda nada; rodar em cima do turno muda
         tudo.
-
+ 
         `ocupado_agora` é injetado por quem integra (ver bridge_client).
         Sem ele -- CLI, testes -- o comportamento é o de antes: roda já.
         O teto existe porque um callback que nunca solta (bug ou call
@@ -810,18 +836,18 @@ class EVA:
             # Callback quebrado não pode derrubar a extração -- só perde
             # a espera, que é otimização, não requisito.
             return
-
+ 
     def _extrair_e_salvar(self, usuario: str) -> None:
         """O trabalho de verdade: busca histórico recente, pede fatos ao
         LLM, grava o que vier. Roda fora do caminho principal -- exceção
         aqui NUNCA deve derrubar a conversa, só fica no log.
-
+ 
         `self.memoria` é seguro entre threads (BancoMemoria tem RLock), mas
         se a EVA for fechada (`fechar()`) enquanto isso ainda roda, o
         SQLite pode já estar fechado -- daí o except genérico no fim: uma
         falha aqui é invisível para o usuário por natureza (a resposta já
         foi entregue), então não vale derrubar nada, só avisar no log.
-
+ 
         O log do resultado (sucesso, vazio ou erro) SEMPRE aparece, não só
         com EVA_DEBUG=1 -- esse era o motivo real de "a EVA quase não
         guarda nada" parecer misterioso: se o modelo extrator falhasse por
@@ -844,7 +870,7 @@ class EVA:
                 print(f"[memoria-llm] {usuario}: nada extraído neste turno")
         except Exception as e:
             print(f"[memoria-llm] erro ao extrair para {usuario}: {e}")
-
+ 
     def _disparar_consolidacao(self, usuario: str) -> None:
         """Mesmo padrão de _disparar_extracao_llm: thread solta no
         caminho síncrono, task no caminho async. Consolidação é ainda mais
@@ -855,21 +881,21 @@ class EVA:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             loop = None
-
+ 
         if loop is not None:
             loop.create_task(self._consolidar_async(usuario))
         else:
             threading.Thread(
                 target=self._consolidar, args=(usuario,), daemon=True
             ).start()
-
+ 
     async def _consolidar_async(self, usuario: str) -> None:
         await asyncio.to_thread(self._consolidar, usuario)
-
+ 
     def _consolidar(self, usuario: str) -> None:
         """O trabalho de verdade: agrupa memórias antigas similares em
         resumos. Ver memory/consolidacao.py para o algoritmo.
-
+ 
         Sem `self.memoria.embeddings` configurado (LM Studio sem o modelo
         de embedding, ou EVA_EMBEDDINGS=0), `candidatos_para_consolidar`
         sempre devolve vazio -- não há vetor pra comparar -- então isso
@@ -886,7 +912,7 @@ class EVA:
         except Exception as e:
             if self.cfg.debug:
                 print(f"[consolidacao] erro para {usuario}: {e}")
-
+ 
     def _disparar_autorreflexao(self, usuario: str) -> None:
         """Mesmo padrão dual sync/async de _disparar_extracao_llm --
         thread solta no caminho síncrono, task no caminho async.
@@ -895,17 +921,17 @@ class EVA:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             loop = None
-
+ 
         if loop is not None:
             loop.create_task(self._autorrefletir_async(usuario))
         else:
             threading.Thread(
                 target=self._autorrefletir, args=(usuario,), daemon=True
             ).start()
-
+ 
     async def _autorrefletir_async(self, usuario: str) -> None:
         await asyncio.to_thread(self._autorrefletir, usuario)
-
+ 
     def _autorrefletir(self, usuario: str) -> None:
         """O trabalho de verdade: pega o histórico recente, pede pro
         extrator (llm_extrator -- mesmo cliente da extração de fatos,
@@ -916,7 +942,7 @@ class EVA:
         com fonte='auto_reflexao' e confiança mais baixa (ver
         extrair_personalidade_propria em memory/extractor.py) pra ficar
         auditável e distinguível do que foi escrito à mão.
-
+ 
         Roda fora do caminho principal, mesma política de _extrair_e_salvar:
         exceção aqui nunca derruba a conversa, só fica no log.
         """
@@ -935,7 +961,7 @@ class EVA:
                 print(f"[autorreflexao] nada específico neste lote (usuario={usuario})")
         except Exception as e:
             print(f"[autorreflexao] erro: {e}")
-
+ 
     def fechar(self) -> None:
         self.estado.salvar()
         self.memoria.fechar()

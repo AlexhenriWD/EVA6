@@ -121,8 +121,11 @@ VISAO = re.compile(
 
 ROBO_OLHAR = re.compile(
     r"\b((pode|poderia)\s+dar|d[áa]) uma olhada em volta|"
-    r"\b(olh(ar|e)(\s+um pouco)? em volta|olh(ar|e) ao redor|"
-    r"olh(ar|e) para os lados|vir(a|e) a cabe[çc]a|olh(ar|e) em torno)\b",
+    # olh(a|ar|e): "olha em volta" -- imperativo coloquial, a forma mais
+    # comum em fala -- nunca casou, porque a alternação só tinha "olhar"
+    # e "olhe". Passou despercebido porque os testes usavam o infinitivo.
+    r"\b(olh(a|ar|e)(\s+um pouco)? em volta|olh(a|ar|e) ao redor|"
+    r"olh(a|ar|e) para os lados|olh(a|ar|e) em torno)\b",
     re.I,
 )
 ROBO_ESTADO = re.compile(
@@ -145,11 +148,16 @@ ROBO_ESTADO = re.compile(
 # de DecisorPorLLM.decidir, e uma ferramenta nova entrava num e não no
 # outro sem nenhum aviso.
 _FERRAMENTAS_FISICAS = {"robo_estado", "robo_olhar", "robo_olhar_em_volta",
-                        "robo_trocar_camera", "robo_gesto", "robo_postura"}
+                        "robo_trocar_camera", "robo_gesto", "robo_postura",
+                        "robo_virar", "robo_encarar", "robo_relaxar",
+                        "robo_andar"}
 
 ROBO_CAMERA = re.compile(
     r"\b(troc(a|ar|ue)|mud(a|ar|e)|altern(a|ar|e))\s+(a\s+|de\s+|sua\s+|pra\s+|para\s+)*c[âa]mera|"
-    r"\bc[âa]mera (da cabe[çc]a|do bra[çc]o|picam|usb)\b|"
+    # "pai cam", "paikin", "pai quem": o whisper transcrevendo "picam".
+    # Mantidos porque conversas antigas e o hábito da pessoa ainda usam a
+    # palavra, mesmo com a EVA já falando "câmera da cabeça".
+    r"\bc[âa]mera (da cabe[çc]a|do corpo|do bra[çc]o|picam|py ?cam|pai ?cam|paikin|usb)\b|"
     r"\bus(a|ar|e)\s+(a\s+)?(picam|c[âa]mera da cabe[çc]a)\b",
     re.I,
 )
@@ -164,6 +172,48 @@ ROBO_GESTO = re.compile(
 )
 
 # Pedido de POSTURA -- altura do olhar, não direção.
+# Determinantes empilhados: "vire A SUA base", "resetar O SEU corpo".
+# Um grupo opcional só (a\s+|sua\s+)? não cobre os dois juntos, e as
+# três primeiras regras físicas falharam por isso contra fala real.
+_DET = r"(?:(?:a|o|as|os|um|uma|sua|seu|suas|seus)\s+)*"
+
+# Virar o CORPO (base). Separado de ROBO_POSTURA porque é direção, não
+# altura -- e separado de ROBO_OLHAR porque não é varredura.
+# ANDAR: deslocar o robô inteiro. Separado de ROBO_VIRAR, que gira só a
+# base do braço -- "vira a base" e "anda pra frente" são coisas
+# diferentes e a confusão entre as duas já apareceu em fala real.
+ROBO_ANDAR = re.compile(
+    r"\b(and(a|ar|e)|v[áa]|vai|caminh(a|ar|e)|se\s+mov(a|er|imente))\s+"
+    r"(um\s+pouco\s+)?(pra|para|pro)?\s*" + _DET + r"(frente|tr[áa]s|direita|esquerda)\b|"
+    r"\b(gir(a|ar|e)|rod(a|ar|e))\s+" + _DET + r"(carrinho|rob[ôo])\b",
+    re.I,
+)
+
+ROBO_VIRAR = re.compile(
+    # cabeça/câmera entram aqui porque "vira a cabeça pra frente" é um
+    # pedido de DIREÇÃO -- girar o conjunto -- e não de gesto.
+    r"\b(vir(a|ar|e)|gir(a|ar|e)|apont(a|ar|e))\s+" + _DET +
+    r"(base|corpo|carrinho|yaw|cabe[çc]a|c[âa]mera)\b|"
+    r"\bvir(a|ar|e)\s+(pra|para)\s+" + _DET + r"(frente|direita)\b",
+    re.I,
+)
+
+# Encarar alguém: a ação completa (altura + mira), não um eixo.
+ROBO_ENCARAR = re.compile(
+    r"\b(olh(a|ar|e)|encar(a|ar|e))\s+(pra|para)\s+(mim|eu|a\s+pessoa|algu[ée]m)\b|"
+    r"\bme\s+olh(a|ar|e)\b|\bolh(a|ar|e)\s+na\s+minha\s+cara\b",
+    re.I,
+)
+
+# Recolher tudo. Vale como saída de qualquer estado travado.
+ROBO_RELAXAR = re.compile(
+    r"\b(relax(a|ar|e)|descans(a|ar|e)|recolh(a|er|e)|guard(a|ar|e))\s+" + _DET +
+    r"(corpo|bra[çc]o|cotovelo|tudo)\b|"
+    r"\bvolt(a|ar|e)\s+(pra|para)\s+" + _DET + r"(posi[çc][ãa]o\s+)?(inicial|descanso|repouso)\b|"
+    r"\breset(a|ar|e)\s+" + _DET + r"corpo\b",
+    re.I,
+)
+
 ROBO_POSTURA = re.compile(
     r"\b(olh(a|ar|e)|vir(a|ar|e)|apont(a|ar|e))\s+(pra|para)\s+(mim|c[áa]|aqui)\b|"
     r"\b(levant(a|ar|e)|sob(e|ir)|abaix(a|ar|e))\s+(a\s+)?(c[âa]mera|cabe[çc]a|bra[çc]o)\b|"
@@ -199,8 +249,18 @@ def robo_estado_relevante(texto: str) -> bool:
     return bool(ROBO_ESTADO.search(texto))
 
 
-def robo_camera_relevante(texto: str) -> bool:
-    return bool(ROBO_CAMERA.search(texto))
+def robo_camera_pedida(texto: str) -> str | None:
+    """Qual câmera, ou None. NUNCA devolve "alterna".
+
+    robo_trocar_camera sem tipo alternava, e ela nunca passava tipo --
+    cada pedido de "troca pra picam" invertia o que estivesse ativo. O
+    log do Pi ficou PICAM->USB->PICAM->USB enquanto ela pedia picam toda
+    vez, e depois relatava a câmera errada."""
+    if not ROBO_CAMERA.search(texto):
+        return None
+    if re.search(r"\busb\b|c[âa]mera do corpo|c[âa]mera de navega|c[âa]mera fixa", texto, re.I):
+        return "corpo"
+    return "cabeca"
 
 
 def robo_gesto_pedido(texto: str) -> str | None:
@@ -216,6 +276,45 @@ def robo_gesto_pedido(texto: str) -> str | None:
     if re.search(r"\bn[ãa]o\b", texto, re.I):
         return "nao"
     return "sim"
+
+
+def robo_andar_pedido(texto: str) -> str | None:
+    """Pra onde andar, ou None. Direção nomeada em vez de vx/vy/vz --
+    mesma razão de robo_virar: o decisor por LLM errou todos os números
+    crus que tentou emitir, e aqui o erro move um carrinho."""
+    if not ROBO_ANDAR.search(texto):
+        return None
+    if re.search(r"\bgir|\brod", texto, re.I):
+        return "girar"
+    for chave, alvo in ((r"tr[áa]s", "tras"), (r"direita", "direita"),
+                        (r"esquerda", "esquerda")):
+        if re.search(r"\b" + chave + r"\b", texto, re.I):
+            return alvo
+    return "frente"
+
+
+def robo_virar_pedido(texto: str) -> str | None:
+    """Qual direção foi pedida, ou None.
+
+    A direção sai da REGRA e não do modelo. Em uso real o decisor por
+    LLM respondeu `yaw: 0` pra "vira a cabeça pra frente" -- e 0 é o
+    lado DIREITO nesta montagem. Ele não conhece os números deste corpo
+    e não tem como conhecer."""
+    if not ROBO_VIRAR.search(texto):
+        return None
+    if re.search(r"\bdireita\b", texto, re.I):
+        return "direita"
+    if re.search(r"\bmeio\b|\bcentro\b", texto, re.I):
+        return "meio"
+    return "frente"
+
+
+def robo_encarar_relevante(texto: str) -> bool:
+    return bool(ROBO_ENCARAR.search(texto))
+
+
+def robo_relaxar_relevante(texto: str) -> bool:
+    return bool(ROBO_RELAXAR.search(texto))
 
 
 def robo_postura_pedida(texto: str) -> str | None:
@@ -448,8 +547,30 @@ class DecisorPorRegras:
             ferramentas.append({"nome": "robo_olhar_em_volta", "args": {}})
         if robo_estado_relevante(texto):
             ferramentas.append({"nome": "robo_estado", "args": {}})
-        if robo_camera_relevante(texto):
-            ferramentas.append({"nome": "robo_trocar_camera", "args": {}})
+        camera = robo_camera_pedida(texto)
+        if camera:
+            ferramentas.append({"nome": "robo_trocar_camera",
+                                "args": {"tipo": camera}})
+
+        # ANDAR antes de VIRAR: "gira o carrinho" desloca o corpo,
+        # "gira a base" mexe só o braço. Os dois regexes casam com
+        # "gira", e o mais específico tem que ganhar.
+        anda = robo_andar_pedido(texto)
+        if anda:
+            ferramentas.append({"nome": "robo_andar", "args": {"direcao": anda}})
+
+        # Ordem importa: encarar e relaxar são AÇÕES COMPLETAS e
+        # sobrepõem virar/postura -- "olha pra mim" não é um pedido de
+        # direção somado a um de altura, é uma coisa só.
+        if robo_encarar_relevante(texto):
+            ferramentas.append({"nome": "robo_encarar", "args": {}})
+        elif robo_relaxar_relevante(texto):
+            ferramentas.append({"nome": "robo_relaxar", "args": {}})
+        elif not anda:
+            direcao = robo_virar_pedido(texto)
+            if direcao:
+                ferramentas.append({"nome": "robo_virar",
+                                    "args": {"direcao": direcao}})
 
         gesto = robo_gesto_pedido(texto)
         if gesto:
@@ -667,8 +788,21 @@ class DecisorPorLLM:
         ]
         # Pedidos físicos inequívocos não podem depender da interpretação do
         # LLM, nem ser confundidos com busca web ou visão da tela.
+        #
+        # `self.registro.get(...)` checado AQUI TAMBÉM (segunda camada,
+        # redundante de propósito): sem isso, com EVA_ROBOT_ATIVO=0 e
+        # robot_tools nunca registrado, uma regra textual que casasse com
+        # "ver"/"olhar"/etc (ver DecisorPorRegras) ainda reinseriria
+        # robo_ver/robo_olhar no plano incondicionalmente, e
+        # registro.executar (orchestrator._executar_ferramentas) devolveria
+        # "ferramenta_desconhecida" -- funcional, mas gera um turno inteiro
+        # tentando uma ferramenta que não existe por desenho, não por falha.
+        # A checagem aqui evita esse turno perdido: sem a ferramenta no
+        # registro, a regra física é simplesmente ignorada, como se
+        # _FERRAMENTAS_FISICAS não a listasse.
         for ferramenta_base in base.ferramentas:
             if (ferramenta_base.get("nome") in _FERRAMENTAS_FISICAS
+                    and self.registro.get(ferramenta_base.get("nome", ""))
                     and not any(f.get("nome") == ferramenta_base.get("nome")
                                 for f in ferramentas)):
                 ferramentas.append(ferramenta_base)

@@ -566,13 +566,13 @@ async def executar(so_python: bool, porta: int) -> None:
     cfg = carregar_config()
     cliente = ClienteBridge(cfg, url=f"ws://localhost:{porta}")
 
-    # Os três llama-server sobem AGORA (chamada não-bloqueante, só cria o
+    # Os llama-server sobem AGORA (chamada não-bloqueante, só cria o
     # subprocesso) e só são ESPERADOS lá embaixo, depois de bridge.js e
     # whisper -- assim os processos carregam em paralelo de verdade
     # (cada um é um subprocesso do SO, continua carregando enquanto este
     # coroutine espera outra coisa), em vez de empilhar o tempo de espera
     # de cada um em sequência. O de conversa sobe primeiro por ser o
-    # maior (12B) -- quem mais se beneficia da folga extra pra carregar.
+    # maior, quem mais se beneficia da folga extra pra carregar.
     supervisor_llama = None
     if cfg.llm.server_exe and not _llama_server_respondendo(cfg.llm.base_url):
         supervisor_llama = SupervisorLlama(
@@ -582,9 +582,10 @@ async def executar(so_python: bool, porta: int) -> None:
         )
         supervisor_llama.iniciar()
 
-    # Decisão/visão -- mesmo servidor atende os dois papéis (--mmproj
-    # habilita a parte de visão). DecisionConfig.base_url e
-    # VisaoConfig.base_url devem apontar pra mesma URL.
+    # Decisão -- puro-texto por padrão desde 02/09/2026 (visão saiu para
+    # servidor próprio, ver supervisor_visao abaixo). server_mmproj só é
+    # passado se você tiver preenchido EVA_DECISAO_SERVER_MMPROJ no .env
+    # (compatibilidade com quem ainda quer o esquema antigo combinado).
     supervisor_decisao = None
     if cfg.decisao.server_exe and not _llama_server_respondendo(cfg.decisao.base_url):
         supervisor_decisao = SupervisorLlama(
@@ -594,6 +595,25 @@ async def executar(so_python: bool, porta: int) -> None:
             nome="decisao",
         )
         supervisor_decisao.iniciar()
+
+    # Visão -- servidor PRÓPRIO desde 02/09/2026 (ver docstring de
+    # VisaoConfig.base_url pro achado real de contenção de GPU que
+    # motivou a separação: o tick de fundo da visão disputando a mesma
+    # GPU que o modelo conversacional derrubou o throughput dele à
+    # metade num turno real). Só sobe se EVA_VISAO_SERVER_EXE estiver
+    # preenchido -- sem isso, cfg.visao.base_url precisa já estar
+    # respondendo (subido na mão, ou apontando pro mesmo servidor de
+    # decisão se você preencher EVA_VISAO_URL=EVA_DECISAO_URL no .env,
+    # voltando ao esquema antigo).
+    supervisor_visao = None
+    if cfg.visao.server_exe and not _llama_server_respondendo(cfg.visao.base_url):
+        supervisor_visao = SupervisorLlama(
+            exe=cfg.visao.server_exe, modelo=cfg.visao.server_modelo,
+            url=cfg.visao.base_url, flags=cfg.visao.server_flags,
+            mmproj=cfg.visao.server_mmproj,
+            nome="visao",
+        )
+        supervisor_visao.iniciar()
 
     # Embeddings -- modelo minúsculo (nomic-embed, ~84MB), mas isolado do
     # resto pra tirar a última dependência do LM Studio.
@@ -646,7 +666,7 @@ async def executar(so_python: bool, porta: int) -> None:
     # ordem acima, eles já vêm carregando há um tempo (o de bridge.js +
     # o de whisper), então a espera efetiva aqui costuma ser bem menor
     # que os timeouts individuais.
-    for sup in (supervisor_llama, supervisor_decisao, supervisor_embeddings):
+    for sup in (supervisor_llama, supervisor_decisao, supervisor_visao, supervisor_embeddings):
         if sup is None:
             continue
         pronto = await sup.esperar_pronto()
@@ -663,6 +683,8 @@ async def executar(so_python: bool, porta: int) -> None:
         tarefas.append(asyncio.create_task(supervisor_llama.repassar_saida()))
     if supervisor_decisao:
         tarefas.append(asyncio.create_task(supervisor_decisao.repassar_saida()))
+    if supervisor_visao:
+        tarefas.append(asyncio.create_task(supervisor_visao.repassar_saida()))
     if supervisor_embeddings:
         tarefas.append(asyncio.create_task(supervisor_embeddings.repassar_saida()))
 
@@ -681,6 +703,8 @@ async def executar(so_python: bool, porta: int) -> None:
             supervisor_llama.parar()
         if supervisor_decisao:
             supervisor_decisao.parar()
+        if supervisor_visao:
+            supervisor_visao.parar()
         if supervisor_embeddings:
             supervisor_embeddings.parar()
         cliente.fechar()

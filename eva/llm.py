@@ -163,6 +163,29 @@ class ClienteLLM:
         if rln is not None:
             payload["repeat_last_n"] = rln
 
+        # DRY e XTC -- mesmo padrão getattr+checagem dos campos acima.
+        # Só LLMConfig (conversa) define esses atributos; DecisionConfig e
+        # a config do extrator não têm, então getattr devolve None e nada
+        # é adicionado -- sem isso, XTC removendo o token certo quebraria
+        # JSON estruturado de decisão/extração.
+        # dry_multiplier/xtc_probability em 0.0 (default de LLMConfig)
+        # significam "desligado" pro próprio llama-server, mas mandamos o
+        # campo mesmo assim quando o atributo existe: omitir o campo
+        # deixaria o comportamento depender do default do SERVIDOR (que
+        # pode ter sido ligado via --dry-multiplier/--xtc-probability na
+        # subida do processo), e a config do Python deve mandar, não o
+        # flag de linha de comando escondido.
+        dm = getattr(self.cfg, "dry_multiplier", None)
+        if dm is not None:
+            payload["dry_multiplier"] = dm
+            payload["dry_base"] = getattr(self.cfg, "dry_base", 1.75)
+            payload["dry_allowed_length"] = getattr(self.cfg, "dry_allowed_length", 2)
+            payload["dry_penalty_last_n"] = getattr(self.cfg, "dry_penalty_last_n", 1152)
+        xtc_p = getattr(self.cfg, "xtc_probability", None)
+        if xtc_p is not None:
+            payload["xtc_probability"] = xtc_p
+            payload["xtc_threshold"] = getattr(self.cfg, "xtc_threshold", 0.1)
+
     def completar_com_ferramenta(
         self,
         mensagens: list[dict],

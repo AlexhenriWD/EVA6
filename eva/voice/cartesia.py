@@ -15,6 +15,14 @@ bridge.js, o suspeito era o TTS. Se sair ruim do mesmo jeito, o suspeito
 é o playback. Ver EVA_VOZ_STREAMING em config.py pra ligar o caminho de
 streaming e comparar.
 
+PRÉ-AQUECIMENTO E TIMEOUT (02/09/2026): `pre_aquecer()` abre o WebSocket
+assim que a call começa, não na primeira fala -- ver a docstring do
+método pro achado real (timeout visto sempre na primeira fala de uma
+call nova, nunca no meio: cold-start de handshake com um serviço
+externo). `timeout` no construtor (default 20s, EVA_TTS_CARTESIA_TIMEOUT)
+troca o default de 60s do SDK, e `_abrir_websocket` tenta a conexão uma
+segunda vez antes de propagar o erro.
+
 DOIS CAMINHOS, mesma dupla que o Pocket TTS expõe:
 
   gerar_para_discord()       bloqueante -- um request só. Usado pelo
@@ -168,6 +176,7 @@ class CartesiaTTSEngine:
         idioma: str = "pt",
         model_id: str | None = None,
         sample_rate: int = 44100,
+        timeout: float | None = None,
     ):
         if not CARTESIA_DISPONIVEL:
             raise ErroCartesiaTTS(
@@ -183,6 +192,24 @@ class CartesiaTTSEngine:
         # docs.cartesia.ai/build-with-cartesia/tts-models se isso mudar.
         self.model_id = model_id or os.environ.get("EVA_TTS_CARTESIA_MODEL", "sonic-3.5")
         self.sample_rate = sample_rate
+        # ACHADO REAL (02/09/2026): "Cartesia (websocket): timed out" na
+        # PRIMEIRA fala de uma call, logo depois de entrar no canal --
+        # nunca no meio da call, sempre logo no início. Padrão clássico
+        # de cold-start: a primeira conexão WebSocket paga handshake
+        # TLS+autenticação (a Cartesia é externa, na nuvem, não local
+        # como os outros modelos deste projeto), e o SDK usa 60s de
+        # timeout HTTP padrão -- mas o handshake de WebSocket não
+        # necessariamente segue o mesmo relógio dependendo de como a lib
+        # `websockets` (usada por baixo, ver import em _abrir_websocket)
+        # trata isso. `timeout` explícito aqui não é sobre AUMENTAR o
+        # limite (60s já era mais que suficiente pro erro observado) --
+        # é sobre poder BAIXAR e testar deliberadamente, e sobre nunca
+        # depender de um default que pode mudar entre versões do SDK.
+        # Ver também _abrir_websocket (tem retry embutido) e
+        # pre_aquecer() (evita pagar o cold-start dentro de um turno de
+        # conversa) -- os dois atacam a causa mais provável (cold-start)
+        # mais diretamente que só mexer no número do timeout.
+        self.timeout = timeout or float(os.environ.get("EVA_TTS_CARTESIA_TIMEOUT", "20"))
         self._carregado = False
         self._cliente = None
         # Cache do método resolvido (ver _resolver_metodo) -- resolvido
@@ -213,7 +240,7 @@ class CartesiaTTSEngine:
                 "EVA_TTS_CARTESIA_VOICE não definida -- precisa do voice_id "
                 "da voz clonada da EVA (o mesmo já usado no EVA-V5)."
             )
-        self._cliente = Cartesia(api_key=self.api_key)
+        self._cliente = Cartesia(api_key=self.api_key, timeout=self.timeout)
         # Resolve AGORA, não na primeira frase: se nenhum candidato
         # existir na versão instalada, falha aqui com mensagem clara
         # (mesmo espírito de inicializar() -- falhar cedo, não na
@@ -233,7 +260,15 @@ class CartesiaTTSEngine:
         self._validar_sync()
 
     def _abrir_websocket(self):
-        """Abre ou reutiliza a conexão WebSocket persistente da call."""
+        """Abre ou reutiliza a conexão WebSocket persistente da call.
+
+        Com retry: uma falha de handshake ISOLADA (cold-start de rede,
+        pico passageiro) não deveria condenar a call inteira a cair pro
+        modo bloqueante (mais lento) na primeira frase. Uma segunda
+        tentativa imediata resolve a maioria dos casos reais -- se
+        também falhar, propaga e quem chama decide (gerar_frase_stream_sync
+        cai pro bloqueante, pre_aquecer engole e loga).
+        """
         if self._ws is not None and not getattr(self._ws, "closed", False):
             return self._ws
         websocket_connect = getattr(self._cliente.tts, "websocket_connect", None)
@@ -259,8 +294,51 @@ class CartesiaTTSEngine:
         # attribute 'context'". .enter() é o alias público documentado pelo próprio
         # SDK pra usar fora de um bloco `with` (nosso caso: conexão persistente pela
         # call inteira, fechada explicitamente em fechar()).
-        self._ws = websocket_connect().enter()
+        try:
+            self._ws = websocket_connect().enter()
+        except Exception as e:
+            # UMA retentativa imediata -- ver docstring do método pro
+            # motivo (cold-start isolado, não erro de configuração).
+            # Sem sleep: se o problema fosse rate-limit ou 5xx real, a
+            # retentativa imediata falharia igual e propagaria rápido;
+            # esperar aqui só atrasaria a primeira fala da call à toa.
+            print(f"[cartesia-tts] abertura de WebSocket falhou "
+                  f"({type(e).__name__}: {e}), tentando de novo uma vez...")
+            self._ws = websocket_connect().enter()
         return self._ws
+
+    def pre_aquecer(self) -> bool:
+        """Abre o WebSocket ANTES da primeira fala real -- chamado quando
+        a EVA entra na call (ver _ligar_visao_se_precisar ou equivalente
+        em bridge_client.py), não na primeira vez que ela precisa falar.
+
+        ACHADO REAL (02/09/2026): o timeout de WebSocket visto em
+        produção aconteceu sempre na PRIMEIRA fala de uma call recém-
+        iniciada -- nunca no meio. É exatamente o padrão de cold-start:
+        a primeira conexão paga handshake TLS + autenticação com a
+        Cartesia (serviço externo, na nuvem), e isso competia por tempo
+        com o resto do turno (STT, decisão, geração da resposta) já em
+        andamento -- a pessoa esperando a resposta é o pior momento
+        possível para descobrir que a conexão está fria.
+        Pré-aquecer quando a call começa (antes de qualquer áudio ter
+        sido processado, ainda com folga de tempo) tira esse custo do
+        caminho crítico da primeira resposta.
+
+        Nunca levanta exceção -- best-effort, mesmo padrão de visão/
+        busca neste projeto. Se falhar, a primeira fala real ainda
+        tenta abrir a conexão do zero (mais lento, mas funcional) e cai
+        pro bloqueante se isso também falhar -- pre_aquecer só existe
+        pra tornar esse caminho raro, não pra ser o único caminho.
+        """
+        try:
+            self._validar_sync()
+            self._abrir_websocket()
+            return True
+        except Exception as e:
+            print(f"[cartesia-tts] pré-aquecimento do WebSocket falhou "
+                  f"({type(e).__name__}: {e}) -- a primeira fala real vai "
+                  f"tentar abrir a conexão do zero.")
+            return False
 
     def fechar(self) -> None:
         """Fecha a conexão persistente da Cartesia, se existir."""

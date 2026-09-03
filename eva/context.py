@@ -135,6 +135,39 @@ PREFIXO_VISUAL = (
     "que é 'só texto': você tem esse canal, e o que segue é o que ele "
     "capturou. Contexto visual: "
 )
+# Visão pela câmera do ROBÔ. Prefixo próprio porque o de cima afirma que
+# a imagem é da TELA -- com o robô conectado isso é falso, e ela repetia
+# a afirmação errada. Diz também QUAL câmera e QUANDO, porque as duas
+# mostram coisas diferentes: a usb é fixa no corpo e não acompanha os
+# servos, a picam é a da cabeça.
+PREFIXO_VISUAL_ROBO = (
+    "Você está vendo pela câmera do robô agora -- informação real, não "
+    "suposição. Descreva só o que está aqui; se algo não aparece, diga "
+    "que não aparece em vez de completar. Imagem da câmera {camera} "
+    "({onde}), capturada há {idade}. Ao falar dela em voz alta, chame de "
+    "\"câmera da cabeça\" ou \"câmera do corpo\" -- nunca \"picam\", que a "
+    "transcrição de voz não entende: "
+)
+# Sem imagem NENHUMA. Este bloco existe pra ocupar o silêncio: quando não
+# havia nada sobre visão no contexto, ela preenchia a lacuna inventando
+# -- chegou a descrever a roupa de uma pessoa sem um único quadro no
+# prompt. "Não estou vendo" precisa ser um fato declarado, não a ausência
+# de um.
+SEM_VISAO_ROBO = (
+    "[Visão] Você está conectada ao robô, mas NÃO tem imagem nova: {motivo}. "
+    "Você não está vendo nada neste momento. Não descreva cena, pessoa, "
+    "roupa nem objeto -- você não tem essa informação agora. Se quiser "
+    "olhar, use robo_ver."
+)
+# Nomes FALADOS. "picam" não sobrevive ao STT -- o whisper transcreveu a
+# mesma palavra como "PyCam", "paikin" e "pai quem" em logs reais, e o
+# nome circula pelo áudio (ela fala, a pessoa repete) voltando quebrado.
+_NOME_CAMERA = {"picam": "da cabeça", "usb": "do corpo"}
+_ONDE_CAMERA = {
+    "picam": "montada na cabeça, acompanha o movimento dos servos",
+    "usb": "fixa no corpo, aponta pra frente do carrinho e não acompanha "
+           "os servos",
+}
 PREFIXO_JOGO = (
     "Estado atual do Minecraft, capturado pelo bridge. Use-o para responder "
     "sobre posição, vida, fome, inventário e arredores; se estiver ausente, "
@@ -290,6 +323,19 @@ NOTA_CRISE = (
     "(CVV, 188, 24h, ligação gratuita) sem soar como protocolo."
 )
 
+# Só usado quando EVA_CAUDA_ROLE=user (ver LLMConfig.cauda_role em
+# config.py). Sem este prefixo, o bloco de cauda ("Contexto:\nSeu
+# estado...\nFatos:...") viraria uma mensagem de role user idêntica em
+# formato a uma fala real da pessoa -- risco real de o modelo tratar o
+# PRÓPRIO bloco de dados como se o usuário tivesse digitado aquilo
+# (ex: responder "Contexto: hora atual..." como se fosse uma pergunta).
+# Esta linha marca a mudança de role sem mudar a ORDEM das mensagens nem
+# o conteúdo do bloco em si -- só avisa o que ele é.
+PREFIXO_CAUDA_USER = (
+    "[Isto não é uma fala minha -- é dado de contexto do sistema, "
+    "injetado automaticamente antes da minha próxima mensagem real.]"
+)
+
 # ------------------------------------------------------ âncora temporal
 
 _DIAS = ("segunda-feira", "terça-feira", "quarta-feira", "quinta-feira",
@@ -336,6 +382,13 @@ class Contexto:
     # nenhum no turno (nada a reforçar).
     reforco: str = ""
 
+    # Role da mensagem de cauda -- "system" (padrão, tolerado por
+    # Sweet_Dreams/Mistral-Nemo) ou "user" (obrigatório pra chat
+    # templates estritos tipo Qwen3.5, que recusam um segundo system no
+    # meio da lista). Ver EVA_CAUDA_ROLE em config.py::LLMConfig pro
+    # achado real que motivou isto.
+    cauda_role: str = "system"
+
     def cauda(self) -> str:
         """Só o que muda a cada turno.
 
@@ -354,7 +407,17 @@ class Contexto:
         msgs.extend(self.mensagens)
         cauda = self.cauda()
         if cauda:
-            msgs.append({"role": "system", "content": cauda})
+            if self.cauda_role == "user":
+                # PREFIXO_CAUDA_USER deixa explícito que isto é dado de
+                # contexto injetado, não uma fala da pessoa -- sem essa
+                # marcação, o modelo pode tratar o bloco de dados como
+                # se a PESSOA tivesse dito aquilo (ex: confundir "Contexto:
+                # hora atual, memórias..." com algo que o usuário
+                # literalmente escreveu no chat).
+                conteudo = f"{PREFIXO_CAUDA_USER}\n\n{cauda}"
+            else:
+                conteudo = cauda
+            msgs.append({"role": self.cauda_role, "content": conteudo})
         return msgs
 
     def para_chat(self, mensagem_usuario: str) -> list[dict]:
@@ -410,6 +473,9 @@ class ContextBuilder:
         iniciativa: str | None = None,
         modo_multicanal: bool = False,
         mensagem: str | None = None,
+        visao_robo: bool = False,
+        camera_robo: str | None = None,
+        idade_quadro_s: float | None = None,
     ) -> Contexto:
         """Monta o Contexto de um turno.
 
@@ -504,8 +570,23 @@ class ContextBuilder:
                 )
             else:
                 linhas.append(identidade)
-        if contexto_visual:
+        if contexto_visual and visao_robo:
+            camera = _NOME_CAMERA.get(camera_robo, camera_robo or "desconhecida")
+            dados_linhas.append(
+                PREFIXO_VISUAL_ROBO.format(
+                    camera=camera,
+                    onde=_ONDE_CAMERA.get(camera, "não sei qual é qual agora"),
+                    idade=(f"{idade_quadro_s:.0f}s" if idade_quadro_s is not None
+                           else "pouco"),
+                ) + contexto_visual.strip()
+            )
+        elif contexto_visual:
             dados_linhas.append(PREFIXO_VISUAL + contexto_visual.strip())
+        elif visao_robo:
+            # Conectada ao robô e SEM cena: o caso que produzia invenção.
+            dados_linhas.append(SEM_VISAO_ROBO.format(
+                motivo=("nenhum quadro chegou ainda" if idade_quadro_s is None
+                        else f"o último quadro tem {idade_quadro_s:.0f}s")))
         if getattr(plano, "precisa_jogo", False):
             dados_linhas.append(
                 PREFIXO_JOGO + (
@@ -546,6 +627,11 @@ class ContextBuilder:
             dados=dados,
             mensagens=self._limpar_historico(historico),
             bruto=ctx,
+            # "user" com chat template estrito (Qwen3.5 e outros Qwen3 --
+            # ver EVA_CAUDA_ROLE em config.py), "system" (default) com o
+            # resto. getattr com default preserva quem não define o campo
+            # (ex: alguma config de teste que não seja LLMConfig).
+            cauda_role=getattr(self.cfg.llm, "cauda_role", "system"),
         )
 
     # ------------------------------------------------------------ render
@@ -657,17 +743,48 @@ class ContextBuilder:
             if not isinstance(r, dict):
                 limpo[nome] = r
                 continue
-            codigo = r.get("erro") or r.get("aviso")
-            if codigo:
+
+            util = {k: v for k, v in r.items()
+                    if not k.startswith("_")
+                    and k not in self._CAMPOS_TECNICOS
+                    and k not in ("erro", "aviso", "detalhe", "ok")}
+
+            # AVISO NÃO É ERRO -- e tratar como era descartava o resultado
+            # inteiro junto.
+            #
+            # ACHADO EM USO REAL: robo_postura('rosto') devolve
+            # {"postura": "rosto", "aviso": "a câmera aponta pro lado
+            # direito...", "descricao_cena": "..."} -- o corpo SE MOVEU e a
+            # descrição da cena existia. Como `aviso` caía no ramo de erro,
+            # ela recebia só {"nota": "essa ferramenta não conseguiu
+            # responder agora"}: nem o resultado, nem a descrição, nem o
+            # aviso. E preenchia a lacuna inventando o que via -- chegou a
+            # descrever a roupa de uma pessoa sem nenhuma imagem no
+            # contexto. Aviso agora acompanha o resultado, como o que é:
+            # algo verdadeiro sobre um sucesso.
+            if r.get("aviso"):
+                util["atenção"] = r["aviso"]
+                limpo[nome] = util
+                continue
+
+            erro = r.get("erro")
+            if erro:
+                # `detalhe` PRIMEIRO. A tabela abaixo só cobre códigos
+                # curtos de busca e cálculo; as ferramentas de corpo mandam
+                # a explicação inteira em `detalhe` ("o cotovelo em 170°
+                # estica o cabo da picam -- recolha o cotovelo antes"), e é
+                # ela que diz o que fazer a seguir. Sem isto, TODO erro de
+                # robô caía no genérico "essa ferramenta não conseguiu
+                # responder agora", que não informa nada e é exatamente o
+                # tipo de lacuna que ela preenche inventando.
                 limpo[nome] = {
-                    "nota": self._NOTAS_ERRO_FERRAMENTA.get(
-                        codigo, "essa ferramenta não conseguiu responder agora")
+                    "nota": (r.get("detalhe")
+                             or self._NOTAS_ERRO_FERRAMENTA.get(erro)
+                             or f"não deu certo: {erro}")
                 }
-            else:
-                limpo[nome] = {
-                    k: v for k, v in r.items()
-                    if not k.startswith("_") and k not in self._CAMPOS_TECNICOS
-                }
+                continue
+
+            limpo[nome] = util
         return limpo
 
     def _limpar_historico(self, historico: list[dict]) -> list[dict]:

@@ -53,6 +53,7 @@ software; esta controla hardware que pode bater em alguma coisa.
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -65,8 +66,62 @@ from urllib.parse import urlparse
 # (status_dashboard, definir_iniciativa, ...), nunca toca estado interno
 # (_cliente, _tarefa_atual) direto.
 from eva.tools import minecraft_tools
-from eva.tools import robot_tools
 from eva.voice.tts import BACKENDS as TTS_BACKENDS, ErroTTS
+
+
+def _carregar_robot_tools_dashboard():
+    """Mesmo import condicionado de bridge_client.py::_carregar_robot_tools
+    -- ver a docstring de lá pro achado real completo.
+
+    Este módulo é importado só dentro de ClienteBridge.rodar() (não no
+    topo de bridge_client.py), então na prática já roda DEPOIS de
+    EVA_ROBOT_ATIVO ter sido checado em builtin.py. Mesmo assim, um
+    import incondicional aqui reintroduziria o mesmo risco se alguém no
+    futuro importar dashboard.py mais cedo no processo (ex: um teste, ou
+    uma nova integração) -- e o custo de manter isto condicional também
+    aqui é uma função a mais, não uma reescrita.
+
+    Com EVA_ROBOT_ATIVO=0, os botões da seção "Robô físico" continuam
+    aparecendo no painel, mas cada ação devolve {"erro": "robo_desativado"}
+    em vez de silenciosamente não fazer nada -- a pessoa vê POR QUE o
+    botão não fez efeito, em vez de achar que o robô está travado.
+    """
+    if os.environ.get("EVA_ROBOT_ATIVO", "1") == "1":
+        from eva.tools import robot_tools
+        return robot_tools
+
+    class _RobotToolsDesativado:
+        @staticmethod
+        def definir_iniciativa(ativo: bool) -> None:
+            pass
+
+        @staticmethod
+        def status_dashboard() -> dict:
+            return {"iniciativa_ativa": False, "conectado": False,
+                    "erro": "robo_desativado (EVA_ROBOT_ATIVO=0)"}
+
+        @staticmethod
+        def conectar_dashboard() -> dict:
+            return {"erro": "robo_desativado",
+                    "detalhe": "EVA_ROBOT_ATIVO=0 no .env -- mude pra 1 e "
+                               "reinicie a EVA para usar o robô"}
+
+        @staticmethod
+        def parar_dashboard() -> dict:
+            return {"erro": "robo_desativado"}
+
+        @staticmethod
+        def estop_dashboard(motivo: str = "") -> dict:
+            return {"erro": "robo_desativado"}
+
+        @staticmethod
+        def reset_estop_dashboard() -> dict:
+            return {"erro": "robo_desativado"}
+
+    return _RobotToolsDesativado()
+
+
+robot_tools = _carregar_robot_tools_dashboard()
 
 # Chaves aceitas pelo endpoint /api/toggle, mapeadas para uma função que
 # aplica o valor no cfg. Whitelist explícita -- uma chave não listada aqui

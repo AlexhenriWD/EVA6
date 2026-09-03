@@ -236,14 +236,34 @@ def carregar_ferramentas():
         print(f"[ferramentas] minecraft_tools não carregou ({e}) -- "
               f"ferramentas de Minecraft indisponíveis nesta sessão", file=sys.stderr)
 
-    try:
-        from . import robot_tools  # noqa: F401 -- mesmo padrão de minecraft_tools acima
-    except Exception as e:
-        # Robô é opcional pelo mesmo motivo: sem eva_command_server.py
-        # acessível, as ferramentas robo_* simplesmente não existem, e o
-        # resto do projeto continua normal.
-        import sys
-        print(f"[ferramentas] robot_tools não carregou ({e}) -- "
-              f"ferramentas de robô indisponíveis nesta sessão", file=sys.stderr)
+    # EVA_ROBOT_ATIVO=0 pula o import por completo -- ANTES do decorador
+    # rodar, então nenhuma ferramenta robo_* é registrada. Sem isso, ligar
+    # o robô fisicamente era o único jeito de desligar o CATÁLOGO: mesmo
+    # com o robô desconectado, o import de robot_tools já registrava
+    # robo_estado/robo_olhar/robo_gesto/etc, e registro.descrever() (ver
+    # decision.py::DecisorPorLLM.decidir) manda esse catálogo pro prompt
+    # do decisor em TODA mensagem -- inclusive quando a call é só
+    # conversa e ninguém pediu nada de robô. Se o decisor (LLM local ou
+    # Groq) interpretar mal e escolher uma robo_*, a chamada real dispara
+    # _iniciar_thread_robo() na hora (ver robot_tools.py), que tenta
+    # conectar em EVA_ROBOT_HOST e fica reconectando pra sempre em
+    # segundo plano -- e sozinho não indica erro no dashboard nem na
+    # conversa, só no console (achado real: log cheio de "[robo] sem
+    # conexão" numa sessão onde só se queria falar por texto/voz, sem
+    # tocar em robô nenhum). Default "1" preserva o comportamento de
+    # antes -- quem já usa o robô não precisa mudar nada.
+    if os.environ.get("EVA_ROBOT_ATIVO", "1") == "1":
+        try:
+            from . import robot_tools  # noqa: F401 -- mesmo padrão de minecraft_tools acima
+        except Exception as e:
+            # Robô é opcional pelo mesmo motivo: sem eva_command_server.py
+            # acessível, as ferramentas robo_* simplesmente não existem, e o
+            # resto do projeto continua normal.
+            import sys
+            print(f"[ferramentas] robot_tools não carregou ({e}) -- "
+                  f"ferramentas de robô indisponíveis nesta sessão", file=sys.stderr)
+    else:
+        print("[ferramentas] robot_tools não carregado (EVA_ROBOT_ATIVO=0) -- "
+              "ferramentas robo_* fora do catálogo do decisor nesta sessão")
 
     return registro

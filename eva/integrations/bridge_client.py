@@ -68,6 +68,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import queue
 import random
 import re
@@ -84,7 +85,6 @@ except ImportError:  # pragma: no cover
 
 from ..config import EVAConfig, carregar_config
 from ..orchestrator import EVA
-from ..tools import robot_tools
 from ..tools import minecraft_tools
 from ..voice.audio import (
     ErroAudio,
@@ -96,6 +96,60 @@ from ..voice.audio import (
 )
 from ..voice.stt import Transcricao, criar_stt, parece_ruido
 from ..voice.tts import ErroTTS, criar_tts
+
+
+def _carregar_robot_tools():
+    """Import condicionado a EVA_ROBOT_ATIVO, mesma flag de
+    builtin.py::carregar_ferramentas().
+
+    ACHADO REAL (02/09/2026): `import robot_tools` incondicional aqui no
+    topo do módulo (como era antes) bypassava por completo a proteção de
+    EVA_ROBOT_ATIVO=0 em builtin.py. O motivo é ordem de import: Python
+    executa o corpo de um módulo (inclusive os decoradores
+    @registro.adicionar de cada robo_* -- ver robot_tools.py) na
+    PRIMEIRA vez que ele é importado, e fica em cache em sys.modules daí
+    pra frente. Como este arquivo importava `from ..tools import
+    robot_tools` direto no topo -- ANTES de EVA() ser instanciada e
+    ANTES de carregar_ferramentas() checar a flag --, o registro global
+    de ferramentas (ver registry.py) já vinha com robo_ver/robo_olhar/
+    etc. registrados no momento em que builtin.py rodava sua checagem.
+    O resultado prático, visto em log real: mesmo com "[ferramentas]
+    robot_tools não carregado (EVA_ROBOT_ATIVO=0)" impresso, o decisor
+    ainda conseguiu chamar robo_ver() de verdade (erro "sem_video" vindo
+    de DENTRO da função -- só possível se ela estava mesmo registrada).
+
+    Este módulo (bridge_client.py) só usa quatro funções de robot_tools:
+    robo_conectado(), definir_em_call(), definir_consciencia_callback(),
+    drenar_eventos_corpo() -- nenhuma delas registra ferramenta nenhuma,
+    são só consulta/config de estado. Com EVA_ROBOT_ATIVO=0, devolve um
+    objeto simples com essas quatro como no-op seguro, em vez de
+    importar o módulo real e disparar os decoradores.
+    """
+    if os.environ.get("EVA_ROBOT_ATIVO", "1") == "1":
+        from ..tools import robot_tools
+        return robot_tools
+
+    class _RobotToolsDesativado:
+        @staticmethod
+        def robo_conectado() -> bool:
+            return False
+
+        @staticmethod
+        def definir_em_call(ativo: bool) -> None:
+            pass
+
+        @staticmethod
+        def definir_consciencia_callback(callback) -> None:
+            pass
+
+        @staticmethod
+        def drenar_eventos_corpo() -> list:
+            return []
+
+    return _RobotToolsDesativado()
+
+
+robot_tools = _carregar_robot_tools()
 
 
 PROMPT_PUXAR_ASSUNTO = """Você está numa call. De vez em quando você considera se vale
@@ -459,6 +513,22 @@ class ClienteBridge:
         """
         from ..decision import robo_estado_relevante, robo_olhar_relevante, visao_relevante
 
+        # ROBÔ CONECTADO = a visão dela é a do robô, ponto. Não roteia
+        # mais por assunto da mensagem.
+        #
+        # O roteamento antigo (por palavra na fala) deixava a visão de
+        # TELA responder qualquer pergunta que não citasse o robô
+        # explicitamente -- e com o robô conectado ela tem um corpo
+        # olhando pra um lugar; o que está no monitor não é o que ela
+        # está vendo. Em uso real isso produziu descrição de tela
+        # apresentada como se fosse a cena à frente do robô.
+        #
+        # Também é o corte mais barato de latência que existe aqui: as
+        # duas visões disputam o mesmo servidor gemma-3-4b, e cada tick
+        # de tela custava ~3s de inferência por turno.
+        if robot_tools.robo_conectado():
+            return await self._contexto_visual_robo_para(texto)
+
         if robo_olhar_relevante(texto) or robo_estado_relevante(texto):
             return await self._contexto_visual_robo_para(texto)
 
@@ -667,7 +737,13 @@ class ClienteBridge:
         # quando tem gente numa call -- mesmo _guilds_com_call de sempre,
         # só que sinalizado pra outra thread via threading.Event.
         robot_tools.definir_em_call(bool(self._guilds_com_call))
-        if self.visao is not None and not self.visao.ativo:
+        # A visão de TELA só liga se o robô não estiver conectado -- ver
+        # _contexto_visual_para. Enquanto ela tem corpo, o monitor não
+        # interessa, e o tick de tela é inferência paga à toa no mesmo
+        # servidor que a visão do robô usa. _laco_visao também confere a
+        # cada volta, porque o robô pode conectar depois da call começar.
+        if (self.visao is not None and not self.visao.ativo
+                and not robot_tools.robo_conectado()):
             self.visao.ligar()
             if self._tarefa_visao is None or self._tarefa_visao.done():
                 self._tarefa_visao = asyncio.create_task(self._laco_visao())
@@ -679,6 +755,31 @@ class ClienteBridge:
             self.visao_robo.ligar()
             if self._tarefa_visao_robo is None or self._tarefa_visao_robo.done():
                 self._tarefa_visao_robo = asyncio.create_task(self._laco_visao_robo())
+
+        self._pre_aquecer_tts_se_precisar()
+
+    def _pre_aquecer_tts_se_precisar(self) -> None:
+        """Abre a conexão WebSocket da Cartesia ASSIM QUE a call começa,
+        não na primeira fala real -- ver CartesiaTTSEngine.pre_aquecer
+        pro achado real completo (timeout visto sempre na primeira fala
+        de uma call recém-entrada, nunca no meio -- padrão de cold-start
+        de handshake TLS+autenticação com um serviço externo).
+
+        Só faz sentido pra motor com esse método (Cartesia hoje; Pocket
+        TTS não tem WebSocket nem cold-start pra amortizar -- é local).
+        getattr com default None cobre os dois casos sem `isinstance`.
+
+        Dispara como task e não espera -- pré-aquecimento é otimização,
+        não requisito; se demorar, a call já começou normal, e a
+        primeira fala real só cai pro caminho mais lento (abrir do zero)
+        se isto ainda não tiver terminado a tempo, exatamente como era
+        antes desta mudança.
+        """
+        motor = getattr(self.tts, "motor", None) if self.tts else None
+        pre_aquecer = getattr(motor, "pre_aquecer", None)
+        if pre_aquecer is None:
+            return
+        asyncio.get_event_loop().run_in_executor(None, pre_aquecer)
 
     def _ligar_robo_consciencia_se_precisar(self, guild_id: str) -> None:
         robot_tools.definir_consciencia_callback(
@@ -736,6 +837,14 @@ class ClienteBridge:
         """
         while True:
             await asyncio.sleep(self.cfg.visao.tick_intervalo)
+            # Robô conectado: pula o tick de tela por completo. Ela tem um
+            # corpo olhando pra algum lugar; o monitor não é o que ela está
+            # vendo, e cada tick custa ~3s de inferência no mesmo
+            # gemma-3-4b que a visão do robô precisa. Checado a cada volta
+            # (e não só na hora de ligar) porque o robô pode conectar
+            # depois da call já ter começado.
+            if robot_tools.robo_conectado():
+                continue
             try:
                 evento = await asyncio.to_thread(self.visao.tick)
                 if evento:
@@ -857,8 +966,28 @@ class ClienteBridge:
                             # c.ultimo_falante (ver orchestrator), então
                             # é esse o turno a corrigir se ela for
                             # cortada puxando assunto.
-                            await self.falar(guild_id, r.resposta,
-                                             usuario=c.ultimo_falante)
+                            #
+                            # ACHADO REAL (02/09/2026): antes chamava
+                            # self.falar() incondicionalmente -- o
+                            # caminho 100% bloqueante, que espera o áudio
+                            # INTEIRO da resposta antes do primeiro som.
+                            # Fala espontânea tende a ser mais longa que
+                            # resposta direta (não tem o teto curto de
+                            # MODO: VOZ pressionando tanto), então o
+                            # custo do bloqueante aparece justamente
+                            # onde di mais: log real mostrou 17-23s até
+                            # o primeiro som em fala espontânea, mesmo
+                            # depois do pré-aquecimento do WebSocket da
+                            # Cartesia já ter resolvido isso pro caminho
+                            # de resposta direta -- o problema aqui
+                            # nunca foi o WebSocket, foi sempre ter
+                            # pulado o streaming por completo.
+                            if self.cfg.voz.voz_streaming:
+                                await self.falar_texto_pronto_stream(
+                                    guild_id, r.resposta, usuario=c.ultimo_falante)
+                            else:
+                                await self.falar(guild_id, r.resposta,
+                                                 usuario=c.ultimo_falante)
                             c.ela_falou(espontanea=True)
                     finally:
                         c.ocupada = False
@@ -991,6 +1120,87 @@ class ClienteBridge:
             self._produzir_stream_de_voz, mensagem, usuario, contexto_visual,
             fila, modo_multicanal, est.cortar))
 
+        return await self._consumir_fila_de_voz(guild_id, est, fila)
+
+    async def falar_texto_pronto_stream(self, guild_id: str, texto: str,
+                                        usuario: str | None = None) -> None:
+        """Fala um texto JÁ PRONTO em streaming (play_start/play_chunk/
+        play_end), frase por frase -- mesmo mecanismo de `_falar_stream`,
+        mas sem o lado do LLM: aqui o texto inteiro já existe (fala
+        espontânea, ver `_laco_consciencia`), só falta cortar em frases e
+        sintetizar cada uma.
+
+        ACHADO REAL (02/09/2026): fala espontânea (falar_sozinha) sempre
+        chamava `self.falar()` -- o caminho 100% bloqueante, um request
+        de síntese só, esperando o áudio INTEIRO antes do primeiro som --
+        mesmo com EVA_VOZ_STREAMING=1 ligado. Isso não aparecia como erro
+        nenhum (nem "[tts-stream] streaming falhou" nem qualquer outro
+        log): o caminho bloqueante nunca foi tentado, e portanto nunca
+        falhou -- ele só foi o único chamado. Confirmado comparando dois
+        logs de call real: mesmo DEPOIS do fix de pré-aquecimento do
+        WebSocket da Cartesia (que eliminou os timeouts do caminho de
+        resposta direta), toda fala espontânea continuou levando
+        17-23s até o primeiro som, sempre pela linha "[tempo] até o
+        primeiro som (bloqueante)" -- o pré-aquecimento não ajuda aqui
+        porque o problema nunca foi o WebSocket, foi o CAMINHO escolhido.
+
+        Ainda síncrono internamente da mesma forma que `_falar_stream`:
+        a produção (quebra em frases + síntese) roda numa thread via
+        asyncio.to_thread, e o consumo da fila é compartilhado com
+        `_falar_stream` via `_consumir_fila_de_voz` -- mesma lógica de
+        pré-buffer, mesmo play_start/play_chunk/play_end, sem duplicar
+        nada.
+        """
+        if not self.tts or not texto.strip():
+            return
+        if not self.tts.motor._carregado:
+            await self.tts.motor.inicializar()
+
+        est = self.estado(guild_id)
+        est.texto_em_voz = ""
+        est.usuario_em_voz = usuario
+        est.bytes_em_voz = 0
+        est.corte_pedido = False
+        est.cortar.clear()
+
+        fila: queue.Queue = queue.Queue()
+        asyncio.create_task(asyncio.to_thread(
+            self._produzir_stream_de_texto_pronto, texto, fila, est.cortar))
+
+        await self._consumir_fila_de_voz(guild_id, est, fila)
+
+    def _produzir_stream_de_texto_pronto(self, texto: str, fila: "queue.Queue",
+                                         cortar: threading.Event | None = None) -> None:
+        """Mesmo padrão de `_produzir_stream_de_voz`, sem o lado do LLM:
+        o texto já existe inteiro, só corta em frases (mesmo extrator
+        usado no streaming de verdade, pra tratar abreviação/decimal
+        igual) e sintetiza cada uma via `_sintetizar_e_enfileirar`.
+        """
+        from ..voice.audio_utils import extrair_frases_fechadas
+
+        buffer = texto
+        try:
+            frases, resto = extrair_frases_fechadas(buffer)
+            for frase in frases:
+                if cortar is not None and cortar.is_set():
+                    break
+                fila.put(("frase", frase))
+                self._sintetizar_e_enfileirar(frase, fila)
+            cortada = cortar is not None and cortar.is_set()
+            if resto.strip() and not cortada:
+                fila.put(("frase", resto))
+                self._sintetizar_e_enfileirar(resto, fila)
+        except Exception as e:
+            fila.put(("erro", str(e)))
+            return
+        fila.put(("fim", None))
+
+    async def _consumir_fila_de_voz(self, guild_id: str, est, fila: "queue.Queue"):
+        """Consome a fila (frase/áudio/fim/erro) e manda play_start/
+        play_chunk/play_end pro bridge -- extraído de `_falar_stream`
+        pra ser compartilhado com `falar_texto_pronto_stream` (fala
+        espontânea) sem duplicar a lógica de pré-buffer/corte/limpeza.
+        """
         resultado = None
         iniciou = False
         pre_buffer = bytearray()
